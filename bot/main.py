@@ -147,6 +147,9 @@ EMPLOYEES: dict[str, dict] = {
     "8790024904": {"name": "FIWWY", "discord_id": "1480817079258054689"},
     "8742150292": {"name": "RAPTOR", "discord_id": "1478312523374657557"},
     "8142690458": {"name": "BRANT", "discord_id": "1468420877325566094"},
+    "8370430767": {"name": "FOLKE", "discord_id": "1501920596315865129"},
+    "7790255430": {"name": "DEVIN", "discord_id": "1346757897492627476"},
+    "8202207453": {"name": "PANTER", "discord_id": "1483818860502188182"},
 }
 
 TARGET_GROUPS = ["Jun88"]
