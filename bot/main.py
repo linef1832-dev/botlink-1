@@ -413,7 +413,7 @@ class ActivityBot(discord.Client):
                     current_vc = member.voice.channel if member.voice else None
                     if current_vc and current_vc.id == target_vc.id:
                         logger.info(f"{name} already in target channel '{target_vc.name}', skipping move")
-                        notify_vc = None  # อยู่ห้องกินข้าวอยู่แล้ว ไม่ต้องแจ้ง
+                        notify_vc = work_vc  # อยู่ห้องกินข้าวอยู่แล้ว → แจ้งในห้องทำงานแทน
                     else:
                         try:
                             await member.move_to(target_vc)
