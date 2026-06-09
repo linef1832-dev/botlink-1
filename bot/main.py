@@ -215,6 +215,14 @@ ACTIVITY_MOVE_CHANNEL: dict[str, str] = {
     "ปวดน้อย": "",
 }
 
+# ห้องที่ไม่นับเป็นห้องทำงาน (ห้องปลายทาง)
+DESTINATION_CHANNEL_IDS: set[str] = {
+    v for v in ACTIVITY_MOVE_CHANNEL.values() if v
+}
+
+# ต้องอยู่ในห้องนานเท่าไหร่ถึงจะนับเป็นห้องทำงาน (วินาที)
+WORK_CHANNEL_DELAY_SECONDS = 60
+
 
 def get_emoji(activity: str, is_return: bool) -> str:
     if is_return:
@@ -292,12 +300,35 @@ class ActivityBot(discord.Client):
         intents.voice_states = True
         super().__init__(intents=intents)
         self._ready_event = asyncio.Event()
-        # discord_user_id (int) → channel_id (int) ก่อนถูกย้ายออก
-        self._home_channels: dict[int, int] = {}
+        # discord_user_id (int) → channel_id (int) ห้องทำงานจริง (อยู่นาน ≥ 60 วิ)
+        self._work_channels: dict[int, int] = {}
+        # pending tasks สำหรับ delay การบันทึกห้องทำงาน
+        self._work_channel_tasks: dict[int, asyncio.Task] = {}
 
     async def on_ready(self):
         logger.info(f"Discord bot ready: {self.user}")
         self._ready_event.set()
+
+    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+        # ยกเลิก timer เดิมถ้ามี (คนออกจากห้องหรือย้ายไปห้องอื่น)
+        old_task = self._work_channel_tasks.pop(member.id, None)
+        if old_task:
+            old_task.cancel()
+
+        # ถ้าย้ายเข้าห้องที่ไม่ใช่ห้องปลายทาง → เริ่ม timer 60 วิ
+        if after.channel and str(after.channel.id) not in DESTINATION_CHANNEL_IDS:
+            channel_snapshot = after.channel
+            async def _commit(m: discord.Member, ch: discord.VoiceChannel):
+                try:
+                    await asyncio.sleep(WORK_CHANNEL_DELAY_SECONDS)
+                    # ตรวจว่ายังอยู่ห้องเดิมอยู่ไหม
+                    refreshed = ch.guild.get_member(m.id)
+                    if refreshed and refreshed.voice and refreshed.voice.channel and refreshed.voice.channel.id == ch.id:
+                        self._work_channels[m.id] = ch.id
+                        logger.info(f"Work channel confirmed for {m.display_name}: #{ch.name}")
+                except asyncio.CancelledError:
+                    pass
+            self._work_channel_tasks[member.id] = asyncio.create_task(_commit(member, channel_snapshot))
 
     async def wait_until_ready_event(self):
         await self._ready_event.wait()
@@ -353,39 +384,37 @@ class ActivityBot(discord.Client):
             logger.warning(f"No member found for {name} ({discord_user_id})")
             return False, None
 
-        current_vc = member.voice.channel if member.voice else None
-        notify_vc = current_vc  # ห้องที่จะส่งแจ้งเตือน
+        # ห้องทำงานจริง (อยู่นาน ≥ 60 วิ) คือห้องที่ใช้แจ้งเตือนและย้ายกลับ
+        work_channel_id = self._work_channels.get(member.id)
+        work_vc = await self.find_voice_channel_by_id(str(work_channel_id)) if work_channel_id else None
 
         if is_return:
-            # กลับที่นั่ง → ย้ายกลับห้องเดิม และแจ้งเตือนในห้องเดิมนั้น
-            home_channel_id = self._home_channels.pop(member.id, None)
-            if home_channel_id:
-                home_vc = await self.find_voice_channel_by_id(str(home_channel_id))
-                if home_vc:
-                    notify_vc = home_vc  # แจ้งเตือนในห้องทำงาน ไม่ใช่ห้องกินข้าว
-                    try:
-                        await member.move_to(home_vc)
-                        logger.info(f"Moved {name} back → #{home_vc.name}")
-                    except discord.Forbidden:
-                        logger.error(f"No permission to move {name} — bot needs 'Move Members' permission")
-                    except Exception as e:
-                        logger.error(f"Failed to move {name} back: {e}")
-                else:
-                    logger.warning(f"Home channel ID {home_channel_id} not found for {name}")
+            # กลับที่นั่ง → ย้ายกลับห้องทำงาน และแจ้งเตือนที่นั่น
+            if work_vc:
+                try:
+                    await member.move_to(work_vc)
+                    logger.info(f"Moved {name} back → #{work_vc.name}")
+                except discord.Forbidden:
+                    logger.error(f"No permission to move {name} — bot needs 'Move Members' permission")
+                except Exception as e:
+                    logger.error(f"Failed to move {name} back: {e}")
             else:
-                logger.info(f"No saved home channel for {name}, skipping return move")
+                logger.info(f"No work channel recorded for {name}, skipping return move")
+
+            notify_vc = work_vc
         else:
-            # Activity → ย้ายไปห้องปลายทาง และแจ้งเตือนในห้องเดิม
+            # Activity → แจ้งเตือนที่ห้องทำงาน แล้วย้ายไปห้องปลายทาง
+            notify_vc = work_vc
+
             target_channel_id = self.get_target_channel_name(activity)
             if target_channel_id:
                 target_vc = await self.find_voice_channel_by_id(target_channel_id)
                 if target_vc:
+                    current_vc = member.voice.channel if member.voice else None
                     if current_vc and current_vc.id == target_vc.id:
                         logger.info(f"{name} already in target channel '{target_vc.name}', skipping move")
+                        notify_vc = None  # อยู่ห้องกินข้าวอยู่แล้ว ไม่ต้องแจ้ง
                     else:
-                        if current_vc:
-                            self._home_channels[member.id] = current_vc.id
-                            logger.info(f"Saved home channel for {name}: #{current_vc.name}")
                         try:
                             await member.move_to(target_vc)
                             logger.info(f"Moved {name} → #{target_vc.name}")
@@ -396,7 +425,7 @@ class ActivityBot(discord.Client):
                 else:
                     logger.warning(f"Target channel ID '{target_channel_id}' not found")
 
-        # ส่งแจ้งเตือนในห้องที่ถูกต้อง
+        # ส่งแจ้งเตือนในห้องทำงาน
         if notify_vc:
             try:
                 await notify_vc.send(message)
@@ -404,8 +433,9 @@ class ActivityBot(discord.Client):
                 return True, notify_vc.name
             except Exception as e:
                 logger.error(f"Failed to send to voice channel #{notify_vc.name}: {e}")
+        elif not is_return:
+            logger.warning(f"No work channel found for {name} ({discord_user_id}) — notification skipped")
 
-        logger.warning(f"No voice channel found for {name} ({discord_user_id})")
         return False, None
 
 
