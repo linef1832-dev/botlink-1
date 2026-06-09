@@ -319,6 +319,8 @@ class ActivityBot(discord.Client):
         self._current_hour: int = datetime.now().hour
         # member_id → channel_id ห้องที่แจ้งกิจกรรมล่าสุด (ใช้สำหรับ "กลับที่นั่ง")
         self._last_notified_channel: dict[int, int] = {}
+        # member_id ที่ถูกย้ายไปห้องปลายทาง (เช่น Dining) — คนเหล่านี้เท่านั้นที่ต้องย้ายกลับ
+        self._moved_to_destination: set[int] = set()
 
     async def setup_hook(self):
         await self.tree.sync()
@@ -445,23 +447,28 @@ class ActivityBot(discord.Client):
                 current_ch = ch
 
         if is_return:
-            # กลับที่นั่ง → ย้ายกลับห้องทำงาน (จากสถิติ) แต่แจ้งที่ห้องที่เคยแจ้งกิจกรรมล่าสุด
-            move_target = work_vc or current_ch
-            if move_target:
-                try:
-                    await member.move_to(move_target)
-                    logger.info(f"Moved {name} back → #{move_target.name}")
-                except discord.Forbidden:
-                    logger.error(f"No permission to move {name} — bot needs 'Move Members' permission")
-                except Exception as e:
-                    logger.error(f"Failed to move {name} back: {e}")
+            # กลับที่นั่ง → ย้ายกลับเฉพาะคนที่ถูกย้ายออกไป (กินข้าว) เท่านั้น
+            was_moved = member.id in self._moved_to_destination
+            if was_moved:
+                move_target = work_vc or current_ch
+                if move_target:
+                    try:
+                        await member.move_to(move_target)
+                        logger.info(f"Moved {name} back → #{move_target.name}")
+                    except discord.Forbidden:
+                        logger.error(f"No permission to move {name} — bot needs 'Move Members' permission")
+                    except Exception as e:
+                        logger.error(f"Failed to move {name} back: {e}")
+                else:
+                    logger.info(f"No work channel found for {name}, skipping return move")
+                self._moved_to_destination.discard(member.id)
             else:
-                logger.info(f"No work channel found for {name}, skipping return move")
+                logger.info(f"{name} was not moved out — skipping return move")
 
             # แจ้งในห้องที่เคยแจ้งกิจกรรมล่าสุด (ถ้ามี) หรือห้องทำงาน
             last_ch_id = self._last_notified_channel.get(member.id)
             last_vc = await self.find_voice_channel_by_id(str(last_ch_id)) if last_ch_id else None
-            notify_vc = last_vc or move_target
+            notify_vc = last_vc or work_vc or current_ch
 
         else:
             target_channel_id = self.get_target_channel_name(activity)
@@ -477,6 +484,7 @@ class ActivityBot(discord.Client):
                     else:
                         try:
                             await member.move_to(target_vc)
+                            self._moved_to_destination.add(member.id)
                             logger.info(f"Moved {name} → #{target_vc.name}")
                         except discord.Forbidden:
                             logger.error(f"No permission to move {name} — bot needs 'Move Members' permission")
