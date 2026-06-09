@@ -353,16 +353,16 @@ class ActivityBot(discord.Client):
             logger.warning(f"No member found for {name} ({discord_user_id})")
             return False, None
 
-        # Current voice channel (send notification here — this is their "original" room)
         current_vc = member.voice.channel if member.voice else None
+        notify_vc = current_vc  # ห้องที่จะส่งแจ้งเตือน
 
-        # Auto-move logic
         if is_return:
-            # กลับที่นั่ง → ย้ายกลับห้องเดิมที่บันทึกไว้
+            # กลับที่นั่ง → ย้ายกลับห้องเดิม และแจ้งเตือนในห้องเดิมนั้น
             home_channel_id = self._home_channels.pop(member.id, None)
             if home_channel_id:
                 home_vc = await self.find_voice_channel_by_id(str(home_channel_id))
                 if home_vc:
+                    notify_vc = home_vc  # แจ้งเตือนในห้องทำงาน ไม่ใช่ห้องกินข้าว
                     try:
                         await member.move_to(home_vc)
                         logger.info(f"Moved {name} back → #{home_vc.name}")
@@ -375,7 +375,7 @@ class ActivityBot(discord.Client):
             else:
                 logger.info(f"No saved home channel for {name}, skipping return move")
         else:
-            # Activity → ย้ายไปห้องปลายทาง และบันทึกห้องเดิมไว้
+            # Activity → ย้ายไปห้องปลายทาง และแจ้งเตือนในห้องเดิม
             target_channel_id = self.get_target_channel_name(activity)
             if target_channel_id:
                 target_vc = await self.find_voice_channel_by_id(target_channel_id)
@@ -383,7 +383,6 @@ class ActivityBot(discord.Client):
                     if current_vc and current_vc.id == target_vc.id:
                         logger.info(f"{name} already in target channel '{target_vc.name}', skipping move")
                     else:
-                        # บันทึกห้องเดิมก่อนย้าย
                         if current_vc:
                             self._home_channels[member.id] = current_vc.id
                             logger.info(f"Saved home channel for {name}: #{current_vc.name}")
@@ -397,14 +396,14 @@ class ActivityBot(discord.Client):
                 else:
                     logger.warning(f"Target channel ID '{target_channel_id}' not found")
 
-        # Send notification to original channel (before move)
-        if current_vc:
+        # ส่งแจ้งเตือนในห้องที่ถูกต้อง
+        if notify_vc:
             try:
-                await current_vc.send(message)
-                logger.info(f"Sent to voice channel #{current_vc.name}: {name} - {activity}")
-                return True, current_vc.name
+                await notify_vc.send(message)
+                logger.info(f"Sent to voice channel #{notify_vc.name}: {name} - {activity}")
+                return True, notify_vc.name
             except Exception as e:
-                logger.error(f"Failed to send to voice channel #{current_vc.name}: {e}")
+                logger.error(f"Failed to send to voice channel #{notify_vc.name}: {e}")
 
         logger.warning(f"No voice channel found for {name} ({discord_user_id})")
         return False, None
