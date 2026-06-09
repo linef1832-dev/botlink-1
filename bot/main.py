@@ -202,6 +202,19 @@ ACTIVITY_EMOJI = {
     "พัก": "☕",
 }
 
+# ---------------------------------------------------------------------------
+# Activity → Discord voice channel auto-move
+# Map activity keyword → exact Discord voice channel name (case-insensitive)
+# Leave empty string to disable auto-move for that activity
+# ---------------------------------------------------------------------------
+ACTIVITY_MOVE_CHANNEL: dict[str, str] = {
+    "กินข้าว": "กินข้าว",
+    "ทานข้าว": "กินข้าว",
+    "พัก": "พัก",
+    "ปวดหนัก": "",
+    "ปวดน้อย": "",
+}
+
 
 def get_emoji(activity: str, is_return: bool) -> str:
     if is_return:
@@ -287,28 +300,42 @@ class ActivityBot(discord.Client):
     async def wait_until_ready_event(self):
         await self._ready_event.wait()
 
-    async def find_voice_channel_for_member(self, discord_user_id: str) -> discord.VoiceChannel | None:
+    async def find_member(self, discord_user_id: str) -> tuple[discord.Guild, discord.Member] | tuple[None, None]:
         for guild in self.guilds:
             try:
                 member = guild.get_member(int(discord_user_id))
                 if member is None:
                     member = await guild.fetch_member(int(discord_user_id))
+                if member:
+                    return guild, member
             except Exception:
                 continue
+        return None, None
 
-            if member is None:
-                continue
-
-            voice = member.voice
-            if not voice or not voice.channel:
-                logger.info(f"{discord_user_id} not in any voice channel")
-                return None
-
-            vc = voice.channel
-            logger.info(f"Found {discord_user_id} in voice channel: '{vc.name}'")
-            return vc
-
+    async def find_voice_channel_by_name(self, guild: discord.Guild, name: str) -> discord.VoiceChannel | None:
+        name_lower = name.lower().strip()
+        for channel in guild.voice_channels:
+            if channel.name.lower().strip() == name_lower:
+                return channel
         return None
+
+    async def find_voice_channel_for_member(self, discord_user_id: str) -> discord.VoiceChannel | None:
+        _, member = await self.find_member(discord_user_id)
+        if member is None:
+            return None
+        voice = member.voice
+        if not voice or not voice.channel:
+            logger.info(f"{discord_user_id} not in any voice channel")
+            return None
+        vc = voice.channel
+        logger.info(f"Found {discord_user_id} in voice channel: '{vc.name}'")
+        return vc
+
+    def get_target_channel_name(self, activity: str) -> str:
+        for keyword, channel_name in ACTIVITY_MOVE_CHANNEL.items():
+            if keyword in activity:
+                return channel_name
+        return ""
 
     async def send_notification(self, discord_user_id: str, name: str, activity: str,
                                  is_return: bool, group_name: str) -> tuple[bool, str | None]:
@@ -317,15 +344,41 @@ class ActivityBot(discord.Client):
         now = datetime.now().strftime("%H:%M")
         message = f"{emoji} {action}\n> 🕐 {now} · 📌 {group_name}"
 
-        vc = await self.find_voice_channel_for_member(discord_user_id)
-        if vc:
+        guild, member = await self.find_member(discord_user_id)
+        if member is None:
+            logger.warning(f"No member found for {name} ({discord_user_id})")
+            return False, None
+
+        # Current voice channel (send notification here — this is their "original" room)
+        current_vc = member.voice.channel if member.voice else None
+
+        # Auto-move: only for non-return activities
+        if not is_return:
+            target_name = self.get_target_channel_name(activity)
+            if target_name:
+                target_vc = await self.find_voice_channel_by_name(guild, target_name)
+                if target_vc:
+                    if current_vc and current_vc.id == target_vc.id:
+                        logger.info(f"{name} already in target channel '{target_name}', skipping move")
+                    else:
+                        try:
+                            await member.move_to(target_vc)
+                            logger.info(f"Moved {name} → #{target_vc.name}")
+                        except discord.Forbidden:
+                            logger.error(f"No permission to move {name} — bot needs 'Move Members' permission")
+                        except Exception as e:
+                            logger.error(f"Failed to move {name}: {e}")
+                else:
+                    logger.warning(f"Target channel '{target_name}' not found in server")
+
+        # Send notification to original channel (before move)
+        if current_vc:
             try:
-                # Discord voice channels have built-in text (Text in Voice) — send directly
-                await vc.send(message)
-                logger.info(f"Sent to voice channel #{vc.name}: {name} - {activity}")
-                return True, vc.name
+                await current_vc.send(message)
+                logger.info(f"Sent to voice channel #{current_vc.name}: {name} - {activity}")
+                return True, current_vc.name
             except Exception as e:
-                logger.error(f"Failed to send to voice channel #{vc.name}: {e}")
+                logger.error(f"Failed to send to voice channel #{current_vc.name}: {e}")
 
         logger.warning(f"No voice channel found for {name} ({discord_user_id})")
         return False, None
