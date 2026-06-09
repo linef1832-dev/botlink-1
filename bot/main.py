@@ -286,7 +286,15 @@ async def start_telegram(on_activity):
         logger.warning("Missing TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_PHONE. Telegram bot disabled.")
         return
 
-    session = StringSession(session_str) if session_str else StringSession()
+    if not session_str:
+        logger.error(
+            "TELEGRAM_SESSION is not set. "
+            "Run 'python bot/auth.py' in the Shell to authenticate and get the session string, "
+            "then save it as TELEGRAM_SESSION environment variable."
+        )
+        return
+
+    session = StringSession(session_str)
     client = TelegramClient(session, api_id, api_hash)
 
     await client.start(phone=phone)
