@@ -29,13 +29,6 @@ async function buildAll() {
     // - use path traversal to read files (e.g. @google-cloud/secret-manager loads sibling .proto files)
     external: [
       "*.node",
-      "telegram",
-      "discord.js",
-      "@discordjs/ws",
-      "@discordjs/rest",
-      "@discordjs/collection",
-      "@discordjs/builders",
-      "@discordjs/util",
       "sharp",
       "better-sqlite3",
       "sqlite3",
