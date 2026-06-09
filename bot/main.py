@@ -393,9 +393,17 @@ class ActivityBot(discord.Client):
             logger.warning(f"No member found for {name} ({discord_user_id})")
             return False, None
 
-        # ห้องทำงานจริง (อยู่นาน ≥ 60 วิ) คือห้องที่ใช้แจ้งเตือนและย้ายกลับ
+        # ห้องทำงานจริง (อยู่นาน ≥ 10 นาที) คือห้องที่ใช้แจ้งเตือนและย้ายกลับ
         work_channel_id = self._work_channels.get(member.id)
         work_vc = await self.find_voice_channel_by_id(str(work_channel_id)) if work_channel_id else None
+
+        # Fallback: ถ้ายังไม่มีห้องที่จำไว้ (เช่น bot เพิ่ง restart)
+        # ให้ใช้ห้องที่ member อยู่ตอนนี้ถ้าไม่ใช่ห้องปลายทาง
+        if work_vc is None and member.voice and member.voice.channel:
+            current_ch = member.voice.channel
+            if str(current_ch.id) not in DESTINATION_CHANNEL_IDS:
+                work_vc = current_ch
+                logger.info(f"Using current channel as work channel for {name}: #{current_ch.name}")
 
         if is_return:
             # กลับที่นั่ง → ย้ายกลับห้องทำงาน และแจ้งเตือนที่นั่น
