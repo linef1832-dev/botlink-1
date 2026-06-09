@@ -317,6 +317,8 @@ class ActivityBot(discord.Client):
         self._hour_time: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
         # ชั่วโมงปัจจุบัน (0-23) เพื่อรู้เมื่อขึ้นชั่วโมงใหม่
         self._current_hour: int = datetime.now().hour
+        # member_id → channel_id ห้องที่แจ้งกิจกรรมล่าสุด (ใช้สำหรับ "กลับที่นั่ง")
+        self._last_notified_channel: dict[int, int] = {}
 
     async def setup_hook(self):
         await self.tree.sync()
@@ -443,19 +445,23 @@ class ActivityBot(discord.Client):
                 current_ch = ch
 
         if is_return:
-            # กลับที่นั่ง → ย้ายกลับห้องทำงาน + แจ้งที่นั่น
-            target_vc = work_vc or current_ch
-            if target_vc:
+            # กลับที่นั่ง → ย้ายกลับห้องทำงาน (จากสถิติ) แต่แจ้งที่ห้องที่เคยแจ้งกิจกรรมล่าสุด
+            move_target = work_vc or current_ch
+            if move_target:
                 try:
-                    await member.move_to(target_vc)
-                    logger.info(f"Moved {name} back → #{target_vc.name}")
+                    await member.move_to(move_target)
+                    logger.info(f"Moved {name} back → #{move_target.name}")
                 except discord.Forbidden:
                     logger.error(f"No permission to move {name} — bot needs 'Move Members' permission")
                 except Exception as e:
                     logger.error(f"Failed to move {name} back: {e}")
             else:
                 logger.info(f"No work channel found for {name}, skipping return move")
-            notify_vc = target_vc
+
+            # แจ้งในห้องที่เคยแจ้งกิจกรรมล่าสุด (ถ้ามี) หรือห้องทำงาน
+            last_ch_id = self._last_notified_channel.get(member.id)
+            last_vc = await self.find_voice_channel_by_id(str(last_ch_id)) if last_ch_id else None
+            notify_vc = last_vc or move_target
 
         else:
             target_channel_id = self.get_target_channel_name(activity)
@@ -479,16 +485,18 @@ class ActivityBot(discord.Client):
                 else:
                     logger.warning(f"Target channel ID '{target_channel_id}' not found")
             else:
-                # ปวดน้อย / ปวดหนัก / พัก → แจ้งห้องที่อยู่ตอนนี้เลย ไม่บันทึกเพิ่ม
+                # ปวดน้อย / ปวดหนัก / พัก → แจ้งห้องทำงานจากสถิติ (หรือห้องปัจจุบันถ้ายังไม่มีสถิติ)
                 notify_vc = work_vc or current_ch
                 if notify_vc is None:
                     logger.warning(f"{name} is not in any voice channel — notification skipped")
 
-        # ส่งแจ้งเตือนในห้องทำงาน
+        # ส่งแจ้งเตือน + บันทึกห้องที่แจ้ง (เพื่อใช้ตอนกลับที่นั่ง)
         if notify_vc:
             try:
                 await notify_vc.send(message)
                 logger.info(f"Sent to voice channel #{notify_vc.name}: {name} - {activity}")
+                if not is_return:
+                    self._last_notified_channel[member.id] = notify_vc.id
                 return True, notify_vc.name
             except Exception as e:
                 logger.error(f"Failed to send to voice channel #{notify_vc.name}: {e}")
