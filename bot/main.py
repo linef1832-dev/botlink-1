@@ -397,14 +397,12 @@ class ActivityBot(discord.Client):
         work_channel_id = self._work_channels.get(member.id)
         work_vc = await self.find_voice_channel_by_id(str(work_channel_id)) if work_channel_id else None
 
-        # Fallback: ถ้ายังไม่มีห้องที่จำไว้ (เช่น bot เพิ่ง restart)
-        # ให้ใช้ห้องที่ member อยู่ตอนนี้ถ้าไม่ใช่ห้องปลายทาง และบันทึกไว้เลย
-        if work_vc is None and member.voice and member.voice.channel:
-            current_ch = member.voice.channel
-            if str(current_ch.id) not in DESTINATION_CHANNEL_IDS:
-                work_vc = current_ch
-                self._work_channels[member.id] = current_ch.id
-                logger.info(f"Recorded fallback work channel for {name}: #{current_ch.name}")
+        # ห้องที่ member อยู่ตอนนี้ (ถ้าไม่ใช่ห้องปลายทาง)
+        current_ch = None
+        if member.voice and member.voice.channel:
+            ch = member.voice.channel
+            if str(ch.id) not in DESTINATION_CHANNEL_IDS:
+                current_ch = ch
 
         if is_return:
             # กลับที่นั่ง → ย้ายกลับห้องทำงาน และแจ้งเตือนที่นั่น
@@ -421,17 +419,23 @@ class ActivityBot(discord.Client):
 
             notify_vc = work_vc
         else:
-            # Activity → แจ้งเตือนที่ห้องทำงาน แล้วย้ายไปห้องปลายทาง
-            notify_vc = work_vc
-
             target_channel_id = self.get_target_channel_name(activity)
+
             if target_channel_id:
+                # กินข้าว / ทานข้าว → ต้องรู้ห้องทำงานเพื่อแจ้งและย้ายกลับ
+                # ถ้ายังไม่มีห้องที่จำไว้ → ใช้ห้องปัจจุบัน + บันทึกเป็นห้องทำงาน
+                if work_vc is None and current_ch:
+                    work_vc = current_ch
+                    self._work_channels[member.id] = current_ch.id
+                    logger.info(f"Recorded work channel for {name}: #{current_ch.name}")
+
+                notify_vc = work_vc
+
                 target_vc = await self.find_voice_channel_by_id(target_channel_id)
                 if target_vc:
-                    current_vc = member.voice.channel if member.voice else None
-                    if current_vc and current_vc.id == target_vc.id:
+                    mem_vc = member.voice.channel if member.voice else None
+                    if mem_vc and mem_vc.id == target_vc.id:
                         logger.info(f"{name} already in target channel '{target_vc.name}', skipping move")
-                        notify_vc = work_vc  # อยู่ห้องกินข้าวอยู่แล้ว → แจ้งในห้องทำงานแทน
                     else:
                         try:
                             await member.move_to(target_vc)
@@ -442,6 +446,11 @@ class ActivityBot(discord.Client):
                             logger.error(f"Failed to move {name}: {e}")
                 else:
                     logger.warning(f"Target channel ID '{target_channel_id}' not found")
+            else:
+                # ปวดน้อย / ปวดหนัก / พัก → แจ้งห้องที่อยู่ตอนนี้เลย ไม่บันทึกห้องทำงาน
+                notify_vc = work_vc or current_ch
+                if notify_vc is None:
+                    logger.warning(f"{name} is not in any voice channel — notification skipped")
 
         # ส่งแจ้งเตือนในห้องทำงาน
         if notify_vc:
