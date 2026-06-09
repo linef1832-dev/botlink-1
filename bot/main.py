@@ -260,18 +260,28 @@ class ActivityBot(discord.Client):
                 return None
 
             vc = voice.channel
-            logger.info(f"Found {discord_user_id} in voice channel: {vc.name}")
+            cat = vc.category
+            logger.info(f"Found {discord_user_id} in voice: '{vc.name}' | category: '{cat.name if cat else 'NO CATEGORY'}'")
 
-            # Try text channel in same category
-            if vc.category:
-                for ch in vc.category.channels:
+            if cat:
+                cat_channels = [(ch.name, type(ch).__name__) for ch in cat.channels]
+                logger.info(f"Channels in category '{cat.name}': {cat_channels}")
+                for ch in cat.channels:
                     if isinstance(ch, discord.TextChannel):
                         return ch
 
-            # Try text channel with similar name
+            # Fallback: any text channel whose name overlaps with voice channel name
+            vc_words = set(re.sub(r"[^\w\u0E00-\u0E7F]", " ", vc.name.lower()).split())
             for ch in guild.text_channels:
-                if vc.name.lower()[:5] in ch.name.lower():
+                ch_words = set(re.sub(r"[^\w\u0E00-\u0E7F]", " ", ch.name.lower()).split())
+                if vc_words & ch_words:
+                    logger.info(f"Fallback text channel match: #{ch.name}")
                     return ch
+
+            # Last resort: first text channel in guild
+            if guild.text_channels:
+                logger.warning(f"Using first text channel in guild: #{guild.text_channels[0].name}")
+                return guild.text_channels[0]
 
         return None
 
