@@ -529,15 +529,41 @@ async def on_activity(parsed: dict):
     logger.info(f"{emp['name']} [{parsed['activity']}] → Discord {status}")
 
 
+async def start_telegram_with_reconnect(on_activity):
+    """Wrap start_telegram with auto-reconnect on disconnect."""
+    backoff = 5
+    while True:
+        try:
+            await start_telegram(on_activity)
+            logger.warning("Telegram disconnected — reconnecting in %ds...", backoff)
+        except Exception as e:
+            logger.error("Telegram error: %s — reconnecting in %ds...", e, backoff)
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 300)  # cap at 5 minutes
+
+
+async def start_discord_with_reconnect(token: str):
+    """Wrap discord bot start with auto-reconnect on disconnect."""
+    backoff = 5
+    while True:
+        try:
+            await discord_bot.start(token)
+            logger.warning("Discord disconnected — reconnecting in %ds...", backoff)
+        except Exception as e:
+            logger.error("Discord error: %s — reconnecting in %ds...", e, backoff)
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 300)
+
+
 async def main():
     discord_token = os.environ.get("DISCORD_BOT_TOKEN", "")
     if not discord_token:
         logger.warning("Missing DISCORD_BOT_TOKEN. Discord bot disabled.")
         discord_task = asyncio.create_task(asyncio.sleep(0))
     else:
-        discord_task = asyncio.create_task(discord_bot.start(discord_token))
+        discord_task = asyncio.create_task(start_discord_with_reconnect(discord_token))
 
-    telegram_task = asyncio.create_task(start_telegram(on_activity))
+    telegram_task = asyncio.create_task(start_telegram_with_reconnect(on_activity))
 
     await asyncio.gather(discord_task, telegram_task, return_exceptions=True)
 
