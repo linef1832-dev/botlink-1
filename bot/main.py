@@ -317,6 +317,20 @@ class ActivityBot(discord.Client):
     async def on_ready(self):
         logger.info(f"Discord bot ready: {self.user}")
         self._ready_event.set()
+        await self.send_status("🟢 **Bot online** — Telegram + Discord connected")
+
+    async def send_status(self, message: str):
+        """ส่งข้อความสถานะไปยัง DISCORD_STATUS_CHANNEL_ID ถ้ากำหนดไว้"""
+        channel_id = os.environ.get("DISCORD_STATUS_CHANNEL_ID", "")
+        if not channel_id:
+            return
+        try:
+            channel = self.get_channel(int(channel_id))
+            if channel:
+                now = datetime.now().strftime("%d/%m %H:%M")
+                await channel.send(f"{message}\n> 🕐 {now}")
+        except Exception as e:
+            logger.error(f"Failed to send status message: {e}")
 
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
         now = time_module.time()
@@ -567,14 +581,21 @@ async def on_activity(parsed: dict):
 async def start_telegram_with_reconnect(on_activity):
     """Wrap start_telegram with auto-reconnect on disconnect."""
     backoff = 5
+    first_run = True
     while True:
         try:
             await start_telegram(on_activity)
+            # Telegram disconnected cleanly
+            await discord_bot.send_status(f"🟡 **Telegram disconnected** — reconnecting in {backoff}s...")
             logger.warning("Telegram disconnected — reconnecting in %ds...", backoff)
         except Exception as e:
+            await discord_bot.send_status(f"🔴 **Telegram error** — `{type(e).__name__}` reconnecting in {backoff}s...")
             logger.error("Telegram error: %s — reconnecting in %ds...", e, backoff)
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 300)  # cap at 5 minutes
+        if not first_run:
+            await discord_bot.send_status("🔄 **Telegram reconnecting...**")
+        first_run = False
 
 
 async def start_discord_with_reconnect(token: str):
