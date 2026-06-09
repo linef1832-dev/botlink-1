@@ -194,7 +194,7 @@ EMPLOYEES: dict[str, dict] = {
     "8588408697": {"name": "TANGO", "discord_id": "1483771517601841265"},
 }
 
-TARGET_GROUPS = ["Jun88"]
+TARGET_GROUPS = ["Jun88-กลุ่มเช็คอิน打卡群", "Jun88-OL กลุ่มเช็คอิน 打卡群"]
 
 RETURN_KEYWORDS = ["กลับที่นั่ง", "กลับที่นัง", "回座"]
 
