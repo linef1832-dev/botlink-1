@@ -170,17 +170,46 @@ def get_emoji(activity: str, is_return: bool) -> str:
 def parse_message(text: str, group_name: str) -> dict | None:
     if not text:
         return None
+
+    # Must have รหัสผู้ใช้
     tid_match = re.search(r"รหัสผู้ใช้[：:]\s*(\d+)", text)
     if not tid_match:
         return None
+
+    activity = None
+
+    # Format A: "ลงทะเบียนสำหรับ <activity>" (long report message)
     act_match = re.search(
         r"ลงทะเบียนสำหรับ\s+(.+?)(?:\s+สำเร็จ)?(?:\s*[:：].*)?$",
         text, re.MULTILINE
     )
-    if not act_match:
+    if act_match:
+        activity = act_match.group(1).strip()
+
+    # Format B: line between "ผู้ใช้：..." and "รหัสผู้ใช้：..." (short notification)
+    if not activity:
+        b_match = re.search(
+            r"ผู้ใช้[：:].*\n(.+?)\n.*รหัสผู้ใช้[：:]",
+            text, re.DOTALL
+        )
+        if b_match:
+            # Activity may have a dot suffix like "ปวดน้อย.สุบุตรี" — take only before the dot
+            raw = b_match.group(1).strip()
+            activity = raw.split(".")[0].strip()
+
+    # Format C: first non-empty line after "ผู้ใช้：..." (fallback)
+    if not activity:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        for i, line in enumerate(lines):
+            if re.match(r"ผู้ใช้[：:]", line) and i + 1 < len(lines):
+                candidate = lines[i + 1]
+                if not re.match(r"รหัสผู้ใช้[：:]", candidate):
+                    activity = candidate.split(".")[0].strip()
+                    break
+
+    if not activity:
         return None
 
-    activity = act_match.group(1).strip()
     is_return = any(kw in activity for kw in RETURN_KEYWORDS)
 
     ts_match = re.search(r"(\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})", text)
@@ -314,14 +343,21 @@ async def start_telegram(on_activity):
         try:
             chat = await event.get_chat()
             title = getattr(chat, "title", "") or ""
-            if not any(g in title for g in TARGET_GROUPS):
-                return
 
-            text = event.message.text or ""
-            parsed = parse_message(text, title)
-            if parsed:
-                logger.info(f"Activity detected: {parsed['telegram_id']} - {parsed['activity']}")
-                await on_activity(parsed)
+            # Debug: log every message from Jun88 groups
+            if any(g in title for g in TARGET_GROUPS):
+                text = event.message.text or ""
+                sender = getattr(event.message.sender, "username", None) or getattr(event.message.sender, "first_name", "unknown") if event.message.sender else "unknown"
+                logger.info(f"[{title}] msg from {sender}: {text[:120]!r}")
+
+                parsed = parse_message(text, title)
+                if parsed:
+                    logger.info(f"Activity detected: {parsed['telegram_id']} - {parsed['activity']}")
+                    await on_activity(parsed)
+                elif "รหัสผู้ใช้" in text:
+                    logger.warning(f"Has รหัสผู้ใช้ but parse failed. Full text: {text!r}")
+            else:
+                pass  # Ignore non-Jun88 groups silently
         except Exception as e:
             logger.error(f"Error handling Telegram message: {e}")
 
