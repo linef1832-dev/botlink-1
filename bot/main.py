@@ -171,51 +171,47 @@ def parse_message(text: str, group_name: str) -> dict | None:
     if not text:
         return None
 
-    # Must have รหัสผู้ใช้
-    tid_match = re.search(r"รหัสผู้ใช้[：:]\s*(\d+)", text)
+    # Skip error/failed messages (❌ with ไม่สามารถ)
+    if "❌" in text and ("ไม่สามารถ" in text or "失败" in text):
+        return None
+
+    # Extract Telegram ID — supports both plain and markdown-wrapped:
+    # "รหัสผู้ใช้：12345"  or  "**รหัสผู้ใช้：** `12345`"
+    tid_match = re.search(r"รหัสผู้ใช้[：:][^\d]*(\d+)", text)
     if not tid_match:
         return None
 
     activity = None
 
-    # Format A: "ลงทะเบียนสำหรับ <activity>" (long report message)
-    act_match = re.search(
-        r"ลงทะเบียนสำหรับ\s+(.+?)(?:\s+สำเร็จ)?(?:\s*[:：].*)?$",
-        text, re.MULTILINE
-    )
-    if act_match:
-        activity = act_match.group(1).strip()
+    # Format A: check-in success  "✅ **ลงทะเบียนสำเร็จ：** `ปวดหนัก`"
+    a_match = re.search(r"ลงทะเบียนสำเร็จ[：:][^`]*`([^`]+)`", text)
+    if a_match:
+        activity = a_match.group(1).strip()
 
-    # Format B: line between "ผู้ใช้：..." and "รหัสผู้ใช้：..." (short notification)
+    # Format B: กลับที่นั่ง  "ลงทะเบียนสำหรับ กลับที่นั่ง สำเร็จ"
     if not activity:
-        b_match = re.search(
-            r"ผู้ใช้[：:].*\n(.+?)\n.*รหัสผู้ใช้[：:]",
-            text, re.DOTALL
-        )
+        b_match = re.search(r"ลงทะเบียนสำหรับ\s+(.+?)\s+สำเร็จ", text)
         if b_match:
-            # Activity may have a dot suffix like "ปวดน้อย.สุบุตรี" — take only before the dot
-            raw = b_match.group(1).strip()
-            activity = raw.split(".")[0].strip()
+            activity = b_match.group(1).strip()
 
-    # Format C: first non-empty line after "ผู้ใช้：..." (fallback)
+    # Format C: plain  "ลงทะเบียนสำหรับ <activity>" without สำเร็จ
     if not activity:
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        for i, line in enumerate(lines):
-            if re.match(r"ผู้ใช้[：:]", line) and i + 1 < len(lines):
-                candidate = lines[i + 1]
-                if not re.match(r"รหัสผู้ใช้[：:]", candidate):
-                    activity = candidate.split(".")[0].strip()
-                    break
+        c_match = re.search(r"ลงทะเบียนสำหรับ\s+(\S+)", text)
+        if c_match:
+            activity = c_match.group(1).strip()
 
     if not activity:
         return None
+
+    # Strip location suffix e.g. "ปวดน้อย.สูบบุหรี่" → "ปวดน้อย"
+    activity = activity.split(".")[0].strip()
 
     is_return = any(kw in activity for kw in RETURN_KEYWORDS)
 
     ts_match = re.search(r"(\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})", text)
     timestamp = ts_match.group(1) if ts_match else datetime.now().strftime("%d/%m %H:%M:%S")
 
-    dur_match = re.search(r"เวลากิจกรรมนี้[：:]\s*([\d:]+)", text)
+    dur_match = re.search(r"เวลากิจกรรมนี้[：:][^`]*`([^`]+)`", text)
     duration = dur_match.group(1) if dur_match else None
 
     return {
