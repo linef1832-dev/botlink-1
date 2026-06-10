@@ -320,6 +320,8 @@ class ActivityBot(discord.Client):
         self._current_hour: int = datetime.now().hour
         # member_id → channel_id ห้องที่แจ้งกิจกรรมล่าสุด (ใช้สำหรับ "กลับที่นั่ง")
         self._last_notified_channel: dict[int, int] = {}
+        # member_id → discord.Message ของกิจกรรมล่าสุด (ใช้สำหรับ reply ตอนกลับที่นั่ง)
+        self._last_activity_message: dict[int, discord.Message] = {}
         # member_id ที่ถูกย้ายไปห้องปลายทาง (เช่น Dining) — คนเหล่านี้เท่านั้นที่ต้องย้ายกลับ
         self._moved_to_destination: set[int] = set()
 
@@ -520,10 +522,19 @@ class ActivityBot(discord.Client):
         # ส่งแจ้งเตือน + บันทึกห้องที่แจ้ง (เพื่อใช้ตอนกลับที่นั่ง)
         if notify_vc:
             try:
-                await notify_vc.send(message)
-                logger.info(f"Sent to voice channel #{notify_vc.name}: {name} - {activity}")
-                if not is_return:
+                if is_return:
+                    # reply กลับไปที่ message กิจกรรมล่าสุด (ถ้ามี)
+                    ref_msg = self._last_activity_message.get(member.id)
+                    if ref_msg and ref_msg.channel.id == notify_vc.id:
+                        sent_msg = await ref_msg.reply(message)
+                    else:
+                        sent_msg = await notify_vc.send(message)
+                    self._last_activity_message.pop(member.id, None)
+                else:
+                    sent_msg = await notify_vc.send(message)
                     self._last_notified_channel[member.id] = notify_vc.id
+                    self._last_activity_message[member.id] = sent_msg
+                logger.info(f"Sent to voice channel #{notify_vc.name}: {name} - {activity}")
                 return True, notify_vc.name
             except Exception as e:
                 logger.error(f"Failed to send to voice channel #{notify_vc.name}: {e}")
