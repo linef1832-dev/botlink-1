@@ -623,24 +623,19 @@ async def start_telegram(on_activity):
             chat = await event.get_chat()
             title = getattr(chat, "title", "") or ""
 
-            # Log ทุกข้อความพร้อมชื่อกลุ่ม เพื่อ debug
-            logger.info(f"[MSG] chat='{title}'")
+            if not any(g in title for g in TARGET_GROUPS):
+                return
 
-            if any(g in title for g in TARGET_GROUPS):
-                text = event.message.text or ""
-                sender = getattr(event.message.sender, "username", None) or getattr(event.message.sender, "first_name", "unknown") if event.message.sender else "unknown"
-                logger.info(f"[Jun88] from {sender}: {text[:120]!r}")
+            text = event.message.text or ""
+            sender = getattr(event.message.sender, "username", None) or getattr(event.message.sender, "first_name", "unknown") if event.message.sender else "unknown"
+            logger.info(f"[Jun88] from {sender}: {text[:120]!r}")
 
-                parsed = parse_message(text, title)
-                if parsed:
-                    logger.info(f"[PARSE OK] id={parsed['telegram_id']} activity={parsed['activity']}")
-                    await on_activity(parsed)
-                elif "รหัสผู้ใช้" in text:
-                    logger.warning(f"[PARSE FAIL] Has รหัสผู้ใช้ but parse failed. Full text: {text!r}")
-                else:
-                    logger.info(f"[SKIP] Not an activity message")
-            else:
-                logger.info(f"[SKIP] '{title}' — not in TARGET_GROUPS")
+            parsed = parse_message(text, title)
+            if parsed:
+                logger.info(f"[PARSE OK] id={parsed['telegram_id']} activity={parsed['activity']}")
+                await on_activity(parsed)
+            elif "รหัสผู้ใช้" in text:
+                logger.warning(f"[PARSE FAIL] Has รหัสผู้ใช้ but parse failed. Full text: {text!r}")
         except Exception as e:
             logger.error(f"Error handling Telegram message: {e}")
 
