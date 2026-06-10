@@ -328,6 +328,16 @@ class ActivityBot(discord.Client):
 
     async def on_ready(self):
         logger.info(f"Discord bot ready: {self.user}")
+        now = time_module.time()
+        count = 0
+        for guild in self.guilds:
+            for channel in guild.voice_channels:
+                for member in channel.members:
+                    if str(channel.id) not in DESTINATION_CHANNEL_IDS:
+                        self._voice_join_time[member.id] = (channel.id, now)
+                        count += 1
+        if count:
+            logger.info(f"Snapshot: found {count} member(s) already in voice channels")
         self._ready_event.set()
 
     async def send_status(self, message: str):
