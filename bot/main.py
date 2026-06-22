@@ -498,8 +498,14 @@ class ActivityBot(discord.Client):
         emoji = get_emoji(activity, is_return)
         action = f"**{name}** กลับที่นั่งแล้ว" if is_return else f"**{name}** ไป{activity}"
         if timestamp:
-            # timestamp format: "dd/mm HH:MM:SS" → extract HH:MM
-            time_part = timestamp.split(" ")[-1][:5]
+            # timestamp format: "dd/mm HH:MM:SS" → extract HH:MM then convert +8 → +7 (Thai time)
+            raw_time = timestamp.split(" ")[-1][:5]
+            try:
+                h, m = map(int, raw_time.split(":"))
+                h = (h - 1) % 24
+                time_part = f"{h:02d}:{m:02d}"
+            except Exception:
+                time_part = raw_time
         else:
             time_part = datetime.now().strftime("%H:%M")
         message = f"{emoji} {action}\n> 🕐 {time_part} · 📌 {group_name}"
