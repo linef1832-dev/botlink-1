@@ -434,7 +434,17 @@ class ActivityBot(discord.Client):
 
         async def play_in_channel(channel: discord.VoiceChannel):
             guild_id = channel.guild.id
+            vc: discord.VoiceClient | None = None
             try:
+                # Bot ต้องเชื่อมต่ออยู่ใน voice channel ก่อนถึงจะส่ง soundboard effect ได้
+                existing_vc = channel.guild.voice_client
+                if existing_vc and existing_vc.channel and existing_vc.channel.id == channel.id:
+                    vc = existing_vc
+                else:
+                    if existing_vc:
+                        await existing_vc.disconnect(force=True)
+                    vc = await channel.connect(timeout=10, reconnect=False)
+
                 # รอบ 1
                 await self.http.request(
                     discord.http.Route(
@@ -457,10 +467,16 @@ class ActivityBot(discord.Client):
                     json={"sound_id": str(sound_id), "source_guild_id": str(guild_id)},
                 )
                 logger.info(f"[SHIFT] Played sound round 2 in #{channel.name}")
+                # รอให้เสียงรอบ 2 จบแล้ว leave
+                await asyncio.sleep(sound_duration)
             except Exception as e:
                 logger.error(f"[SHIFT] Error playing sound in #{channel.name}: {e}")
+            finally:
+                if vc and vc.is_connected():
+                    await vc.disconnect(force=True)
 
-        await asyncio.gather(*[play_in_channel(ch) for ch in occupied.values()])
+        for ch in occupied.values():
+            await play_in_channel(ch)
 
     async def find_member(self, discord_user_id: str) -> tuple[discord.Guild, discord.Member] | tuple[None, None]:
         for guild in self.guilds:
