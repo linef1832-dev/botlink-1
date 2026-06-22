@@ -467,8 +467,6 @@ class ActivityBot(discord.Client):
                     json={"sound_id": str(sound_id), "source_guild_id": str(guild_id)},
                 )
                 logger.info(f"[SHIFT] Played sound round 2 in #{channel.name}")
-                # รอให้เสียงรอบ 2 จบแล้ว leave
-                await asyncio.sleep(sound_duration)
             except Exception as e:
                 logger.error(f"[SHIFT] Error playing sound in #{channel.name}: {e}")
             finally:
