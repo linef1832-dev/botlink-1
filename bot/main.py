@@ -196,6 +196,17 @@ EMPLOYEES: dict[str, dict] = {
 
 TARGET_GROUPS = ["Jun88-กลุ่มเช็คอิน打卡群", "Jun88-OL กลุ่มเช็คอิน 打卡群", "OL ชั่วคราว", "AM ONLINE เข้างาน"]
 
+# กลุ่มที่ใช้ระบบกะงาน (ไม่ใช่เช็คอินรายบุคคล)
+SHIFT_GROUPS = ["OL ชั่วคราว", "AM ONLINE เข้างาน"]
+
+# ข้อความกะงานที่ต้องดักจับ
+SHIFT_KEYWORDS = [
+    "กะเช้า(08.00-20.00 น.) รอบที่ 1",
+    "กะเช้า(08.00-20.00 น.) รอบที่ 2",
+    "กะดึก(20.00-08.00 น.) รอบที่ 1",
+    "กะดึก(20.00-08.00 น.) รอบที่ 2",
+]
+
 RETURN_KEYWORDS = ["กลับที่นั่ง", "กลับที่นัง", "回座"]
 
 ACTIVITY_EMOJI = {
@@ -380,6 +391,67 @@ class ActivityBot(discord.Client):
 
     async def wait_until_ready_event(self):
         await self._ready_event.wait()
+
+    async def play_shift_sound(self, shift_label: str):
+        """เปิดเสียง soundboard ในทุกห้อง voice ที่มีพนักงานอยู่ (2 ครั้งต่อห้อง)"""
+        sound_id_str = os.environ.get("SHIFT_SOUND_ID", "")
+        if not sound_id_str:
+            logger.warning("[SHIFT] SHIFT_SOUND_ID not set — skipping soundboard")
+            return
+
+        try:
+            sound_id = int(sound_id_str)
+        except ValueError:
+            logger.error(f"[SHIFT] SHIFT_SOUND_ID is not a valid integer: {sound_id_str!r}")
+            return
+
+        await self.wait_until_ready_event()
+
+        # รวบรวมห้อง voice ที่มีพนักงานอยู่ (ไม่นับห้องปลายทาง เช่น Dining)
+        occupied: dict[int, discord.VoiceChannel] = {}
+        for _member_id, (channel_id, _) in self._voice_join_time.items():
+            if str(channel_id) not in DESTINATION_CHANNEL_IDS and channel_id not in occupied:
+                ch = self.get_channel(channel_id)
+                if isinstance(ch, discord.VoiceChannel):
+                    occupied[channel_id] = ch
+
+        if not occupied:
+            logger.info(f"[SHIFT] {shift_label} — no occupied voice channels, skipping")
+            return
+
+        ch_names = [ch.name for ch in occupied.values()]
+        logger.info(f"[SHIFT] {shift_label} — playing sound in {len(occupied)} channel(s): {ch_names}")
+
+        for channel_id, channel in occupied.items():
+            guild_id = channel.guild.id
+            try:
+                # เข้าร่วม voice channel ผ่าน gateway (ไม่ส่ง audio จริง)
+                await self.ws.voice_state(guild_id, channel_id, self_mute=True, self_deaf=True)
+                await asyncio.sleep(1.0)
+
+                # เปิดเสียง 2 รอบติดกัน
+                for round_num in range(1, 3):
+                    await self.http.request(
+                        discord.http.Route(
+                            "POST",
+                            "/channels/{channel_id}/send-soundboard-sound",
+                            channel_id=channel_id,
+                        ),
+                        json={"sound_id": str(sound_id), "source_guild_id": str(guild_id)},
+                    )
+                    logger.info(f"[SHIFT] Played sound round {round_num} in #{channel.name}")
+                    await asyncio.sleep(0.5)
+
+                # ออกจาก voice channel
+                await self.ws.voice_state(guild_id, None)
+                await asyncio.sleep(0.5)
+
+            except Exception as e:
+                logger.error(f"[SHIFT] Error playing sound in #{channel.name}: {e}")
+                try:
+                    await self.ws.voice_state(guild_id, None)
+                except Exception:
+                    pass
 
     async def find_member(self, discord_user_id: str) -> tuple[discord.Guild, discord.Member] | tuple[None, None]:
         for guild in self.guilds:
@@ -651,6 +723,15 @@ async def start_telegram(on_activity):
             sender = getattr(event.message.sender, "username", None) or getattr(event.message.sender, "first_name", "unknown") if event.message.sender else "unknown"
             logger.info(f"[Jun88] from {sender}: {text[:120]!r}")
 
+            # กลุ่มกะงาน → ดักข้อความกะเช้า/กะดึก แล้วเปิดเสียง
+            if any(g in title for g in SHIFT_GROUPS):
+                matched = next((kw for kw in SHIFT_KEYWORDS if kw in text), None)
+                if matched:
+                    logger.info(f"[SHIFT] Detected '{matched}' in '{title}'")
+                    asyncio.create_task(discord_bot.play_shift_sound(matched))
+                return
+
+            # กลุ่มเช็คอินปกติ → parse และแจ้ง Discord
             parsed = parse_message(text, title)
             if parsed:
                 logger.info(f"[PARSE OK] id={parsed['telegram_id']} activity={parsed['activity']}")
