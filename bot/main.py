@@ -199,10 +199,17 @@ TARGET_GROUPS = ["Jun88-กลุ่มเช็คอิน打卡群", "Jun88-O
 # กลุ่มที่ใช้ระบบกะงาน → Sound ID สำหรับแต่ละกลุ่ม
 SHIFT_GROUPS = ["OL ชั่วคราว", "AM ONLINE เข้างาน"]
 
-SHIFT_GROUP_SOUND_ID: dict[str, str] = {
-    "OL ชั่วคราว": os.environ.get("SHIFT_SOUND_ID_OL", ""),
-    "AM ONLINE เข้างาน": os.environ.get("SHIFT_SOUND_ID_AM_ONLINE", ""),
-}
+def get_shift_sound_id(group_name: str) -> int:
+    """อ่าน sound ID จาก env ทุกครั้ง (ไม่ cache ตอน startup)"""
+    mapping = {
+        "OL ชั่วคราว": os.environ.get("SHIFT_SOUND_ID_OL", ""),
+        "AM ONLINE เข้างาน": os.environ.get("SHIFT_SOUND_ID_AM_ONLINE", ""),
+    }
+    val = mapping.get(group_name, "")
+    try:
+        return int(val) if val else 0
+    except ValueError:
+        return 0
 
 # ความยาวเสียง (วินาที) ของแต่ละ sound_id — ใช้รอให้รอบ 1 จบก่อนเปิดรอบ 2
 SHIFT_SOUND_DURATION: dict[str, float] = {
@@ -739,8 +746,7 @@ async def start_telegram(on_activity):
                 matched = next((kw for kw in SHIFT_KEYWORDS if kw in text), None)
                 if matched:
                     group_key = next((g for g in SHIFT_GROUPS if g in title), "")
-                    sound_id_str = SHIFT_GROUP_SOUND_ID.get(group_key, "")
-                    sound_id = int(sound_id_str) if sound_id_str else 0
+                    sound_id = get_shift_sound_id(group_key)
                     logger.info(f"[SHIFT] Detected '{matched}' in '{title}' (sound_id={sound_id})")
                     asyncio.create_task(discord_bot.play_shift_sound(matched, sound_id))
                 return
