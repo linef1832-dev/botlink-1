@@ -759,7 +759,15 @@ async def start_telegram(on_activity):
                     group_key = next((g for g in SHIFT_GROUPS if g in title), "")
                     sound_id = get_shift_sound_id(group_key)
                     logger.info(f"[SHIFT] Detected '{matched}' in '{title}' (sound_id={sound_id})")
-                    asyncio.create_task(discord_bot.play_shift_sound(matched, sound_id))
+
+                    async def _run_shift_sound(label=matched, sid=sound_id):
+                        try:
+                            await discord_bot.play_shift_sound(label, sid)
+                            logger.info(f"[SHIFT] Done playing sound for '{label}'")
+                        except Exception as exc:
+                            logger.error(f"[SHIFT] Unhandled error in play_shift_sound: {exc}")
+
+                    asyncio.create_task(_run_shift_sound())
                 return
 
             # กลุ่มเช็คอินปกติ → parse และแจ้ง Discord
