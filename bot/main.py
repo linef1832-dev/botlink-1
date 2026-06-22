@@ -418,38 +418,26 @@ class ActivityBot(discord.Client):
             return
 
         ch_names = [ch.name for ch in occupied.values()]
-        logger.info(f"[SHIFT] {shift_label} — playing sound in {len(occupied)} channel(s): {ch_names}")
+        logger.info(f"[SHIFT] {shift_label} — playing sound simultaneously in {len(occupied)} channel(s): {ch_names}")
 
-        for channel_id, channel in occupied.items():
+        async def play_in_channel(channel: discord.VoiceChannel):
             guild_id = channel.guild.id
             try:
-                # เข้าร่วม voice channel ผ่าน gateway (ไม่ส่ง audio จริง)
-                await self.ws.voice_state(guild_id, channel_id, self_mute=True, self_deaf=True)
-                await asyncio.sleep(1.0)
-
-                # เปิดเสียง 2 รอบติดกัน
                 for round_num in range(1, 3):
                     await self.http.request(
                         discord.http.Route(
                             "POST",
                             "/channels/{channel_id}/send-soundboard-sound",
-                            channel_id=channel_id,
+                            channel_id=channel.id,
                         ),
                         json={"sound_id": str(sound_id), "source_guild_id": str(guild_id)},
                     )
                     logger.info(f"[SHIFT] Played sound round {round_num} in #{channel.name}")
                     await asyncio.sleep(0.5)
-
-                # ออกจาก voice channel
-                await self.ws.voice_state(guild_id, None)
-                await asyncio.sleep(0.5)
-
             except Exception as e:
                 logger.error(f"[SHIFT] Error playing sound in #{channel.name}: {e}")
-                try:
-                    await self.ws.voice_state(guild_id, None)
-                except Exception:
-                    pass
+
+        await asyncio.gather(*[play_in_channel(ch) for ch in occupied.values()])
 
     async def find_member(self, discord_user_id: str) -> tuple[discord.Guild, discord.Member] | tuple[None, None]:
         for guild in self.guilds:
