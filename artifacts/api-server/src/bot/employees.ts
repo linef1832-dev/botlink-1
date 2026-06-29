@@ -79,6 +79,7 @@ export const employees: Employee[] = [
   { name: "NUTZA", telegramId: "8588789702", discordId: "1462116752875065515" },
   { name: "PUKAN", telegramId: "8519049805", discordId: "1136833359222419517" },
   { name: "RAREEN", telegramId: "6179092946", discordId: "1461948398319046686" },
+  { name: "VINZO", telegramId: "8904989899", discordId: "838410181930778694" },
   { name: "MAGAN", telegramId: "7991808096", discordId: "1418194553734959214" },
   { name: "AWANG", telegramId: "6396414761", discordId: "1461256969179365400" },
   { name: "GWEN", telegramId: "8512234523", discordId: "1093955667431280784" },
@@ -119,7 +120,6 @@ export const employees: Employee[] = [
   { name: "FUMI", telegramId: "8904558738", discordId: "1385301261754306631" },
   { name: "PHURI", telegramId: "8712544949", discordId: "1227619511956541440" },
   { name: "PRIEWPRIEW", telegramId: "6774588340", discordId: "1485581872904798230" },
-  { name: "VINZO", telegramId: "8904989899", discordId: "838410181930778694" },
   { name: "GRACIE", telegramId: "7059861131", discordId: "1499298891861065791" },
   { name: "CAMP", telegramId: "7282670765", discordId: "1482275631537586247" },
   { name: "TAMMY", telegramId: "8629386763", discordId: "1483866155306455061" },
@@ -174,7 +174,6 @@ export const employees: Employee[] = [
   { name: "AFEY", telegramId: "8662504657", discordId: "1484560819973787680" },
   { name: "POINT", telegramId: "6647194217", discordId: "1483338333013807166" },
   { name: "TANGO", telegramId: "8588408697", discordId: "1483771517601841265" },
-  
 ];
 
 export const byTelegramId = new Map<string, Employee>(
