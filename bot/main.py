@@ -830,7 +830,27 @@ async def start_telegram(on_activity):
                 logger.info(f"[PARSE OK] id={parsed['telegram_id']} activity={parsed['activity']}")
                 await on_activity(parsed)
             elif "รหัสผู้ใช้" in text:
-                logger.warning(f"[PARSE FAIL] Has รหัสผู้ใช้ but parse failed. Full text: {text!r}")
+                # กรณีกลับที่นั่งล้มเหลวเพราะบอทเทเลแกรมรีเซท
+                is_failed_return = any(kw in text for kw in RETURN_KEYWORDS) and "ไม่มีกิจกรรม" in text
+                if is_failed_return:
+                    tid_match = re.search(r"รหัสผู้ใช้[：:][^\d]*(\d+)", text)
+                    if tid_match:
+                        tid = tid_match.group(1)
+                        emp = EMPLOYEES.get(tid)
+                        if emp and tid in _currently_out:
+                            # เช็คว่าต้องแจ้งเตือนถ่ายรูปด้วยไหม
+                            reminder = None
+                            if tid in _out_during_window and tid not in _photos_sent and _checkin_window["keyword"]:
+                                reminder = f"📷 {emp['name']} กลับที่นั่งแล้วอย่าลืมถ่ายรูปเช็คชื่อด้วยนะ! · {_checkin_window['shift_name']}"
+                            await discord_bot.send_notification(
+                                emp["discord_id"], emp["name"], "กลับที่นั่ง", True, title,
+                                checkin_reminder=reminder,
+                            )
+                            _out_during_window.discard(tid)
+                            _currently_out.pop(tid, None)
+                            logger.info(f"[FAILED RETURN] {emp['name']} — notified via failed return message")
+                else:
+                    logger.warning(f"[PARSE FAIL] Has รหัสผู้ใช้ but parse failed. Full text: {text!r}")
         except Exception as e:
             logger.error(f"Error handling Telegram message: {e}")
 
@@ -870,6 +890,7 @@ async def on_activity(parsed: dict):
     if parsed["is_return"] and _checkin_window["keyword"]:
         if tid in _out_during_window and tid not in _photos_sent:
             checkin_reminder = f"📷 {emp['name']} กลับที่นั่งแล้วอย่าลืมถ่ายรูปเช็คชื่อด้วยนะ! · {_checkin_window['shift_name']}"
+        _out_during_window.discard(tid)  # ล้างออกหลังกลับสำเร็จ ป้องกันแจ้งซ้ำ
 
     await discord_bot.wait_until_ready_event()
     sent, channel = await discord_bot.send_notification(
