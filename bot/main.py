@@ -203,29 +203,19 @@ NO_MOVE_DISCORD_IDS: set[str] = {
     "1450370026858348656",  # ICE
 }
 
-TARGET_CHAT_IDS: set[int] = {
-    -2059357394,   # Jun88-กลุ่มเช็คอิน打卡群
-    -3502981935,   # Jun88-OL กลุ่มเช็คอิน 打卡群
-    -3671113977,   # OL ชั่วคราว
-    -3386618433,   # AM ONLINE เข้างาน
-    -5531545587,   # พี่เลี้ยง Jun88 กะ JAPAO
-}
+TARGET_GROUPS = ["Jun88-กลุ่มเช็คอิน打卡群", "Jun88-OL กลุ่มเช็คอิน 打卡群", "OL ชั่วคราว", "AM ONLINE เข้างาน", "พี่เลี้ยง Jun88 กะ JAPAO"]
 
 # กลุ่มที่ใช้ระบบกะงาน → Sound ID สำหรับแต่ละกลุ่ม
-SHIFT_CHAT_IDS: set[int] = {
-    -3671113977,   # OL ชั่วคราว
-    -3386618433,   # AM ONLINE เข้างาน
-    -5531545587,   # พี่เลี้ยง Jun88 กะ JAPAO
+SHIFT_GROUPS = ["OL ชั่วคราว", "AM ONLINE เข้างาน", "พี่เลี้ยง Jun88 กะ JAPAO"]
+
+SHIFT_GROUP_SOUND_ID: dict[str, int] = {
+    "OL ชั่วคราว":              1518570639886389378,
+    "AM ONLINE เข้างาน":        1518570573943410798,
+    "พี่เลี้ยง Jun88 กะ JAPAO": 1518570639886389378,  # ใช้เสียงเดียวกับ OL
 }
 
-SHIFT_CHAT_SOUND_ID: dict[int, int] = {
-    -3671113977: 1518570639886389378,  # OL ชั่วคราว
-    -3386618433: 1518570573943410798,  # AM ONLINE เข้างาน
-    -5531545587: 1518570639886389378,  # พี่เลี้ยง Jun88 กะ JAPAO
-}
-
-def get_shift_sound_id(chat_id: int) -> int:
-    return SHIFT_CHAT_SOUND_ID.get(chat_id, 0)
+def get_shift_sound_id(group_name: str) -> int:
+    return SHIFT_GROUP_SOUND_ID.get(group_name, 0)
 
 # ความยาวเสียง (วินาที) ของแต่ละ sound_id — ใช้รอให้รอบ 1 จบก่อนเปิดรอบ 2
 SHIFT_SOUND_DURATION: dict[str, float] = {
@@ -783,22 +773,22 @@ async def start_telegram(on_activity):
     @client.on(events.NewMessage())
     async def handler(event):
         try:
-            chat_id = event.chat_id
-
-            if chat_id not in TARGET_CHAT_IDS:
-                return
-
             chat = await event.get_chat()
             title = getattr(chat, "title", "") or ""
+
+            if not any(g in title for g in TARGET_GROUPS):
+                return
+
             text = event.message.text or ""
             sender = getattr(event.message.sender, "username", None) or getattr(event.message.sender, "first_name", "unknown") if event.message.sender else "unknown"
             logger.info(f"[Jun88] from {sender}: {text[:120]!r}")
 
             # กลุ่มกะงาน → ดักข้อความกะเช้า/กะดึก แล้วเปิดเสียง
-            if chat_id in SHIFT_CHAT_IDS:
+            if any(g in title for g in SHIFT_GROUPS):
                 matched = next((kw for kw in SHIFT_KEYWORDS if kw in text), None)
                 if matched:
-                    sound_id = get_shift_sound_id(chat_id)
+                    group_key = next((g for g in SHIFT_GROUPS if g in title), "")
+                    sound_id = get_shift_sound_id(group_key)
                     logger.info(f"[SHIFT] Detected '{matched}' in '{title}' (sound_id={sound_id})")
                     _checkin_window.update({"keyword": matched, "shift_name": shift_keyword_to_name(matched)})
                     _photos_sent.clear()
@@ -833,7 +823,7 @@ async def start_telegram(on_activity):
         except Exception as e:
             logger.error(f"Error handling Telegram message: {e}")
 
-    logger.info(f"Listening for chat IDs: {TARGET_CHAT_IDS}")
+    logger.info(f"Listening for groups containing: {TARGET_GROUPS}")
     try:
         await client.run_until_disconnected()
     finally:
