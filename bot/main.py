@@ -5,7 +5,7 @@ import json
 import logging
 import time as time_module
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -13,6 +13,7 @@ from telethon.errors import AuthKeyDuplicatedError
 import discord
 from discord import ChannelType
 import aiohttp
+from supabase import create_client, Client as SupabaseClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,8 +22,15 @@ logging.basicConfig(
 logger = logging.getLogger("bot")
 
 # ---------------------------------------------------------------------------
-# Employee mapping  (Telegram ID -> employee info)
+# Supabase client
 # ---------------------------------------------------------------------------
+_supabase_url = os.environ.get("SUPABASE_URL", "")
+_supabase_key = os.environ.get("SUPABASE_KEY", "")
+supabase: SupabaseClient | None = create_client(_supabase_url, _supabase_key) if _supabase_url and _supabase_key else None
+if supabase:
+    logger.info("[Supabase] Client initialized")
+else:
+    logger.warning("[Supabase] SUPABASE_URL or SUPABASE_KEY not set — break tracking disabled")
 EMPLOYEES: dict[str, dict] = {
     "8046888446": {"name": "PRIDE", "discord_id": "937663612766548028"},
     "8204537651": {"name": "YAO", "discord_id": "1438396440861872168"},
@@ -289,6 +297,92 @@ def get_emoji(activity: str, is_return: bool) -> str:
         if key in activity:
             return emoji
     return "🚶"
+
+
+def get_break_reason(activity: str) -> str:
+    """แปลงชื่อกิจกรรมเป็น break_reason ที่ตรงกับ checkin-bot-render"""
+    for key, emoji in ACTIVITY_EMOJI.items():
+        if key in activity:
+            return f"{emoji} {key}"
+    return f"☕ {activity}"
+
+
+def get_thai_time() -> datetime:
+    """คืน datetime ปัจจุบันในโซนเวลาไทย (UTC+7)"""
+    return datetime.now(timezone(timedelta(hours=7)))
+
+
+def get_break_date_str() -> str:
+    """
+    คืนวันที่สำหรับบันทึก break_date
+    ถ้าตอนนี้เป็น 00:00-07:59 ไทย (ยังอยู่ในกะดึกที่เริ่มเมื่อวาน) → คืนวันเมื่อวาน
+    """
+    t = get_thai_time()
+    if t.hour < 8:
+        t = t - timedelta(days=1)
+    return t.strftime("%Y-%m-%d")
+
+
+async def supabase_open_break(staff_name: str, activity: str) -> None:
+    """บันทึกเริ่มพักลง break_sessions"""
+    if not supabase:
+        return
+    try:
+        now = get_thai_time()
+        break_date = get_break_date_str()
+        prev_date = (get_thai_time() - timedelta(days=1)).strftime("%Y-%m-%d")
+        reason = get_break_reason(activity)
+
+        # กันซ้ำ: ถ้ายังมี record ที่ยังไม่ปิดอยู่ → ข้าม
+        res = supabase.from_("break_sessions") \
+            .select("id") \
+            .eq("staff_name", staff_name) \
+            .in_("break_date", [break_date, prev_date]) \
+            .is_("break_end", "null") \
+            .limit(1) \
+            .execute()
+        if res.data:
+            logger.info(f"[Supabase] {staff_name} ยังพักค้างอยู่ → ข้าม insert")
+            return
+
+        supabase.from_("break_sessions").insert({
+            "staff_name": staff_name,
+            "break_start": now.isoformat(),
+            "break_date": break_date,
+            "break_reason": reason,
+        }).execute()
+        logger.info(f"[Supabase] {staff_name} เริ่มพัก ({reason}) break_date={break_date}")
+    except Exception as e:
+        logger.error(f"[Supabase] supabase_open_break error: {e}")
+
+
+async def supabase_close_break(staff_name: str) -> None:
+    """ปิด break_end ให้ record ที่ยังเปิดอยู่ของคนนี้"""
+    if not supabase:
+        return
+    try:
+        now = get_thai_time()
+        break_date = get_break_date_str()
+        prev_date = (get_thai_time() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        res = supabase.from_("break_sessions") \
+            .select("id") \
+            .eq("staff_name", staff_name) \
+            .in_("break_date", [break_date, prev_date]) \
+            .is_("break_end", "null") \
+            .execute()
+        if not res.data:
+            logger.info(f"[Supabase] {staff_name} ไม่มี record พักที่เปิดอยู่")
+            return
+
+        ids = [r["id"] for r in res.data]
+        supabase.from_("break_sessions") \
+            .update({"break_end": now.isoformat()}) \
+            .in_("id", ids) \
+            .execute()
+        logger.info(f"[Supabase] {staff_name} กลับแล้ว ปิด {len(ids)} record")
+    except Exception as e:
+        logger.error(f"[Supabase] supabase_close_break error: {e}")
 
 
 def parse_message(text: str, group_name: str) -> dict | None:
@@ -846,6 +940,7 @@ async def start_telegram(on_activity):
                                 emp["discord_id"], emp["name"], "กลับที่นั่ง", True, title,
                                 checkin_reminder=reminder,
                             )
+                            await supabase_close_break(emp["name"])
                             _out_during_window.discard(tid)
                             _currently_out.pop(tid, None)
                             logger.info(f"[FAILED RETURN] {emp['name']} — notified via failed return message")
@@ -878,12 +973,16 @@ async def on_activity(parsed: dict):
     # Track activity state
     if parsed["is_return"]:
         _currently_out.pop(tid, None)
+        # ปิด break session ใน Supabase
+        await supabase_close_break(emp["name"])
     else:
         _currently_out[tid] = parsed["group_name"]
         if _checkin_window["keyword"]:
             paired_checkins = SHIFT_CHECKIN_PAIR.get(_checkin_window.get("shift_group", ""), [])
             if not paired_checkins or any(p in parsed["group_name"] for p in paired_checkins):
                 _out_during_window.add(tid)
+        # เปิด break session ใน Supabase
+        await supabase_open_break(emp["name"], parsed["activity"])
 
     # เช็คว่าต้องแจ้งเตือนถ่ายรูปไหม
     checkin_reminder = None
