@@ -323,14 +323,38 @@ def get_break_date_str() -> str:
     return t.strftime("%Y-%m-%d")
 
 
-async def supabase_open_break(staff_name: str, activity: str) -> None:
+def parse_telegram_timestamp(ts_str: str | None) -> datetime | None:
+    """แปลง timestamp จาก Telegram 'dd/mm HH:MM:SS' เป็น datetime ไทย (UTC+7)
+    Telegram ส่งเวลาเป็น UTC+8 → ลบ 1 ชั่วโมงเหมือนที่แสดงใน Discord"""
+    if not ts_str:
+        return None
+    try:
+        parts = ts_str.strip().split()
+        date_part, time_part = parts[0], parts[1]
+        day, month = map(int, date_part.split('/'))
+        h, m, s = map(int, time_part.split(':'))
+        h = (h - 1) % 24  # UTC+8 → UTC+7
+        year = datetime.now().year
+        return datetime(year, month, day, h, m, s, tzinfo=timezone(timedelta(hours=7)))
+    except Exception:
+        return None
+
+
+def get_break_date_from_time(dt: datetime) -> str:
+    """คืน break_date จาก datetime — ถ้าก่อน 08:00 ไทย ถือว่าเป็นวันก่อนหน้า (กะดึก)"""
+    if dt.hour < 8:
+        dt = dt - timedelta(days=1)
+    return dt.strftime("%Y-%m-%d")
+
+
+async def supabase_open_break(staff_name: str, activity: str, timestamp_str: str | None = None) -> None:
     """บันทึกเริ่มพักลง break_sessions"""
     if not supabase:
         return
     try:
-        now = get_thai_time()
-        break_date = get_break_date_str()
-        prev_date = (get_thai_time() - timedelta(days=1)).strftime("%Y-%m-%d")
+        now = parse_telegram_timestamp(timestamp_str) or get_thai_time()
+        break_date = get_break_date_from_time(now)
+        prev_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
         reason = get_break_reason(activity)
 
         # กันซ้ำ: ถ้ายังมี record ที่ยังไม่ปิดอยู่ → ข้าม
@@ -351,19 +375,19 @@ async def supabase_open_break(staff_name: str, activity: str) -> None:
             "break_date": break_date,
             "break_reason": reason,
         }).execute()
-        logger.info(f"[Supabase] {staff_name} เริ่มพัก ({reason}) break_date={break_date}")
+        logger.info(f"[Supabase] {staff_name} เริ่มพัก ({reason}) break_date={break_date} เวลา={now.strftime('%H:%M:%S')}")
     except Exception as e:
         logger.error(f"[Supabase] supabase_open_break error: {e}")
 
 
-async def supabase_close_break(staff_name: str) -> None:
+async def supabase_close_break(staff_name: str, timestamp_str: str | None = None) -> None:
     """ปิด break_end ให้ record ที่ยังเปิดอยู่ของคนนี้"""
     if not supabase:
         return
     try:
-        now = get_thai_time()
-        break_date = get_break_date_str()
-        prev_date = (get_thai_time() - timedelta(days=1)).strftime("%Y-%m-%d")
+        now = parse_telegram_timestamp(timestamp_str) or get_thai_time()
+        break_date = get_break_date_from_time(now)
+        prev_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
 
         res = supabase.from_("break_sessions") \
             .select("id") \
@@ -380,7 +404,7 @@ async def supabase_close_break(staff_name: str) -> None:
             .update({"break_end": now.isoformat()}) \
             .in_("id", ids) \
             .execute()
-        logger.info(f"[Supabase] {staff_name} กลับแล้ว ปิด {len(ids)} record")
+        logger.info(f"[Supabase] {staff_name} กลับแล้ว ปิด {len(ids)} record เวลา={now.strftime('%H:%M:%S')}")
     except Exception as e:
         logger.error(f"[Supabase] supabase_close_break error: {e}")
 
@@ -968,7 +992,7 @@ async def start_telegram(on_activity):
                                 emp["discord_id"], emp["name"], "กลับที่นั่ง", True, title,
                                 checkin_reminder=reminder,
                             )
-                            await supabase_close_break(emp["name"])
+                            await supabase_close_break(emp["name"], None)
                             _out_during_window.discard(tid)
                             _currently_out.pop(tid, None)
                             logger.info(f"[FAILED RETURN] {emp['name']} — notified via failed return message")
@@ -1001,16 +1025,16 @@ async def on_activity(parsed: dict):
     # Track activity state
     if parsed["is_return"]:
         _currently_out.pop(tid, None)
-        # ปิด break session ใน Supabase
-        await supabase_close_break(emp["name"])
+        # ปิด break session ใน Supabase ด้วยเวลาจาก Telegram
+        await supabase_close_break(emp["name"], parsed.get("timestamp"))
     else:
         _currently_out[tid] = parsed["group_name"]
         if _checkin_window["keyword"]:
             paired_checkins = SHIFT_CHECKIN_PAIR.get(_checkin_window.get("shift_group", ""), [])
             if not paired_checkins or any(p in parsed["group_name"] for p in paired_checkins):
                 _out_during_window.add(tid)
-        # เปิด break session ใน Supabase
-        await supabase_open_break(emp["name"], parsed["activity"])
+        # เปิด break session ใน Supabase ด้วยเวลาจาก Telegram
+        await supabase_open_break(emp["name"], parsed["activity"], parsed.get("timestamp"))
 
     # เช็คว่าต้องแจ้งเตือนถ่ายรูปไหม
     checkin_reminder = None
