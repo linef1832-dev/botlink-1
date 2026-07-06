@@ -175,6 +175,7 @@ export const employees: Employee[] = [
   { name: "POINT", telegramId: "6647194217", discordId: "1483338333013807166" },
   { name: "TANGO", telegramId: "8588408697", discordId: "1483771517601841265" },
   { name: "BOOK", telegramId: "8443371273", discordId: "1472588497780211774" },
+  { name: "CHIALI", telegramId: "8696829807", discordId: "1503464843515003050" },
 ];
 
 export const byTelegramId = new Map<string, Employee>(
