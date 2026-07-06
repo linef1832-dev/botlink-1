@@ -203,6 +203,7 @@ EMPLOYEES: dict[str, dict] = {
     "8588408697": {"name": "TANGO", "discord_id": "1483771517601841265"},
     "8911647927": {"name": "NATTARACK", "discord_id": "1516619284493766728"},
     "8553978679": {"name": "ICE", "discord_id": "1450370026858348656"},
+    "8443371273": {"name": "BOOK", "discord_id": "1472588497780211774"},
 }
 
 # พนักงานที่ไม่ต้องย้าย voice channel ตอนพักกิจกรรมใดๆ (ระบุด้วย Discord ID)
