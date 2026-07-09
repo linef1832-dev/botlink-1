@@ -72,7 +72,23 @@ async def load_employees_from_supabase() -> None:
     except Exception as e:
         logger.error(f"[EMPLOYEES] load error: {e}")
 
-TARGET_GROUPS = ["Jun88-กลุ่มเช็คอิน打卡群", "Jun88-OL กลุ่มเช็คอิน 打卡群", "OL ชั่วคราว", "AM ONLINE เข้างาน", "พี่เลี้ยง Jun88 กะ JAPAO"]
+# TARGET_GROUPS โหลดจาก Supabase ตาราง checkin_groups
+TARGET_GROUPS: list[str] = []  # จะถูกโหลดตอน startup
+
+async def load_target_groups() -> None:
+    """โหลดรายชื่อกลุ่ม Telegram ที่ต้องดักจาก Supabase"""
+    global TARGET_GROUPS
+    if not supabase:
+        return
+    try:
+        res = supabase.from_("checkin_groups")             .select("group_name")             .eq("active", True)             .execute()
+        if res.data:
+            TARGET_GROUPS = [r["group_name"] for r in res.data]
+            logger.info(f"[GROUPS] โหลดสำเร็จ {len(TARGET_GROUPS)} กลุ่ม: {TARGET_GROUPS}")
+        else:
+            logger.warning("[GROUPS] ไม่พบกลุ่มใน Supabase — ใช้ค่าเดิม")
+    except Exception as e:
+        logger.error(f"[GROUPS] load error: {e}")
 
 # กลุ่มที่ใช้ระบบกะงาน → Sound ID สำหรับแต่ละกลุ่ม
 SHIFT_GROUPS = ["OL ชั่วคราว", "AM ONLINE เข้างาน", "พี่เลี้ยง Jun88 กะ JAPAO"]
@@ -809,6 +825,8 @@ async def start_telegram(on_activity):
     me = await client.get_me()
     logger.info(f"Telegram connected as: {me.username or me.first_name}")
     await discord_bot.wait_until_ready_event()
+    # โหลดกลุ่ม Telegram จาก Supabase K36
+    await load_target_groups()
     # โหลดพนักงานจาก Supabase K36
     await load_employees_from_supabase()
     await supabase_restore_open_breaks()
@@ -845,6 +863,29 @@ async def start_telegram(on_activity):
                 await asyncio.sleep(60)
                 await load_employees_from_supabase()
     asyncio.create_task(watch_employees_realtime())
+
+    # ดักการเปลี่ยนแปลงตาราง checkin_groups → รีโหลด TARGET_GROUPS ทันที
+    async def watch_groups_realtime():
+        try:
+            from realtime import AsyncRealtimeClient
+            realtime_url = _supabase_url.replace("https://", "wss://") + "/realtime/v1"
+            rt_client = AsyncRealtimeClient(realtime_url, _supabase_key)
+            await rt_client.connect()
+            channel = rt_client.channel("groups-changes")
+            async def on_groups_change(payload):
+                logger.info(f"[GROUPS] Realtime: ตรวจพบการเปลี่ยนแปลงใน checkin_groups → รีโหลดทันที")
+                await load_target_groups()
+            await channel.on_postgres_changes(
+                event="*",
+                schema="public",
+                table="checkin_groups",
+                callback=on_groups_change
+            ).subscribe()
+            logger.info("[GROUPS] Realtime: กำลัง watch ตาราง checkin_groups...")
+            await rt_client.listen()
+        except Exception as e:
+            logger.error(f"[GROUPS] Realtime error: {e}")
+    asyncio.create_task(watch_groups_realtime())
 
     @client.on(events.NewMessage())
     async def handler(event):
