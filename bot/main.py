@@ -644,21 +644,21 @@ class ActivityBot(discord.Client):
                 # กินข้าว / ทานข้าว → แจ้งในห้องทำงาน แล้วย้ายไป Dining
                 notify_vc = work_vc or current_ch
                 target_vc = await self.find_voice_channel_by_id(target_channel_id)
-                    if target_vc:
-                        mem_vc = member.voice.channel if member.voice else None
-                        if mem_vc and mem_vc.id == target_vc.id:
-                            logger.info(f"{name} already in target channel '{target_vc.name}', skipping move")
-                        else:
-                            try:
-                                await member.move_to(target_vc)
-                                self._moved_to_destination.add(member.id)
-                                logger.info(f"Moved {name} → #{target_vc.name}")
-                            except discord.Forbidden:
-                                logger.error(f"No permission to move {name} — bot needs 'Move Members' permission")
-                            except Exception as e:
-                                logger.error(f"Failed to move {name}: {e}")
+                if target_vc:
+                    mem_vc = member.voice.channel if member.voice else None
+                    if mem_vc and mem_vc.id == target_vc.id:
+                        logger.info(f"{name} already in target channel '{target_vc.name}', skipping move")
                     else:
-                        logger.warning(f"Target channel ID '{target_channel_id}' not found")
+                        try:
+                            await member.move_to(target_vc)
+                            self._moved_to_destination.add(member.id)
+                            logger.info(f"Moved {name} → #{target_vc.name}")
+                        except discord.Forbidden:
+                            logger.error(f"No permission to move {name} — bot needs 'Move Members' permission")
+                        except Exception as e:
+                            logger.error(f"Failed to move {name}: {e}")
+                else:
+                    logger.warning(f"Target channel ID '{target_channel_id}' not found")
             else:
                 # ปวดน้อย / ปวดหนัก / พัก → แจ้งห้องที่นั่งอยู่ตอนนี้เลย
                 notify_vc = current_ch
