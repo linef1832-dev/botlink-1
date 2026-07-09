@@ -326,21 +326,44 @@ def get_break_date_str() -> str:
 
 
 def parse_telegram_timestamp(ts_str: str | None) -> datetime | None:
-    """แปลง timestamp จาก Telegram 'dd/mm HH:MM:SS' เป็น datetime ไทย (UTC+7)
-    format: dd/mm HH:MM:SS (วัน/เดือน ชั่วโมง:นาที:วินาที)
-    เวลาเป็น Thai time (UTC+7) อยู่แล้ว ไม่ต้องแปลง zone"""
+    """แปลง timestamp จาก Telegram เป็น datetime ไทย (UTC+7)
+    รองรับทั้ง dd/mm และ mm/dd โดยเลือก format ที่ใกล้เคียงวันปัจจุบันมากสุด"""
     if not ts_str:
         return None
     try:
         parts = ts_str.strip().split()
         date_part, time_part = parts[0], parts[1]
-        # format dd/mm → day, month
-        day, month = map(int, date_part.split('/'))
+        a, b = map(int, date_part.split('/'))
         h, m, s = map(int, time_part.split(':'))
-        # ใช้ปีจาก Thai timezone
         year = get_thai_time().year
-        dt = datetime(year, month, day, h, m, s, tzinfo=timezone(timedelta(hours=7)))
-        return dt
+        today = get_thai_time()
+
+        # ลอง dd/mm (วัน/เดือน)
+        try:
+            dt_ddmm = datetime(year, b, a, h, m, s, tzinfo=timezone(timedelta(hours=7)))
+            diff_ddmm = abs((dt_ddmm - today).total_seconds())
+        except ValueError:
+            dt_ddmm = None
+            diff_ddmm = float("inf")
+
+        # ลอง mm/dd (เดือน/วัน)
+        try:
+            dt_mmdd = datetime(year, a, b, h, m, s, tzinfo=timezone(timedelta(hours=7)))
+            diff_mmdd = abs((dt_mmdd - today).total_seconds())
+        except ValueError:
+            dt_mmdd = None
+            diff_mmdd = float("inf")
+
+        if dt_ddmm is None and dt_mmdd is None:
+            return None
+        if dt_ddmm is None:
+            return dt_mmdd
+        if dt_mmdd is None:
+            return dt_ddmm
+
+        result = dt_ddmm if diff_ddmm <= diff_mmdd else dt_mmdd
+        logger.info(f"[parse_timestamp] {ts_str!r} → {result.strftime('%Y-%m-%d %H:%M:%S')}")
+        return result
     except Exception as e:
         logger.warning(f"[parse_telegram_timestamp] parse failed: {ts_str!r} — {e}")
         return None
