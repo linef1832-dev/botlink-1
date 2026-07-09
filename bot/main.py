@@ -31,187 +31,46 @@ if supabase:
     logger.info("[Supabase] Client initialized")
 else:
     logger.warning("[Supabase] SUPABASE_URL or SUPABASE_KEY not set — break tracking disabled")
-EMPLOYEES: dict[str, dict] = {
-    "8046888446": {"name": "PRIDE", "discord_id": "937663612766548028"},
-    "8204537651": {"name": "YAO", "discord_id": "1438396440861872168"},
-    "7194888933": {"name": "RHAM", "discord_id": "855213538247573544"},
-    "6425316652": {"name": "ALIEN", "discord_id": "741711562120888350"},
-    "8492341073": {"name": "ALLNEW", "discord_id": "1447830227106402446"},
-    "8380767244": {"name": "NIDA", "discord_id": "1458699656874950782"},
-    "6750457815": {"name": "MEMORIES", "discord_id": "1506253460176109709"},
-    "8456635697": {"name": "BAMBI", "discord_id": "1458707432300609566"},
-    "7849459391": {"name": "PRAI", "discord_id": "1459021946854572075"},
-    "6988453021": {"name": "YOUNGJAY", "discord_id": "875611878473228388"},
-    "5554617607": {"name": "CHICKS", "discord_id": "1081857927733842030"},
-    "5623769505": {"name": "RIKA", "discord_id": "892552753270911018"},
-    "6073022140": {"name": "TRUMP", "discord_id": "1377551300123689010"},
-    "8560735759": {"name": "KWANCHAI", "discord_id": "1468270550626599127"},
-    "8502456217": {"name": "KEVIN", "discord_id": "1463020827216973894"},
-    "8911792172": {"name": "THEE", "discord_id": "1384210089006600376"},
-    "6578592217": {"name": "LYDIA", "discord_id": "1463041919587193026"},
-    "6582978944": {"name": "PALO", "discord_id": "1434864108766756994"},
-    "7235598775": {"name": "BEAM", "discord_id": "1474438080470585395"},
-    "8731963427": {"name": "REVO", "discord_id": "1451093813534920750"},
-    "7554839486": {"name": "FOLEN", "discord_id": "1463021218171981953"},
-    "7707044062": {"name": "BULEE", "discord_id": "1461997174043709556"},
-    "8528198622": {"name": "DAYONE", "discord_id": "1470439159574560869"},
-    "8103612072": {"name": "MEBEL", "discord_id": "1472799216488288358"},
-    "7607162067": {"name": "POOKPIK", "discord_id": "1471087361046876215"},
-    "7775151875": {"name": "ANAN", "discord_id": "1468844740261842976"},
-    "8158661621": {"name": "CHIN", "discord_id": "1493397604799611040"},
-    "8527879554": {"name": "LUKKAI", "discord_id": "1467780092108476416"},
-    "8225463050": {"name": "NIMMAN", "discord_id": "1466300492819726439"},
-    "7681502019": {"name": "PIRIYA", "discord_id": "1304037473915113546"},
-    "6275536589": {"name": "ARYA", "discord_id": "1445125175946514649"},
-    "6635722903": {"name": "XANDER", "discord_id": "1477190188592529672"},
-    "7658174553": {"name": "MARIN", "discord_id": "1472073717202026538"},
-    "8585155045": {"name": "GABRIAN", "discord_id": "699888907126308906"},
-    "8599131396": {"name": "BREAD", "discord_id": "1475059204149612595"},
-    "8362535494": {"name": "DAX", "discord_id": "1456983093922496523"},
-    "8438010552": {"name": "SAKURA", "discord_id": "1476973201631219804"},
-    "8592723303": {"name": "BASS", "discord_id": "1497720055121576020"},
-    "7453498643": {"name": "GOBGAP", "discord_id": "1472898506891988992"},
-    "8759871424": {"name": "PRANG", "discord_id": "1482279911967297611"},
-    "1368117045": {"name": "KELLY", "discord_id": "721037014388178964"},
-    "8392745693": {"name": "PHIM", "discord_id": "1481249177408372738"},
-    "5662320070": {"name": "DESTA", "discord_id": "1383057863173214300"},
-    "7858728622": {"name": "MONGKEY", "discord_id": "1403604944061468854"},
-    "7465321328": {"name": "MELIE", "discord_id": "1477012122197295246"},
-    "6402453881": {"name": "SURI", "discord_id": "1451205039954854060"},
-    "8723574609": {"name": "SCARLET", "discord_id": "1494629820271825016"},
-    "8669550253": {"name": "SUSY", "discord_id": "1493980177892638790"},
-    "8840483162": {"name": "WISDOM", "discord_id": "835118253931233310"},
-    "8506336451": {"name": "ZYREN", "discord_id": "1481070139058163878"},
-    "8761505054": {"name": "BLACKCAT", "discord_id": "1501072565970669598"},
-    "8761919464": {"name": "ZEUS", "discord_id": "1434919983435223101"},
-    "8729754073": {"name": "MIKAEL", "discord_id": "759280255381798962"},
-    "8640787369": {"name": "JAPAO", "discord_id": "1497389449825226793"},
-    "7552569589": {"name": "YAIMAI", "discord_id": "1483412107956453457"},
-    "8218127334": {"name": "JULIE", "discord_id": "1483461742510997506"},
-    "8494681520": {"name": "NYE", "discord_id": "1483866077187543061"},
-    "8270835449": {"name": "TAEYANG", "discord_id": "1484070985438331022"},
-    "8331438797": {"name": "MAWIN", "discord_id": "1483379690101280830"},
-    "8330944910": {"name": "NADA", "discord_id": "1464870423106945024"},
-    "8094793794": {"name": "ROGER", "discord_id": "885721870488436736"},
-    "7963274593": {"name": "MEIFERN", "discord_id": "1451094885678579763"},
-    "5912256964": {"name": "SLOBE", "discord_id": "1452589286548308028"},
-    "8321818445": {"name": "KUMA", "discord_id": "280643046067142656"},
-    "5561904262": {"name": "THINGTHING", "discord_id": "1122962399910170814"},
-    "8385516985": {"name": "LUZY", "discord_id": "690461334504210432"},
-    "5477060253": {"name": "ENGENE", "discord_id": "1473637594657980570"},
-    "8155166757": {"name": "RUBSARB", "discord_id": "465160716698124319"},
-    "7421340881": {"name": "SEEN", "discord_id": "1457281901952761898"},
-    "6436209710": {"name": "MARYM", "discord_id": "884763024286691398"},
-    "8385283326": {"name": "HIACHANG", "discord_id": "1258636317210968064"},
-    "8588789702": {"name": "NUTZA", "discord_id": "1462116752875065515"},
-    "8519049805": {"name": "PUKAN", "discord_id": "1136833359222419517"},
-    "6179092946": {"name": "RAREEN", "discord_id": "1461948398319046686"},
-    "8904989899": {"name": "VINZO", "discord_id": "838410181930778694"},
-    "7991808096": {"name": "MAGAN", "discord_id": "1418194553734959214"},
-    "6396414761": {"name": "AWANG", "discord_id": "1461256969179365400"},
-    "8512234523": {"name": "GWEN", "discord_id": "1093955667431280784"},
-    "8280442513": {"name": "BEENA", "discord_id": "1184129991106121829"},
-    "7104118055": {"name": "PIMMI", "discord_id": "606682935155884032"},
-    "8366504139": {"name": "MICKEY", "discord_id": "638352634994098186"},
-    "8452781349": {"name": "FONGJIN", "discord_id": "1486075312272838920"},
-    "8583331973": {"name": "NADOL", "discord_id": "1470364104203047141"},
-    "8243789592": {"name": "WENDY", "discord_id": "736063999539544105"},
-    "7720725242": {"name": "MAPRAW", "discord_id": "1237461033539473428"},
-    "8736200334": {"name": "FRING", "discord_id": "1470601644013125773"},
-    "6908609234": {"name": "DAJIM", "discord_id": "762999364917526539"},
-    "8052140335": {"name": "GIPZY", "discord_id": "1466047478427160620"},
-    "7228474384": {"name": "LOST", "discord_id": "1199240280679927818"},
-    "8577888334": {"name": "VIEW", "discord_id": "1468499147467259995"},
-    "8550887286": {"name": "TEEMEE", "discord_id": "1472052848467644416"},
-    "5468698254": {"name": "MILO", "discord_id": "1338856952503209994"},
-    "8348178547": {"name": "GARETH", "discord_id": "1253902663180091454"},
-    "8594743671": {"name": "DANA", "discord_id": "1334803952725786660"},
-    "6855153960": {"name": "CREAMME", "discord_id": "1143353948581924884"},
-    "8366965168": {"name": "ROMAN", "discord_id": "1127340978899001494"},
-    "5918754528": {"name": "XAOIBAI", "discord_id": "1433015221819019286"},
-    "8553244404": {"name": "NINJA", "discord_id": "1475375983703097386"},
-    "6773776173": {"name": "KOKO", "discord_id": "1474328897389592690"},
-    "7569122247": {"name": "TONPHAI", "discord_id": "1298736039136858164"},
-    "8299349977": {"name": "DISNEY", "discord_id": "1476069704190922824"},
-    "7780234618": {"name": "KAIA", "discord_id": "1474048953124388895"},
-    "7535232991": {"name": "PIKUL", "discord_id": "1460652066455158819"},
-    "8530375236": {"name": "FREAK", "discord_id": "1478672600132751483"},
-    "5928986894": {"name": "MABOO", "discord_id": "1482458538235138215"},
-    "8478420677": {"name": "DRINK", "discord_id": "1463086389208813724"},
-    "8612517477": {"name": "SPACE", "discord_id": "1494184627110416425"},
-    "8585437393": {"name": "PUNPUN", "discord_id": "1494564037738889349"},
-    "8143722666": {"name": "TEDDY", "discord_id": "783553980781035541"},
-    "6912075391": {"name": "AOFFY", "discord_id": "846977903748317214"},
-    "6392523761": {"name": "KAIJAEW", "discord_id": "1306505294871793685"},
-    "6558672538": {"name": "TURBO", "discord_id": "965646273690632223"},
-    "8904558738": {"name": "FUMI", "discord_id": "1385301261754306631"},
-    "8712544949": {"name": "PHURI", "discord_id": "1227619511956541440"},
-    "6774588340": {"name": "PRIEWPRIEW", "discord_id": "1485581872904798230"},
-    "7059861131": {"name": "GRACIE", "discord_id": "1499298891861065791"},
-    "7282670765": {"name": "CAMP", "discord_id": "1482275631537586247"},
-    "8629386763": {"name": "TAMMY", "discord_id": "1483866155306455061"},
-    "7980323307": {"name": "CALI", "discord_id": "1483348961942306877"},
-    "8467818809": {"name": "TOR", "discord_id": "1483495290777501839"},
-    "8310418152": {"name": "CHABA", "discord_id": "1481000364391010451"},
-    "8254737736": {"name": "BAILAY", "discord_id": "1386249982318870528"},
-    "7708086148": {"name": "THAI", "discord_id": "1483307641844269236"},
-    "7358066222": {"name": "REBRON", "discord_id": "1508636898904506489"},
-    "8790024904": {"name": "FIWWY", "discord_id": "1480817079258054689"},
-    "8742150292": {"name": "RAPTOR", "discord_id": "1478312523374657557"},
-    "8142690458": {"name": "BRANT", "discord_id": "1468420877325566094"},
-    "8370430767": {"name": "FOLKE", "discord_id": "1501920596315865129"},
-    "7790255430": {"name": "DEVIN", "discord_id": "1346757897492627476"},
-    "8202207453": {"name": "PANTER", "discord_id": "1483818860502188182"},
-    "5745637611": {"name": "SAKAI", "discord_id": "385473230384791562"},
-    "5398437494": {"name": "DOLIA", "discord_id": "1385570608904933446"},
-    "8520335906": {"name": "SARA", "discord_id": "1469903384919150659"},
-    "5734088160": {"name": "DORIS", "discord_id": "1443548147140788298"},
-    "5968527149": {"name": "AEM", "discord_id": "1481379556832313344"},
-    "7487109657": {"name": "TINDER", "discord_id": "1340925092523151361"},
-    "8179270865": {"name": "RAYNA", "discord_id": "735383998767038535"},
-    "7734869356": {"name": "CHITA", "discord_id": "1473569307442286603"},
-    "8528099488": {"name": "MIKA", "discord_id": "1445282308906291265"},
-    "5679263927": {"name": "LAYLA", "discord_id": "1474297870327746582"},
-    "8375637281": {"name": "CODEX", "discord_id": "944703805180756018"},
-    "8193432362": {"name": "NANOON", "discord_id": "1473947581619896341"},
-    "7433754403": {"name": "CAWAII", "discord_id": "1478260599380246719"},
-    "5001503243": {"name": "FINALHELL", "discord_id": "226352705847689217"},
-    "7270565060": {"name": "MOMO", "discord_id": "1475758468718788741"},
-    "7904470714": {"name": "SEK", "discord_id": "1460468129057472585"},
-    "7795611138": {"name": "AIBRO", "discord_id": "1490203560879587351"},
-    "6511614629": {"name": "MOUSE", "discord_id": "1482630543060369408"},
-    "2026291311": {"name": "MINI", "discord_id": "1352309695024726107"},
-    "7033451658": {"name": "KANOMPANG", "discord_id": "1460165527937875993"},
-    "8108697897": {"name": "STORM", "discord_id": "1477990611050303629"},
-    "6764248570": {"name": "NAIROBI", "discord_id": "1278241526832697378"},
-    "8397868763": {"name": "LANLING", "discord_id": "1469931328819695691"},
-    "7944285544": {"name": "FUJI", "discord_id": "1469936153384976602"},
-    "8392215042": {"name": "TOFFY", "discord_id": "1469923409759572079"},
-    "7558089138": {"name": "NOOKER", "discord_id": "1469953407405264961"},
-    "7002273351": {"name": "BRIAN", "discord_id": "1470634319272742994"},
-    "5807524388": {"name": "COPTER", "discord_id": "1474295302298271908"},
-    "8088282133": {"name": "MUNG", "discord_id": "976425793846665286"},
-    "8144348662": {"name": "SALY", "discord_id": "1514326974317985812"},
-    "7493380321": {"name": "POPSICLE", "discord_id": "1470771494987628711"},
-    "5273594873": {"name": "PATTY", "discord_id": "726812488213200987"},
-    "8114078368": {"name": "TAPAEW", "discord_id": "1473641812236308646"},
-    "7788093508": {"name": "RORA", "discord_id": "1312973404764110879"},
-    "8736633012": {"name": "LYLY", "discord_id": "1478096981976023173"},
-    "7036734948": {"name": "HAYLEE", "discord_id": "1232669083195936799"},
-    "8662504657": {"name": "AFEY", "discord_id": "1484560819973787680"},
-    "6647194217": {"name": "POINT", "discord_id": "1483338333013807166"},
-    "8588408697": {"name": "TANGO", "discord_id": "1483771517601841265"},
-    "8911647927": {"name": "NATTARACK", "discord_id": "1516619284493766728"},
-    "8553978679": {"name": "ICE", "discord_id": "1450370026858348656"},
-    "8443371273": {"name": "BOOK", "discord_id": "1472588497780211774"},
-    "8696829807": {"name": "CHIALI", "discord_id": "1503464843515003050"},
-}
+# ---------------------------------------------------------------------------
+# EMPLOYEES โหลดจาก Supabase K36 แทน hardcode
+# ---------------------------------------------------------------------------
+EMPLOYEES: dict[str, dict] = {}  # telegram_id → {name, discord_id, allowed_shift}
+_employees_loaded = False
 
-# พนักงานที่ไม่ต้องย้าย voice channel ตอนพักกิจกรรมใดๆ (ระบุด้วย Discord ID)
-NO_MOVE_DISCORD_IDS: set[str] = {
-    "1516619284493766728",  # NATTARACK
-    "1450370026858348656",  # ICE
-}
+async def load_employees_from_supabase() -> None:
+    """โหลดข้อมูลพนักงานจาก Supabase K36 ตาราง users"""
+    global EMPLOYEES, _employees_loaded
+    if not supabase:
+        logger.warning("[EMPLOYEES] Supabase ไม่พร้อม — ใช้ข้อมูลเดิม")
+        return
+    try:
+        res = supabase.from_("users") \
+            .select("username, discord_id, telegram_id, allowed_shift, department") \
+            .not_.is_("telegram_id", "null") \
+            .not_.is_("discord_id", "null") \
+            .execute()
+        if not res.data:
+            logger.warning("[EMPLOYEES] ไม่พบข้อมูลพนักงานใน Supabase")
+            return
+        new_map = {}
+        for u in res.data:
+            tid = str(u.get("telegram_id") or "").strip()
+            did = str(u.get("discord_id") or "").strip()
+            name = str(u.get("username") or "").strip().upper()
+            shift = str(u.get("allowed_shift") or "").strip()
+            dept = str(u.get("department") or "").strip()
+            if tid and did and name:
+                new_map[tid] = {
+                    "name": name,
+                    "discord_id": did,
+                    "allowed_shift": shift,
+                    "department": dept,
+                }
+        EMPLOYEES = new_map
+        _employees_loaded = True
+        logger.info(f"[EMPLOYEES] โหลดสำเร็จ {len(EMPLOYEES)} คน จาก Supabase K36")
+    except Exception as e:
+        logger.error(f"[EMPLOYEES] load error: {e}")
 
 TARGET_GROUPS = ["Jun88-กลุ่มเช็คอิน打卡群", "Jun88-OL กลุ่มเช็คอิน 打卡群", "OL ชั่วคราว", "AM ONLINE เข้างาน", "พี่เลี้ยง Jun88 กะ JAPAO"]
 
@@ -784,10 +643,7 @@ class ActivityBot(discord.Client):
             if target_channel_id:
                 # กินข้าว / ทานข้าว → แจ้งในห้องทำงาน แล้วย้ายไป Dining
                 notify_vc = work_vc or current_ch
-                if discord_user_id in NO_MOVE_DISCORD_IDS:
-                    logger.info(f"{name} is in NO_MOVE list — skipping voice channel move")
-                else:
-                    target_vc = await self.find_voice_channel_by_id(target_channel_id)
+                target_vc = await self.find_voice_channel_by_id(target_channel_id)
                     if target_vc:
                         mem_vc = member.voice.channel if member.voice else None
                         if mem_vc and mem_vc.id == target_vc.id:
@@ -953,8 +809,42 @@ async def start_telegram(on_activity):
     me = await client.get_me()
     logger.info(f"Telegram connected as: {me.username or me.first_name}")
     await discord_bot.wait_until_ready_event()
+    # โหลดพนักงานจาก Supabase K36
+    await load_employees_from_supabase()
     await supabase_restore_open_breaks()
     await discord_bot.send_status("🟢 **Bot online** — Telegram + Discord connected")
+
+    # ดักการเปลี่ยนแปลงตาราง users ผ่าน Supabase Realtime → รีโหลดทันที
+    async def watch_employees_realtime():
+        try:
+            from realtime import AsyncRealtimeClient
+            realtime_url = _supabase_url.replace("https://", "wss://") + "/realtime/v1"
+            rt_client = AsyncRealtimeClient(realtime_url, _supabase_key)
+            await rt_client.connect()
+            channel = rt_client.channel("users-changes")
+            async def on_users_change(payload):
+                logger.info(f"[EMPLOYEES] Realtime: ตรวจพบการเปลี่ยนแปลงใน users → รีโหลดทันที")
+                await load_employees_from_supabase()
+            await channel.on_postgres_changes(
+                event="*",
+                schema="public",
+                table="users",
+                callback=on_users_change
+            ).subscribe()
+            logger.info("[EMPLOYEES] Realtime: กำลัง watch ตาราง users...")
+            await rt_client.listen()
+        except ImportError:
+            # ถ้าไม่มี realtime library → fallback poll ทุก 60 วินาที
+            logger.warning("[EMPLOYEES] ไม่มี realtime library → ใช้ poll ทุก 60 วินาทีแทน")
+            while True:
+                await asyncio.sleep(60)
+                await load_employees_from_supabase()
+        except Exception as e:
+            logger.error(f"[EMPLOYEES] Realtime error: {e} → fallback poll")
+            while True:
+                await asyncio.sleep(60)
+                await load_employees_from_supabase()
+    asyncio.create_task(watch_employees_realtime())
 
     @client.on(events.NewMessage())
     async def handler(event):
