@@ -386,17 +386,21 @@ async def supabase_open_break(staff_name: str, activity: str, timestamp_str: str
         prev_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
         reason = get_break_reason(activity)
 
-        # กันซ้ำ: ถ้ายังมี record ที่ยังไม่ปิดอยู่ → ข้าม
+        # ถ้ายังมี record ที่ยังไม่ปิดอยู่ → ปิดก่อนแล้วเปิดใหม่ (กรณีบอท Telegram รีเซทข้ามตี 1)
         res = supabase.from_("break_sessions") \
-            .select("id") \
+            .select("id, break_start") \
             .eq("staff_name", staff_name) \
             .in_("break_date", [break_date, prev_date]) \
             .is_("break_end", "null") \
-            .limit(1) \
             .execute()
         if res.data:
-            logger.info(f"[Supabase] {staff_name} ยังพักค้างอยู่ → ข้าม insert")
-            return
+            ids = [r["id"] for r in res.data]
+            # ปิด record เก่าด้วยเวลาปัจจุบัน (ถือว่าพักจนถึงตอนนี้)
+            supabase.from_("break_sessions") \
+                .update({"break_end": now.isoformat()}) \
+                .in_("id", ids) \
+                .execute()
+            logger.info(f"[Supabase] {staff_name} มี record ค้าง {len(ids)} รายการ → ปิดแล้วเปิดใหม่")
 
         supabase.from_("break_sessions").insert({
             "staff_name": staff_name,
@@ -1012,19 +1016,21 @@ async def start_telegram(on_activity):
                     if tid_match:
                         tid = tid_match.group(1)
                         emp = EMPLOYEES.get(tid)
-                        if emp and tid in _currently_out:
-                            # เช็คว่าต้องแจ้งเตือนถ่ายรูปด้วยไหม
-                            reminder = None
-                            if tid in _out_during_window and tid not in _photos_sent and _checkin_window["keyword"]:
-                                reminder = f"📷 {emp['name']} กลับที่นั่งแล้วอย่าลืมถ่ายรูปเช็คชื่อด้วยนะ! · {_checkin_window['shift_name']}"
-                            await discord_bot.send_notification(
-                                emp["discord_id"], emp["name"], "กลับที่นั่ง", True, title,
-                                checkin_reminder=reminder,
-                            )
+                        if emp:
+                            # ปิด break session ใน Supabase เสมอ ไม่ว่าจะอยู่ใน _currently_out หรือไม่
+                            # (กรณีบอท Telegram รีเซทข้ามตี 1 ทำให้ _currently_out ว่าง)
                             await supabase_close_break(emp["name"], None)
-                            _out_during_window.discard(tid)
-                            _currently_out.pop(tid, None)
-                            logger.info(f"[FAILED RETURN] {emp['name']} — notified via failed return message")
+                            if tid in _currently_out:
+                                reminder = None
+                                if tid in _out_during_window and tid not in _photos_sent and _checkin_window["keyword"]:
+                                    reminder = f"📷 {emp['name']} กลับที่นั่งแล้วอย่าลืมถ่ายรูปเช็คชื่อด้วยนะ! · {_checkin_window['shift_name']}"
+                                await discord_bot.send_notification(
+                                    emp["discord_id"], emp["name"], "กลับที่นั่ง", True, title,
+                                    checkin_reminder=reminder,
+                                )
+                                _out_during_window.discard(tid)
+                                _currently_out.pop(tid, None)
+                            logger.info(f"[FAILED RETURN] {emp['name']} — closed break session (bot reset case)")
                 else:
                     logger.warning(f"[PARSE FAIL] Has รหัสผู้ใช้ but parse failed. Full text: {text!r}")
         except Exception as e:
