@@ -327,18 +327,22 @@ def get_break_date_str() -> str:
 
 def parse_telegram_timestamp(ts_str: str | None) -> datetime | None:
     """แปลง timestamp จาก Telegram 'dd/mm HH:MM:SS' เป็น datetime ไทย (UTC+7)
-    Telegram ส่งเวลาเป็น UTC+8 → ลบ 1 ชั่วโมงเหมือนที่แสดงใน Discord"""
+    format: dd/mm HH:MM:SS (วัน/เดือน ชั่วโมง:นาที:วินาที)
+    เวลาเป็น Thai time (UTC+7) อยู่แล้ว ไม่ต้องแปลง zone"""
     if not ts_str:
         return None
     try:
         parts = ts_str.strip().split()
         date_part, time_part = parts[0], parts[1]
+        # format dd/mm → day, month
         day, month = map(int, date_part.split('/'))
         h, m, s = map(int, time_part.split(':'))
-        h = (h - 1) % 24  # UTC+8 → UTC+7
-        year = datetime.now().year
-        return datetime(year, month, day, h, m, s, tzinfo=timezone(timedelta(hours=7)))
-    except Exception:
+        # ใช้ปีจาก Thai timezone
+        year = get_thai_time().year
+        dt = datetime(year, month, day, h, m, s, tzinfo=timezone(timedelta(hours=7)))
+        return dt
+    except Exception as e:
+        logger.warning(f"[parse_telegram_timestamp] parse failed: {ts_str!r} — {e}")
         return None
 
 
@@ -459,7 +463,7 @@ def parse_message(text: str, group_name: str) -> dict | None:
     is_return = any(kw in activity for kw in RETURN_KEYWORDS)
 
     ts_match = re.search(r"(\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})", text)
-    timestamp = ts_match.group(1) if ts_match else datetime.now().strftime("%d/%m %H:%M:%S")
+    timestamp = ts_match.group(1) if ts_match else get_thai_time().strftime("%d/%m %H:%M:%S")
 
     dur_match = re.search(r"เวลากิจกรรมนี้[：:][^`]*`([^`]+)`", text)
     duration = dur_match.group(1) if dur_match else None
