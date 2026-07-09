@@ -72,26 +72,32 @@ async def load_employees_from_supabase() -> None:
     except Exception as e:
         logger.error(f"[EMPLOYEES] load error: {e}")
 
-# TARGET_GROUPS โหลดจาก Supabase ตาราง checkin_groups
-TARGET_GROUPS: list[str] = []  # จะถูกโหลดตอน startup
+# TARGET_GROUPS และ SHIFT_GROUPS โหลดจาก Supabase ตาราง checkin_groups
+TARGET_GROUPS: list[str] = []   # กลุ่มเช็คอิน (แจ้งพัก)
+SHIFT_GROUPS: list[str] = []    # กลุ่มเช็คชื่อ (ถ่ายรูป/กะ)
 
 async def load_target_groups() -> None:
-    """โหลดรายชื่อกลุ่ม Telegram ที่ต้องดักจาก Supabase"""
-    global TARGET_GROUPS
+    """โหลดรายชื่อกลุ่ม Telegram จาก Supabase แยกตาม group_type"""
+    global TARGET_GROUPS, SHIFT_GROUPS
     if not supabase:
         return
     try:
-        res = supabase.from_("checkin_groups")             .select("group_name")             .eq("active", True)             .execute()
+        res = supabase.from_("checkin_groups")             .select("group_name, group_type")             .eq("active", True)             .execute()
         if res.data:
+            checkin = [r["group_name"] for r in res.data if r.get("group_type") == "checkin"]
+            shift   = [r["group_name"] for r in res.data if r.get("group_type") == "shift"]
+            # TARGET_GROUPS = รวมทั้งหมด (ดักทุกกลุ่ม)
             TARGET_GROUPS = [r["group_name"] for r in res.data]
-            logger.info(f"[GROUPS] โหลดสำเร็จ {len(TARGET_GROUPS)} กลุ่ม: {TARGET_GROUPS}")
+            SHIFT_GROUPS  = shift
+            logger.info(f"[GROUPS] เช็คอิน: {checkin}")
+            logger.info(f"[GROUPS] เช็คชื่อ: {shift}")
         else:
-            logger.warning("[GROUPS] ไม่พบกลุ่มใน Supabase — ใช้ค่าเดิม")
+            logger.warning("[GROUPS] ไม่พบกลุ่มใน Supabase")
     except Exception as e:
         logger.error(f"[GROUPS] load error: {e}")
 
 # กลุ่มที่ใช้ระบบกะงาน → Sound ID สำหรับแต่ละกลุ่ม
-SHIFT_GROUPS = ["OL ชั่วคราว", "AM ONLINE เข้างาน", "พี่เลี้ยง Jun88 กะ JAPAO"]
+# SHIFT_GROUPS โหลดจาก Supabase แล้ว (ดู load_target_groups)
 
 SHIFT_GROUP_SOUND_ID: dict[str, int] = {
     "OL ชั่วคราว":              1518570639886389378,
