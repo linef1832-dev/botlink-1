@@ -843,30 +843,30 @@ async def start_telegram(on_activity):
         try:
             from realtime import AsyncRealtimeClient
             realtime_url = _supabase_url.replace("https://", "wss://") + "/realtime/v1"
-            rt_client = AsyncRealtimeClient(realtime_url, _supabase_key)
-            await rt_client.connect()
-            channel = rt_client.channel("users-changes")
-            async def on_users_change(payload):
-                logger.info(f"[EMPLOYEES] Realtime: ตรวจพบการเปลี่ยนแปลงใน users → รีโหลดทันที")
-                await load_employees_from_supabase()
-            await channel.on_postgres_changes(
-                event="*",
-                schema="public",
-                table="users",
-                callback=on_users_change
-            ).subscribe()
-            logger.info("[EMPLOYEES] Realtime: กำลัง watch ตาราง users...")
-            await rt_client.listen()
+            while True:
+                try:
+                    rt_client = AsyncRealtimeClient(realtime_url, _supabase_key)
+                    await rt_client.connect()
+                    channel = rt_client.channel("users-changes")
+                    async def on_users_change(payload):
+                        logger.info("[EMPLOYEES] Realtime: ตรวจพบการเปลี่ยนแปลง → รีโหลด")
+                        await load_employees_from_supabase()
+                    await channel.on_postgres_changes(
+                        event="*",
+                        schema="public",
+                        table="users",
+                        callback=on_users_change
+                    ).subscribe()
+                    logger.info("[EMPLOYEES] Realtime: watching users...")
+                    while True:
+                        await asyncio.sleep(1)
+                except Exception as e:
+                    logger.error(f"[EMPLOYEES] Realtime disconnected: {e} → reconnect in 10s")
+                    await asyncio.sleep(10)
         except ImportError:
-            # ถ้าไม่มี realtime library → fallback poll ทุก 60 วินาที
-            logger.warning("[EMPLOYEES] ไม่มี realtime library → ใช้ poll ทุก 60 วินาทีแทน")
+            logger.warning("[EMPLOYEES] ไม่มี realtime library → poll ทุก 30 วินาที")
             while True:
-                await asyncio.sleep(60)
-                await load_employees_from_supabase()
-        except Exception as e:
-            logger.error(f"[EMPLOYEES] Realtime error: {e} → fallback poll")
-            while True:
-                await asyncio.sleep(60)
+                await asyncio.sleep(30)
                 await load_employees_from_supabase()
     asyncio.create_task(watch_employees_realtime())
 
