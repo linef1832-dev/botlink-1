@@ -72,54 +72,124 @@ async def load_employees_from_supabase() -> None:
     except Exception as e:
         logger.error(f"[EMPLOYEES] load error: {e}")
 
-# TARGET_GROUPS และ SHIFT_GROUPS โหลดจาก Supabase ตาราง checkin_groups
-TARGET_GROUPS: list[str] = []   # กลุ่มเช็คอิน (แจ้งพัก)
-SHIFT_GROUPS: list[str] = []    # กลุ่มเช็คชื่อ (ถ่ายรูป/กะ)
+# ---------------------------------------------------------------------------
+# กลุ่ม Telegram — โหลดทั้งหมดจาก Supabase ตาราง telegram_groups
+# ไม่มีชื่อกลุ่ม / sound id / การจับคู่ hardcode ไว้ในไฟล์นี้อีกแล้ว
+# แก้ค่าทุกอย่างได้จากหน้าเว็บ แล้วบอทรีโหลดเองผ่าน realtime
+# ---------------------------------------------------------------------------
+GROUPS_BY_CHAT: dict[str, dict] = {}        # chat_id (normalize แล้ว) -> ข้อมูลกลุ่ม
+SHIFT_CHAT_IDS: set[str] = set()            # chat_id ของกลุ่มประเภท shift
+SOUND_DURATION_BY_ID: dict[str, float] = {} # sound_id -> ความยาวเสียง (วินาที)
+_seen_unknown_chats: set[str] = set()       # กัน log ซ้ำสำหรับกลุ่มที่ยังไม่ได้ตั้งค่า
+
+
+def norm_chat_id(value) -> str:
+    """ทำให้ chat id รูปแบบต่างๆ เทียบกันได้
+
+    Telethon คืน 1234567890 แต่ Bot API / ลิงก์ คืน -1001234567890
+    ทั้งคู่คือกลุ่มเดียวกัน ฟังก์ชันนี้ตัดเครื่องหมายลบและ prefix 100 ออกให้เหลือแกนเดียวกัน
+    จะได้ไม่ต้องมานั่งเดาว่าต้องกรอกแบบไหนในหน้าเว็บ
+    """
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    s = s.lstrip("-")
+    if not s.isdigit():
+        return ""
+    if s.startswith("100") and len(s) > 10:
+        s = s[3:]
+    return s
+
 
 async def load_target_groups() -> None:
-    """โหลดรายชื่อกลุ่ม Telegram จาก Supabase แยกตาม group_type"""
-    global TARGET_GROUPS, SHIFT_GROUPS
+    """โหลดกลุ่ม Telegram จาก Supabase ตาราง telegram_groups"""
+    global GROUPS_BY_CHAT, SHIFT_CHAT_IDS, SOUND_DURATION_BY_ID
     if not supabase:
         return
     try:
-        res = supabase.from_("checkin_groups")             .select("group_name, group_type")             .eq("active", True)             .execute()
-        if res.data:
-            checkin = [r["group_name"] for r in res.data if r.get("group_type") == "checkin"]
-            shift   = [r["group_name"] for r in res.data if r.get("group_type") == "shift"]
-            # TARGET_GROUPS = รวมทั้งหมด (ดักทุกกลุ่ม)
-            TARGET_GROUPS = [r["group_name"] for r in res.data]
-            SHIFT_GROUPS  = shift
-            logger.info(f"[GROUPS] เช็คอิน: {checkin}")
-            logger.info(f"[GROUPS] เช็คชื่อ: {shift}")
-        else:
-            logger.warning("[GROUPS] ไม่พบกลุ่มใน Supabase")
+        res = supabase.from_("telegram_groups") \
+            .select("group_name, group_type, chat_id, sound_id, sound_duration, paired_chat_ids") \
+            .eq("active", True) \
+            .execute()
+
+        groups: dict[str, dict] = {}
+        shifts: set[str] = set()
+        durations: dict[str, float] = {}
+        missing_id: list[str] = []
+
+        for r in (res.data or []):
+            cid = norm_chat_id(r.get("chat_id"))
+            if not cid:
+                missing_id.append(r.get("group_name") or "(ไม่มีชื่อ)")
+                continue
+
+            raw_pairs = r.get("paired_chat_ids") or []
+            if isinstance(raw_pairs, str):
+                try:
+                    raw_pairs = json.loads(raw_pairs)
+                except Exception:
+                    raw_pairs = []
+            if not isinstance(raw_pairs, list):
+                raw_pairs = []
+
+            sound_id = str(r.get("sound_id") or "").strip()
+            try:
+                duration = float(r.get("sound_duration")) if r.get("sound_duration") else 0.0
+            except (TypeError, ValueError):
+                duration = 0.0
+
+            groups[cid] = {
+                "name": r.get("group_name") or "",
+                "type": r.get("group_type") or "checkin",
+                "sound_id": sound_id,
+                "paired": [x for x in (norm_chat_id(v) for v in raw_pairs) if x],
+            }
+            if groups[cid]["type"] == "shift":
+                shifts.add(cid)
+            if sound_id and duration > 0:
+                durations[sound_id] = duration
+
+        GROUPS_BY_CHAT = groups
+        SHIFT_CHAT_IDS = shifts
+        SOUND_DURATION_BY_ID = durations
+        _seen_unknown_chats.clear()
+
+        logger.info(f"[GROUPS] โหลดแล้ว {len(groups)} กลุ่ม (กะ {len(shifts)} กลุ่ม)")
+        for cid, g in groups.items():
+            logger.info(f"[GROUPS]   chat_id={cid} · {g['name']} · {g['type']}")
+        if missing_id:
+            logger.warning(f"[GROUPS] ข้าม {len(missing_id)} กลุ่ม เพราะยังไม่ได้ใส่ Chat ID: {missing_id}")
+        if not groups:
+            logger.warning("[GROUPS] ไม่มีกลุ่มที่ใช้งานได้เลย — บอทจะไม่ดักข้อความจากที่ไหน")
     except Exception as e:
         logger.error(f"[GROUPS] load error: {e}")
 
-# กลุ่มที่ใช้ระบบกะงาน → Sound ID สำหรับแต่ละกลุ่ม
-# SHIFT_GROUPS โหลดจาก Supabase แล้ว (ดู load_target_groups)
 
-SHIFT_GROUP_SOUND_ID: dict[str, int] = {
-    "OL ชั่วคราว":              1518570639886389378,
-    "AM ONLINE เข้างาน":        1518570573943410798,
-    "พี่เลี้ยง Jun88 กะ JAPAO": 1518570639886389378,  # ใช้เสียงเดียวกับ OL
-}
+def get_group(chat_id) -> dict | None:
+    return GROUPS_BY_CHAT.get(norm_chat_id(chat_id))
 
-# จับคู่: กลุ่มกะงาน → กลุ่มเช็คอินกิจกรรมที่ใช้คู่กัน (รองรับหลายกลุ่มได้)
-SHIFT_CHECKIN_PAIR: dict[str, list[str]] = {
-    "AM ONLINE เข้างาน":        ["Jun88-OL กลุ่มเช็คอิน 打卡群"],
-    "OL ชั่วคราว":              ["Jun88-กลุ่มเช็คอิน打卡群"],
-    "พี่เลี้ยง Jun88 กะ JAPAO": ["Jun88-OL กลุ่มเช็คอิน 打卡群", "Jun88-กลุ่มเช็คอิน打卡群"],
-}
 
-def get_shift_sound_id(group_name: str) -> int:
-    return SHIFT_GROUP_SOUND_ID.get(group_name, 0)
+def get_shift_sound_id(chat_id) -> int:
+    g = get_group(chat_id)
+    if not g or not g["sound_id"]:
+        return 0
+    try:
+        return int(g["sound_id"])
+    except ValueError:
+        logger.warning(f"[GROUPS] sound_id ไม่ใช่ตัวเลข: {g['sound_id']!r} (กลุ่ม {g['name']})")
+        return 0
 
-# ความยาวเสียง (วินาที) ของแต่ละ sound_id — ใช้รอให้รอบ 1 จบก่อนเปิดรอบ 2
-SHIFT_SOUND_DURATION: dict[str, float] = {
-    "1518570639886389378": 3.540,  # OL ชั่วคราว
-    "1518570573943410798": 2.520,  # AM ONLINE เข้างาน
-}
+
+def log_unknown_chat(chat_id: str, title: str) -> None:
+    """พิมพ์ chat_id ของกลุ่มที่ยังไม่ได้ตั้งค่า ครั้งเดียวต่อกลุ่ม
+
+    เอาไว้ให้แอดมินเปิด log แล้วก๊อป chat_id ไปใส่ในหน้าเว็บได้เลย
+    """
+    if not chat_id or chat_id in _seen_unknown_chats:
+        return
+    _seen_unknown_chats.add(chat_id)
+    logger.info(f"[GROUPS] พบกลุ่มที่ยังไม่ได้ตั้งค่า → chat_id={chat_id} · ชื่อ: {title!r}")
+
 
 # ข้อความกะงานที่ต้องดักจับ
 SHIFT_KEYWORDS = [
@@ -145,7 +215,7 @@ RETURN_KEYWORDS = ["กลับที่นั่ง", "กลับที่�
 _checkin_window: dict = {"keyword": None, "shift_name": None, "shift_group": None}
 _photos_sent: set[str] = set()        # telegram_id ที่ส่งรูปในช่วงเช็คชื่อนี้แล้ว
 _out_during_window: set[str] = set()  # telegram_id ที่ออกไปทำกิจกรรมระหว่าง/ก่อนช่วง
-_currently_out: dict[str, str] = {}   # telegram_id → group_name ที่กดเช็คอินมา
+_currently_out: dict[str, str] = {}   # telegram_id → chat_id ของกลุ่มที่กดเช็คอินมา
 
 ACTIVITY_EMOJI = {
     "กินข้าว": "🍚", "ทานข้าว": "🍚",
@@ -323,7 +393,7 @@ async def supabase_close_break(staff_name: str, timestamp_str: str | None = None
         logger.error(f"[Supabase] supabase_close_break error: {e}")
 
 
-def parse_message(text: str, group_name: str) -> dict | None:
+def parse_message(text: str, group_name: str, chat_id: str = "") -> dict | None:
     if not text:
         return None
 
@@ -383,6 +453,7 @@ def parse_message(text: str, group_name: str) -> dict | None:
         "timestamp": timestamp,
         "duration": duration,
         "group_name": group_name,
+        "chat_id": chat_id,
     }
 
 
@@ -494,7 +565,7 @@ class ActivityBot(discord.Client):
         ch_names = [ch.name for ch in occupied.values()]
         logger.info(f"[SHIFT] {shift_label} — playing sound simultaneously in {len(occupied)} channel(s): {ch_names}")
 
-        sound_duration = SHIFT_SOUND_DURATION.get(str(sound_id), 3.0)
+        sound_duration = SOUND_DURATION_BY_ID.get(str(sound_id), 3.0)
 
         async def play_in_channel(channel: discord.VoiceChannel):
             guild_id = channel.guild.id
@@ -870,7 +941,7 @@ async def start_telegram(on_activity):
                 await load_employees_from_supabase()
     asyncio.create_task(watch_employees_realtime())
 
-    # ดักการเปลี่ยนแปลงตาราง checkin_groups → รีโหลด TARGET_GROUPS ทันที
+    # ดักการเปลี่ยนแปลงตาราง telegram_groups → รีโหลดรายชื่อกลุ่มทันที
     async def watch_groups_realtime():
         try:
             from realtime import AsyncRealtimeClient
@@ -879,15 +950,15 @@ async def start_telegram(on_activity):
             await rt_client.connect()
             channel = rt_client.channel("groups-changes")
             async def on_groups_change(payload):
-                logger.info(f"[GROUPS] Realtime: ตรวจพบการเปลี่ยนแปลงใน checkin_groups → รีโหลดทันที")
+                logger.info(f"[GROUPS] Realtime: ตรวจพบการเปลี่ยนแปลงใน telegram_groups → รีโหลดทันที")
                 await load_target_groups()
             await channel.on_postgres_changes(
                 event="*",
                 schema="public",
-                table="checkin_groups",
+                table="telegram_groups",
                 callback=on_groups_change
             ).subscribe()
-            logger.info("[GROUPS] Realtime: กำลัง watch ตาราง checkin_groups...")
+            logger.info("[GROUPS] Realtime: กำลัง watch ตาราง telegram_groups...")
             await rt_client.listen()
         except Exception as e:
             logger.error(f"[GROUPS] Realtime error: {e}")
@@ -898,28 +969,32 @@ async def start_telegram(on_activity):
         try:
             chat = await event.get_chat()
             title = getattr(chat, "title", "") or ""
+            chat_id = norm_chat_id(getattr(chat, "id", None))
 
-            if not any(g in title for g in TARGET_GROUPS):
+            group = GROUPS_BY_CHAT.get(chat_id)
+            if not group:
+                log_unknown_chat(chat_id, title)
                 return
+
+            group_name = group["name"] or title
 
             text = event.message.text or ""
             sender = getattr(event.message.sender, "username", None) or getattr(event.message.sender, "first_name", "unknown") if event.message.sender else "unknown"
             logger.info(f"[Jun88] from {sender}: {text[:120]!r}")
 
             # กลุ่มกะงาน → ดักข้อความกะเช้า/กะดึก แล้วเปิดเสียง
-            if any(g in title for g in SHIFT_GROUPS):
+            if chat_id in SHIFT_CHAT_IDS:
                 matched = next((kw for kw in SHIFT_KEYWORDS if kw in text), None)
                 if matched:
-                    group_key = next((g for g in SHIFT_GROUPS if g in title), "")
-                    sound_id = get_shift_sound_id(group_key)
-                    logger.info(f"[SHIFT] Detected '{matched}' in '{title}' (sound_id={sound_id})")
-                    _checkin_window.update({"keyword": matched, "shift_name": shift_keyword_to_name(matched), "shift_group": group_key})
+                    sound_id = get_shift_sound_id(chat_id)
+                    logger.info(f"[SHIFT] Detected '{matched}' in '{group_name}' (sound_id={sound_id})")
+                    _checkin_window.update({"keyword": matched, "shift_name": shift_keyword_to_name(matched), "shift_group": chat_id})
                     _photos_sent.clear()
                     _out_during_window.clear()
-                    paired_checkins = SHIFT_CHECKIN_PAIR.get(group_key, [])
+                    paired_checkins = group["paired"]
                     _out_during_window.update(
                         tid for tid, grp in _currently_out.items()
-                        if not paired_checkins or any(p in grp for p in paired_checkins)
+                        if not paired_checkins or grp in paired_checkins
                     )
                     logger.info(f"[CHECKIN] Window opened: {_checkin_window['shift_name']} (paired: {paired_checkins}), {len(_out_during_window)} already out")
 
@@ -941,7 +1016,7 @@ async def start_telegram(on_activity):
                 return
 
             # กลุ่มเช็คอินปกติ → parse และแจ้ง Discord
-            parsed = parse_message(text, title)
+            parsed = parse_message(text, group_name, chat_id)
             if parsed:
                 logger.info(f"[PARSE OK] id={parsed['telegram_id']} activity={parsed['activity']}")
                 await on_activity(parsed)
@@ -962,7 +1037,7 @@ async def start_telegram(on_activity):
                                 if tid in _out_during_window and tid not in _photos_sent and _checkin_window["keyword"]:
                                     reminder = f"📷 {emp['name']} กลับที่นั่งแล้วอย่าลืมถ่ายรูปเช็คชื่อด้วยนะ! · {_checkin_window['shift_name']}"
                                 await discord_bot.send_notification(
-                                    emp["discord_id"], emp["name"], "กลับที่นั่ง", True, title,
+                                    emp["discord_id"], emp["name"], "กลับที่นั่ง", True, group_name,
                                     checkin_reminder=reminder,
                                 )
                                 _out_during_window.discard(tid)
@@ -973,7 +1048,7 @@ async def start_telegram(on_activity):
         except Exception as e:
             logger.error(f"Error handling Telegram message: {e}")
 
-    logger.info(f"Listening for groups containing: {TARGET_GROUPS}")
+    logger.info(f"[GROUPS] เริ่มฟัง {len(GROUPS_BY_CHAT)} กลุ่ม (จับคู่ด้วย chat_id)")
     try:
         await client.run_until_disconnected()
     finally:
@@ -1000,10 +1075,11 @@ async def on_activity(parsed: dict):
         # ปิด break session ใน Supabase ด้วยเวลาจาก Telegram
         await supabase_close_break(emp["name"], parsed.get("timestamp"))
     else:
-        _currently_out[tid] = parsed["group_name"]
+        _currently_out[tid] = parsed.get("chat_id", "")
         if _checkin_window["keyword"]:
-            paired_checkins = SHIFT_CHECKIN_PAIR.get(_checkin_window.get("shift_group", ""), [])
-            if not paired_checkins or any(p in parsed["group_name"] for p in paired_checkins):
+            shift_group = get_group(_checkin_window.get("shift_group") or "")
+            paired_checkins = shift_group["paired"] if shift_group else []
+            if not paired_checkins or parsed.get("chat_id", "") in paired_checkins:
                 _out_during_window.add(tid)
         # เปิด break session ใน Supabase ด้วยเวลาจาก Telegram
         await supabase_open_break(emp["name"], parsed["activity"], parsed.get("timestamp"))
