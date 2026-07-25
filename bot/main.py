@@ -180,14 +180,21 @@ def get_shift_sound_id(chat_id) -> int:
         return 0
 
 
-def log_unknown_chat(chat_id: str, title: str) -> None:
+async def log_unknown_chat(event, chat_id: str) -> None:
     """พิมพ์ chat_id ของกลุ่มที่ยังไม่ได้ตั้งค่า ครั้งเดียวต่อกลุ่ม
 
     เอาไว้ให้แอดมินเปิด log แล้วก๊อป chat_id ไปใส่ในหน้าเว็บได้เลย
+    ดึงชื่อกลุ่มเฉพาะตอนเจอกลุ่มใหม่ครั้งแรกเท่านั้น ไม่ใช่ทุกข้อความ
     """
     if not chat_id or chat_id in _seen_unknown_chats:
         return
     _seen_unknown_chats.add(chat_id)
+    title = ""
+    try:
+        chat = await event.get_chat()
+        title = getattr(chat, "title", "") or ""
+    except Exception:
+        pass
     logger.info(f"[GROUPS] พบกลุ่มที่ยังไม่ได้ตั้งค่า → chat_id={chat_id} · ชื่อ: {title!r}")
 
 
@@ -967,16 +974,17 @@ async def start_telegram(on_activity):
     @client.on(events.NewMessage())
     async def handler(event):
         try:
-            chat = await event.get_chat()
-            title = getattr(chat, "title", "") or ""
-            chat_id = norm_chat_id(getattr(chat, "id", None))
+            # ตัดจบตั้งแต่บรรทัดแรก — event.chat_id มีมาให้ในตัว event อยู่แล้ว
+            # ไม่ต้องเรียก get_chat() (ซึ่งบางครั้งต้องยิงถาม Telegram กลับไป) ทุกข้อความ
+            chat_id = norm_chat_id(getattr(event, "chat_id", None))
 
             group = GROUPS_BY_CHAT.get(chat_id)
             if not group:
-                log_unknown_chat(chat_id, title)
+                if not getattr(event, "is_private", False):
+                    await log_unknown_chat(event, chat_id)
                 return
 
-            group_name = group["name"] or title
+            group_name = group["name"]
 
             text = event.message.text or ""
             sender = getattr(event.message.sender, "username", None) or getattr(event.message.sender, "first_name", "unknown") if event.message.sender else "unknown"
