@@ -112,7 +112,7 @@ async def load_target_groups() -> None:
         return
     try:
         res = supabase.from_("telegram_groups") \
-            .select("group_name, group_type, chat_id, sound_id, sound_duration, paired_chat_ids") \
+            .select("group_name, group_type, chat_id, sound_id, sound_duration") \
             .eq("active", True) \
             .execute()
 
@@ -127,15 +127,6 @@ async def load_target_groups() -> None:
                 missing_id.append(r.get("group_name") or "(ไม่มีชื่อ)")
                 continue
 
-            raw_pairs = r.get("paired_chat_ids") or []
-            if isinstance(raw_pairs, str):
-                try:
-                    raw_pairs = json.loads(raw_pairs)
-                except Exception:
-                    raw_pairs = []
-            if not isinstance(raw_pairs, list):
-                raw_pairs = []
-
             sound_id = str(r.get("sound_id") or "").strip()
             try:
                 duration = float(r.get("sound_duration")) if r.get("sound_duration") else 0.0
@@ -146,7 +137,6 @@ async def load_target_groups() -> None:
                 "name": r.get("group_name") or "",
                 "type": r.get("group_type") or "checkin",
                 "sound_id": sound_id,
-                "paired": [x for x in (norm_chat_id(v) for v in raw_pairs) if x],
             }
             if groups[cid]["type"] == "shift":
                 shifts.add(cid)
@@ -1024,12 +1014,9 @@ async def start_telegram(on_activity):
                     _checkin_window.update({"keyword": matched, "shift_name": shift_keyword_to_name(matched), "shift_group": chat_id})
                     _photos_sent.clear()
                     _out_during_window.clear()
-                    paired_checkins = group["paired"]
-                    _out_during_window.update(
-                        tid for tid, grp in _currently_out.items()
-                        if not paired_checkins or grp in paired_checkins
-                    )
-                    logger.info(f"[CHECKIN] Window opened: {_checkin_window['shift_name']} (paired: {paired_checkins}), {len(_out_during_window)} already out")
+                    # นับทุกคนที่กำลังไม่อยู่โต๊ะ ไม่แยกว่ามาจากกลุ่มเช็คอินไหน
+                    _out_during_window.update(_currently_out.keys())
+                    logger.info(f"[CHECKIN] Window opened: {_checkin_window['shift_name']}, {len(_out_during_window)} already out")
 
                     async def _run_shift_sound(label=matched, sid=sound_id):
                         try:
@@ -1112,10 +1099,7 @@ async def on_activity(parsed: dict):
     else:
         _currently_out[tid] = parsed.get("chat_id", "")
         if _checkin_window["keyword"]:
-            shift_group = get_group(_checkin_window.get("shift_group") or "")
-            paired_checkins = shift_group["paired"] if shift_group else []
-            if not paired_checkins or parsed.get("chat_id", "") in paired_checkins:
-                _out_during_window.add(tid)
+            _out_during_window.add(tid)
         # เปิด break session ใน Supabase ด้วยเวลาจาก Telegram
         await supabase_open_break(emp["name"], parsed["activity"], parsed.get("timestamp"))
 
