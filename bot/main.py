@@ -926,9 +926,14 @@ async def start_telegram(on_activity):
                     rt_client = AsyncRealtimeClient(realtime_url, _supabase_key)
                     await rt_client.connect()
                     channel = rt_client.channel("users-changes")
-                    async def on_users_change(payload):
+                    _loop = asyncio.get_running_loop()
+
+                    # [FIX] callback ต้องเป็นฟังก์ชันธรรมดา ไม่ใช่ async def
+                    # ไลบรารี realtime เรียกแบบ binding.callback(payload, ref) เฉยๆ ไม่ได้ await
+                    # ถ้าเขียนเป็น async def จะได้แค่ coroutine ที่ไม่มีใครรัน (RuntimeWarning: never awaited)
+                    def on_users_change(*_args, **_kwargs):
                         logger.info("[EMPLOYEES] Realtime: ตรวจพบการเปลี่ยนแปลง → รีโหลด")
-                        await load_employees_from_supabase()
+                        asyncio.run_coroutine_threadsafe(load_employees_from_supabase(), _loop)
                     await channel.on_postgres_changes(
                         event="*",
                         schema="public",
@@ -956,9 +961,12 @@ async def start_telegram(on_activity):
             rt_client = AsyncRealtimeClient(realtime_url, _supabase_key)
             await rt_client.connect()
             channel = rt_client.channel("groups-changes")
-            async def on_groups_change(payload):
-                logger.info(f"[GROUPS] Realtime: ตรวจพบการเปลี่ยนแปลงใน telegram_groups → รีโหลดทันที")
-                await load_target_groups()
+            _loop = asyncio.get_running_loop()
+
+            # [FIX] เหตุผลเดียวกับ on_users_change ข้างบน — ต้องเป็นฟังก์ชันธรรมดา
+            def on_groups_change(*_args, **_kwargs):
+                logger.info("[GROUPS] Realtime: ตรวจพบการเปลี่ยนแปลงใน telegram_groups → รีโหลดทันที")
+                asyncio.run_coroutine_threadsafe(load_target_groups(), _loop)
             await channel.on_postgres_changes(
                 event="*",
                 schema="public",
