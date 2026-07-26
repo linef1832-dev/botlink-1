@@ -82,6 +82,10 @@ SHIFT_CHAT_IDS: set[str] = set()            # chat_id ของกลุ่ม�
 SOUND_DURATION_BY_ID: dict[str, float] = {} # sound_id -> ความยาวเสียง (วินาที)
 _seen_unknown_chats: set[str] = set()       # กัน log ซ้ำสำหรับกลุ่มที่ยังไม่ได้ตั้งค่า
 
+# ปิดเสียง log ของกลุ่มที่ไม่ได้ตั้งค่าไว้ (ค่าเริ่มต้น = ปิด เพื่อไม่ให้ log รก)
+# ตอนจะหา chat_id ของกลุ่มใหม่ ให้ตั้ง env LOG_UNKNOWN_GROUPS=1 แล้วรีสตาร์ทบอท
+LOG_UNKNOWN_GROUPS = os.environ.get("LOG_UNKNOWN_GROUPS", "0").strip().lower() in ("1", "true", "yes", "on")
+
 
 def norm_chat_id(value) -> str:
     """ทำให้ chat id รูปแบบต่างๆ เทียบกันได้
@@ -186,6 +190,8 @@ async def log_unknown_chat(event, chat_id: str) -> None:
     เอาไว้ให้แอดมินเปิด log แล้วก๊อป chat_id ไปใส่ในหน้าเว็บได้เลย
     ดึงชื่อกลุ่มเฉพาะตอนเจอกลุ่มใหม่ครั้งแรกเท่านั้น ไม่ใช่ทุกข้อความ
     """
+    if not LOG_UNKNOWN_GROUPS:
+        return
     if not chat_id or chat_id in _seen_unknown_chats:
         return
     _seen_unknown_chats.add(chat_id)
@@ -267,9 +273,14 @@ def get_break_reason(activity: str) -> str:
     return f"☕ {activity}"
 
 
+# บอท Telegram ส่ง timestamp มาเป็นโซนจีน (UTC+8) ต้องแปลงเป็นไทย (UTC+7) ก่อนเก็บเสมอ
+TG_TZ = timezone(timedelta(hours=8))   # โซนที่ข้อความจาก Telegram ใช้
+TH_TZ = timezone(timedelta(hours=7))   # โซนไทย ที่เราเก็บลง DB
+
+
 def get_thai_time() -> datetime:
     """คืน datetime ปัจจุบันในโซนเวลาไทย (UTC+7)"""
-    return datetime.now(timezone(timedelta(hours=7)))
+    return datetime.now(TH_TZ)
 
 
 def get_break_date_str() -> str:
@@ -285,6 +296,12 @@ def get_break_date_str() -> str:
 
 def parse_telegram_timestamp(ts_str: str | None) -> datetime | None:
     """แปลง timestamp จาก Telegram เป็น datetime ไทย (UTC+7)
+
+    [FIX] เวลาที่บอท Telegram ส่งมาเป็นโซนจีน (UTC+8) ของเดิมเอาเลขดิบมาแปะป้ายว่า
+    เป็น +7 เลย ทำให้เวลาที่เก็บลง break_sessions เร็วไป 1 ชั่วโมงทุกแถว
+    (ส่วนข้อความที่ส่งเข้า Discord แปลงถูกอยู่แล้ว เลยไม่ตรงกับ DB)
+    ตอนนี้อ่านเป็น +8 ก่อน แล้วค่อยแปลงเป็น +7 ให้ถูกต้อง
+
     รองรับทั้ง dd/mm และ mm/dd โดยเลือก format ที่ใกล้เคียงวันปัจจุบันมากสุด"""
     if not ts_str:
         return None
@@ -298,7 +315,7 @@ def parse_telegram_timestamp(ts_str: str | None) -> datetime | None:
 
         # ลอง dd/mm (วัน/เดือน)
         try:
-            dt_ddmm = datetime(year, b, a, h, m, s, tzinfo=timezone(timedelta(hours=7)))
+            dt_ddmm = datetime(year, b, a, h, m, s, tzinfo=TG_TZ).astimezone(TH_TZ)
             diff_ddmm = abs((dt_ddmm - today).total_seconds())
         except ValueError:
             dt_ddmm = None
@@ -306,7 +323,7 @@ def parse_telegram_timestamp(ts_str: str | None) -> datetime | None:
 
         # ลอง mm/dd (เดือน/วัน)
         try:
-            dt_mmdd = datetime(year, a, b, h, m, s, tzinfo=timezone(timedelta(hours=7)))
+            dt_mmdd = datetime(year, a, b, h, m, s, tzinfo=TG_TZ).astimezone(TH_TZ)
             diff_mmdd = abs((dt_mmdd - today).total_seconds())
         except ValueError:
             dt_mmdd = None
@@ -1065,6 +1082,8 @@ async def start_telegram(on_activity):
             logger.error(f"Error handling Telegram message: {e}")
 
     logger.info(f"[GROUPS] เริ่มฟัง {len(GROUPS_BY_CHAT)} กลุ่ม (จับคู่ด้วย chat_id)")
+    if not LOG_UNKNOWN_GROUPS:
+        logger.info("[GROUPS] ปิด log กลุ่มที่ไม่ได้ตั้งค่าไว้ — ถ้าจะหา chat_id ใหม่ ตั้ง env LOG_UNKNOWN_GROUPS=1 แล้วรีสตาร์ท")
     try:
         await client.run_until_disconnected()
     finally:
