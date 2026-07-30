@@ -1,0 +1,77 @@
+Starting Container
+2026-06-09 09:00:46,809 [WARNING] discord.client: PyNaCl is not installed, voice will NOT be supported
+2026-06-09 09:00:46,809 [WARNING] discord.client: davey is not installed, voice will NOT be supported
+2026-06-09 09:00:46,810 [INFO] discord.client: logging in using static token
+2026-06-09 09:00:46,810 [INFO] telethon.network.mtprotosender: Connecting to 91.108.56.151:443/TcpFull...
+2026-06-09 09:00:47,041 [INFO] telethon.network.mtprotosender: Connection to 91.108.56.151:443/TcpFull complete!
+2026-06-09 09:00:47,510 [ERROR] bot: Telegram error: The authorization key (session file) was used under two different IP addresses simultaneously, and can no longer be used. Use the same session exclusively, or use different sessions (caused by InvokeWithLayerRequest(InitConnectionRequest(GetConfigRequest))) — reconnecting in 5s...
+2026-06-09 09:00:52,515 [INFO] telethon.network.mtprotosender: Connecting to 91.108.56.151:443/TcpFull...
+2026-06-09 09:00:52,738 [INFO] telethon.network.mtprotosender: Connection to 91.108.56.151:443/TcpFull complete!
+2026-06-09 09:00:53,200 [ERROR] bot: Telegram error: The authorization key (session file) was used under two different IP addresses simultaneously, and can no longer be used. Use the same session exclusively, or use different sessions (caused by InvokeWithLayerRequest(InitConnectionRequest(GetConfigRequest))) — reconnecting in 10s...
+2026-06-09 09:01:03,202 [INFO] telethon.network.mtprotosender: Connecting to 91.108.56.151:443/TcpFull...
+2026-06-09 09:01:03,425 [INFO] telethon.network.mtprotosender: Connection to 91.108.56.151:443/TcpFull complete!
+2026-06-09 09:01:03,878 [ERROR] bot: Telegram error: The authorization key (session file) was used under two different IP addresses simultaneously, and can no longer be used. Use the same session exclusively, or use different sessions (caused by InvokeWithLayerRequest(InitConnectionRequest(GetConfigRequest))) — reconnecting in 20s...
+2026-06-09 09:01:23,882 [INFO] telethon.network.mtprotosender: Connecting to 91.108.56.151:443/TcpFull...
+2026-06-09 09:01:24,052 [INFO] telethon.network.mtprotosender: Connection to 91.108.56.151:443/TcpFull complete!
+2026-06-09 09:01:24,408 [ERROR] bot: Telegram error: The authorization key (session file) was used under two different IP addresses simultaneously, and can no longer be used. Use the same session exclusively, or use different sessions (caused by InvokeWithLayerRequest(InitConnectionRequest(GetConfigRequest))) — reconnecting in 40s...
+2026-06-09 09:01:42,976 [INFO] discord.gateway: Shard ID None has connected to Gateway (Session ID: 354a4ee0b2e037c93ba68a202ee253f5).
+2026-06-09 09:01:42,996 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-7' coro=<Connection._send_loop() running at /usr/local/lib/python3.11/site-packages/telethon/network/connection/connection.py:322> wait_for=<Future pending cb=[Task.task_wakeup()]>>
+2026-06-09 09:01:42,996 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-8' coro=<Connection._recv_loop() running at /usr/local/lib/python3.11/site-packages/telethon/network/connection/connection.py:341> wait_for=<Future pending cb=[Task.task_wakeup()]>>
+2026-06-09 09:01:42,996 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-9' coro=<MTProtoSender._send_loop() running at /usr/local/lib/python3.11/site-packages/telethon/network/mtprotosender.py:470> wait_for=<Future pending cb=[Task.task_wakeup()]>>
+2026-06-09 09:01:42,996 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-10' coro=<MTProtoSender._recv_loop() running at /usr/local/lib/python3.11/site-packages/telethon/network/mtprotosender.py:513> wait_for=<Future pending cb=[Task.task_wakeup()]>>
+Exception ignored in: <coroutine object Connection._recv_loop at 0x7fbd8e6d9d50>
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.11/json/decoder.py", line 353, in raw_decode
+    obj, end = self.scan_once(s, idx)
+               ^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: coroutine ignored GeneratorExit
+2026-06-09 09:01:42,996 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-13' coro=<Connection._send_loop() done, defined at /usr/local/lib/python3.11/site-packages/telethon/network/connection/connection.py:316> wait_for=<Future cancelled>>
+Exception ignored in: <coroutine object Connection._recv_loop at 0x7fbd8e6dbc40>
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.11/json/decoder.py", line 353, in raw_decode
+    obj, end = self.scan_once(s, idx)
+               ^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: coroutine ignored GeneratorExit
+2026-06-09 09:01:42,996 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-14' coro=<Connection._recv_loop() running at /usr/local/lib/python3.11/site-packages/telethon/network/connection/connection.py:361> wait_for=<Future pending cb=[Task.task_wakeup()]>>
+2026-06-09 09:01:42,996 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-15' coro=<MTProtoSender._send_loop() done, defined at /usr/local/lib/python3.11/site-packages/telethon/network/mtprotosender.py:452> wait_for=<Future pending cb=[Task.task_wakeup()]>>
+2026-06-09 09:01:42,996 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-16' coro=<MTProtoSender._recv_loop() done, defined at /usr/local/lib/python3.11/site-packages/telethon/network/mtprotosender.py:503> wait_for=<Future cancelled>>
+2026-06-09 09:01:42,996 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-18' coro=<Connection._send_loop() done, defined at /usr/local/lib/python3.11/site-packages/telethon/network/connection/connection.py:316> wait_for=<Future cancelled>>
+Exception ignored in: <coroutine object Connection._recv_loop at 0x7fbd8e705030>
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.11/json/decoder.py", line 353, in raw_decode
+    obj, end = self.scan_once(s, idx)
+               ^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: coroutine ignored GeneratorExit
+2026-06-09 09:01:42,997 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-19' coro=<Connection._recv_loop() running at /usr/local/lib/python3.11/site-packages/telethon/network/connection/connection.py:361> wait_for=<Future pending cb=[Task.task_wakeup()]>>
+2026-06-09 09:01:42,997 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-20' coro=<MTProtoSender._send_loop() done, defined at /usr/local/lib/python3.11/site-packages/telethon/network/mtprotosender.py:452> wait_for=<Future pending cb=[Task.task_wakeup()]>>
+2026-06-09 09:01:42,997 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-21' coro=<MTProtoSender._recv_loop() done, defined at /usr/local/lib/python3.11/site-packages/telethon/network/mtprotosender.py:503> wait_for=<Future cancelled>>
+2026-06-09 09:01:42,997 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-23' coro=<Connection._send_loop() done, defined at /usr/local/lib/python3.11/site-packages/telethon/network/connection/connection.py:316> wait_for=<Future cancelled>>
+Exception ignored in: <coroutine object Connection._recv_loop at 0x7fbd8e706c50>
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.11/json/decoder.py", line 353, in raw_decode
+    obj, end = self.scan_once(s, idx)
+               ^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: coroutine ignored GeneratorExit
+2026-06-09 09:01:42,997 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-24' coro=<Connection._recv_loop() running at /usr/local/lib/python3.11/site-packages/telethon/network/connection/connection.py:361> wait_for=<Future pending cb=[Task.task_wakeup()]>>
+2026-06-09 09:01:42,997 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-25' coro=<MTProtoSender._send_loop() done, defined at /usr/local/lib/python3.11/site-packages/telethon/network/mtprotosender.py:452> wait_for=<Future pending cb=[Task.task_wakeup()]>>
+2026-06-09 09:01:42,997 [ERROR] asyncio: Task was destroyed but it is pending!
+task: <Task pending name='Task-26' coro=<MTProtoSender._recv_loop() done, defined at /usr/local/lib/python3.11/site-packages/telethon/network/mtprotosender.py:503> wait_for=<Future cancelled>>
+2026-06-09 09:01:45,002 [INFO] bot: Discord bot ready: อย่าอู้บ่อย#1902
+2026-06-09 09:02:05,421 [INFO] telethon.network.mtprotosender: Connecting to 91.108.56.151:443/TcpFull...
+2026-06-09 09:02:05,609 [INFO] telethon.network.mtprotosender: Connection to 91.108.56.151:443/TcpFull complete!
+2026-06-09 09:02:07,925 [ERROR] bot: Telegram error: The authorization key (session file) was used under two different IP addresses simultaneously, and can no longer be used. Use the same session exclusively, or use different sessions (caused by InvokeWithLayerRequest(InitConnectionRequest(GetConfigRequest))) — reconnecting in 80s...

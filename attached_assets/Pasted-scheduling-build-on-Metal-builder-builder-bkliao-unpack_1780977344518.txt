@@ -1,0 +1,64 @@
+scheduling build on Metal builder "builder-bkliao"
+unpacking archive
+
+unpacking archive
+uploading snapshot
+
+uploading snapshot
+using build driver nixpacks-v1.41.0
+
+╔══════════════════════════════ Nixpacks v1.41.0 ══════════════════════════════╗
+║ setup      │ python311                                                       ║
+║──────────────────────────────────────────────────────────────────────────────║
+║ install    │ python3 -m pip install --break-system-packages -r               ║
+║            │ requirements.txt                                                ║
+║──────────────────────────────────────────────────────────────────────────────║
+║ build      │                                                                 ║
+║──────────────────────────────────────────────────────────────────────────────║
+║ start      │ python bot/main.py                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+Saved output to:
+  snapshot-target-unpack
+[internal] load build definition from Dockerfile
+
+
+[internal] load metadata for ghcr.io/railwayapp/nixpacks:ubuntu-1745885067
+
+
+[internal] load .dockerignore
+
+
+SecretsUsedInArgOrEnv: Do not use ARG or ENV instructions for sensitive data (ARG "DISCORD_BOT_TOKEN") (line 11)(https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/)
+ details: Sensitive data should not be used in the ARG or ENV commands
+
+SecretsUsedInArgOrEnv: Do not use ARG or ENV instructions for sensitive data (ENV "DISCORD_BOT_TOKEN") (line 12)(https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/)
+ details: Sensitive data should not be used in the ARG or ENV commands
+
+UndefinedVar: Usage of undefined variable '$NIXPACKS_PATH' (line 18)(https://docs.docker.com/go/dockerfile/rule/undefined-var/)
+ details: Variables should be defined before their use
+
+[stage-0 1/8] FROM ghcr.io/railwayapp/nixpacks:ubuntu-1745885067@sha256:d45c89d80e13d7ad0fd555b5130f22a866d9dd10e861f589932303ef2314c7de
+
+
+[internal] load build context
+
+
+[stage-0 4/8] RUN nix-env -if .nixpacks/nixpkgs-bc8f8d1be58e8c8383e683a06e1e1e57893fff87.nix && nix-collect-garbage -d
+
+
+[stage-0 3/8] COPY .nixpacks/nixpkgs-bc8f8d1be58e8c8383e683a06e1e1e57893fff87.nix .nixpacks/nixpkgs-bc8f8d1be58e8c8383e683a06e1e1e57893fff87.nix
+
+
+[stage-0 2/8] WORKDIR /app/
+
+
+[stage-0 5/8] COPY . /app/.
+
+
+[stage-0 6/8] RUN --mount=type=cache,id=s/00d1419c-b68a-453e-b323-dc35e6d6a49a-/root/cache/pip,target=/root/.cache/pip python3 -m pip install --break-system-packages -r requirements.txt
+
+/root/.nix-profile/bin/python3: No module named pip
+
+Build Failed: build daemon returned an error < failed to solve: process "/bin/bash -ol pipefail -c python3 -m pip install --break-system-packages -r requirements.txt" did not complete successfully: exit code: 1 >
