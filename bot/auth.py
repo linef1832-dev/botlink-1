@@ -6,7 +6,7 @@ Usage:
     python bot/auth.py
 """
 import asyncio
-import os1
+import os
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
