@@ -958,6 +958,19 @@ async def start_telegram(on_activity):
                 await load_employees_from_supabase()
     asyncio.create_task(watch_employees_realtime())
 
+    # ⏱️ กันเหนียว: รีโหลดพนักงาน+กลุ่มทุก 5 นาที "เสมอ" — แม้ Realtime ต่อได้แต่ไม่มี event วิ่งมา
+    #    (เช่น ตาราง users ยังไม่ถูก add เข้า publication supabase_realtime ฝั่ง K36)
+    #    ข้อมูลจะตามทันภายใน 5 นาทีโดยไม่ต้องรีสตาร์ทบอท (ถ้า Realtime ทำงาน จะเห็นทันทีเหมือนเดิม)
+    async def poll_data_forever():
+        while True:
+            await asyncio.sleep(300)  # 5 นาที
+            try:
+                await load_employees_from_supabase()
+                await load_target_groups()
+            except Exception as e:
+                logger.error(f"[Poll] reload error: {e}")
+    asyncio.create_task(poll_data_forever())
+
     # ดักการเปลี่ยนแปลงตาราง telegram_groups → รีโหลดรายชื่อกลุ่มทันที
     async def watch_groups_realtime():
         try:
