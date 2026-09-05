@@ -78,8 +78,7 @@ async def load_employees_from_supabase() -> None:
 # แก้ค่าทุกอย่างได้จากหน้าเว็บ แล้วบอทรีโหลดเองผ่าน realtime
 # ---------------------------------------------------------------------------
 GROUPS_BY_CHAT: dict[str, dict] = {}        # chat_id (normalize แล้ว) -> ข้อมูลกลุ่ม
-SHIFT_CHAT_IDS: set[str] = set()            # chat_id ของกลุ่มประเภท shift
-SOUND_DURATION_BY_ID: dict[str, float] = {} # sound_id -> ความยาวเสียง (วินาที)
+SHIFT_CHAT_IDS: set[str] = set()            # chat_id ของกลุ่มประเภท shift (ใช้เพื่อ "ข้าม" ไม่ประมวลผล)
 _seen_unknown_chats: set[str] = set()       # กัน log ซ้ำสำหรับกลุ่มที่ยังไม่ได้ตั้งค่า
 
 # ปิดเสียง log ของกลุ่มที่ไม่ได้ตั้งค่าไว้ (ค่าเริ่มต้น = ปิด เพื่อไม่ให้ log รก)
@@ -107,18 +106,17 @@ def norm_chat_id(value) -> str:
 
 async def load_target_groups() -> None:
     """โหลดกลุ่ม Telegram จาก Supabase ตาราง telegram_groups"""
-    global GROUPS_BY_CHAT, SHIFT_CHAT_IDS, SOUND_DURATION_BY_ID
+    global GROUPS_BY_CHAT, SHIFT_CHAT_IDS
     if not supabase:
         return
     try:
         res = supabase.from_("telegram_groups") \
-            .select("group_name, group_type, chat_id, sound_id, sound_duration") \
+            .select("group_name, group_type, chat_id") \
             .eq("active", True) \
             .execute()
 
         groups: dict[str, dict] = {}
         shifts: set[str] = set()
-        durations: dict[str, float] = {}
         missing_id: list[str] = []
 
         for r in (res.data or []):
@@ -127,25 +125,15 @@ async def load_target_groups() -> None:
                 missing_id.append(r.get("group_name") or "(ไม่มีชื่อ)")
                 continue
 
-            sound_id = str(r.get("sound_id") or "").strip()
-            try:
-                duration = float(r.get("sound_duration")) if r.get("sound_duration") else 0.0
-            except (TypeError, ValueError):
-                duration = 0.0
-
             groups[cid] = {
                 "name": r.get("group_name") or "",
                 "type": r.get("group_type") or "checkin",
-                "sound_id": sound_id,
             }
             if groups[cid]["type"] == "shift":
                 shifts.add(cid)
-            if sound_id and duration > 0:
-                durations[sound_id] = duration
 
         GROUPS_BY_CHAT = groups
         SHIFT_CHAT_IDS = shifts
-        SOUND_DURATION_BY_ID = durations
         _seen_unknown_chats.clear()
 
         logger.info(f"[GROUPS] โหลดแล้ว {len(groups)} กลุ่ม (กะ {len(shifts)} กลุ่ม)")
@@ -161,17 +149,6 @@ async def load_target_groups() -> None:
 
 def get_group(chat_id) -> dict | None:
     return GROUPS_BY_CHAT.get(norm_chat_id(chat_id))
-
-
-def get_shift_sound_id(chat_id) -> int:
-    g = get_group(chat_id)
-    if not g or not g["sound_id"]:
-        return 0
-    try:
-        return int(g["sound_id"])
-    except ValueError:
-        logger.warning(f"[GROUPS] sound_id ไม่ใช่ตัวเลข: {g['sound_id']!r} (กลุ่ม {g['name']})")
-        return 0
 
 
 async def log_unknown_chat(event, chat_id: str) -> None:
@@ -194,30 +171,8 @@ async def log_unknown_chat(event, chat_id: str) -> None:
     logger.info(f"[GROUPS] พบกลุ่มที่ยังไม่ได้ตั้งค่า → chat_id={chat_id} · ชื่อ: {title!r}")
 
 
-# ข้อความกะงานที่ต้องดักจับ
-SHIFT_KEYWORDS = [
-    "กะเช้า(08.00-20.00 น.) รอบที่ 1",
-    "กะเช้า(08.00-20.00 น.) รอบที่ 2",
-    "กะดึก(20.00-08.00 น.) รอบที่ 1",
-    "กะดึก(20.00-08.00 น.) รอบที่ 2",
-]
-
-def shift_keyword_to_name(keyword: str) -> str:
-    for k, v in [("เช้า", "กะเช้า"), ("ดึก", "กะดึก")]:
-        if k in keyword:
-            for r in ["1", "2"]:
-                if f"รอบที่ {r}" in keyword:
-                    return f"{v} รอบ {r}"
-    return keyword
-
 RETURN_KEYWORDS = ["กลับที่นั่ง", "กลับที่นัง", "回座"]
 
-# ---------------------------------------------------------------------------
-# Check-in window & photo tracking
-# ---------------------------------------------------------------------------
-_checkin_window: dict = {"keyword": None, "shift_name": None, "shift_group": None}
-_photos_sent: set[str] = set()        # telegram_id ที่ส่งรูปในช่วงเช็คชื่อนี้แล้ว
-_out_during_window: set[str] = set()  # telegram_id ที่ออกไปทำกิจกรรมระหว่าง/ก่อนช่วง
 _currently_out: dict[str, str] = {}   # telegram_id → chat_id ของกลุ่มที่กดเช็คอินมา
 
 ACTIVITY_EMOJI = {
@@ -554,75 +509,6 @@ class ActivityBot(discord.Client):
     async def wait_until_ready_event(self):
         await self._ready_event.wait()
 
-    async def play_shift_sound(self, shift_label: str, sound_id: int):
-        """เปิดเสียง soundboard ในทุกห้อง voice ที่มีพนักงานอยู่ (2 ครั้งต่อห้อง)"""
-        if not sound_id:
-            logger.warning(f"[SHIFT] No sound_id for '{shift_label}' — skipping soundboard")
-            return
-
-        await self.wait_until_ready_event()
-
-        # รวบรวมห้อง voice ที่มีพนักงานอยู่ (ไม่นับห้องปลายทาง เช่น Dining)
-        occupied: dict[int, discord.VoiceChannel] = {}
-        for _member_id, (channel_id, _) in self._voice_join_time.items():
-            if str(channel_id) not in DESTINATION_CHANNEL_IDS and channel_id not in occupied:
-                ch = self.get_channel(channel_id)
-                if isinstance(ch, discord.VoiceChannel):
-                    occupied[channel_id] = ch
-
-        if not occupied:
-            logger.info(f"[SHIFT] {shift_label} — no occupied voice channels, skipping")
-            return
-
-        ch_names = [ch.name for ch in occupied.values()]
-        logger.info(f"[SHIFT] {shift_label} — playing sound simultaneously in {len(occupied)} channel(s): {ch_names}")
-
-        sound_duration = SOUND_DURATION_BY_ID.get(str(sound_id), 3.0)
-
-        async def play_in_channel(channel: discord.VoiceChannel):
-            guild_id = channel.guild.id
-            vc: discord.VoiceClient | None = None
-            try:
-                # Bot ต้องเชื่อมต่ออยู่ใน voice channel ก่อนถึงจะส่ง soundboard effect ได้
-                existing_vc = channel.guild.voice_client
-                if existing_vc and existing_vc.channel and existing_vc.channel.id == channel.id:
-                    vc = existing_vc
-                else:
-                    if existing_vc:
-                        await existing_vc.disconnect(force=True)
-                    vc = await channel.connect(timeout=10, reconnect=False)
-
-                # รอบ 1
-                await self.http.request(
-                    discord.http.Route(
-                        "POST",
-                        "/channels/{channel_id}/send-soundboard-sound",
-                        channel_id=channel.id,
-                    ),
-                    json={"sound_id": str(sound_id), "source_guild_id": str(guild_id)},
-                )
-                logger.info(f"[SHIFT] Played sound round 1 in #{channel.name} — waiting {sound_duration}s")
-                # รอให้เสียงรอบ 1 จบก่อน
-                await asyncio.sleep(sound_duration)
-                # รอบ 2
-                await self.http.request(
-                    discord.http.Route(
-                        "POST",
-                        "/channels/{channel_id}/send-soundboard-sound",
-                        channel_id=channel.id,
-                    ),
-                    json={"sound_id": str(sound_id), "source_guild_id": str(guild_id)},
-                )
-                logger.info(f"[SHIFT] Played sound round 2 in #{channel.name}")
-            except Exception as e:
-                logger.error(f"[SHIFT] Error playing sound in #{channel.name}: {e}")
-            finally:
-                if vc and vc.is_connected():
-                    await vc.disconnect(force=True)
-
-        for ch in occupied.values():
-            await play_in_channel(ch)
-
     async def find_member(self, discord_user_id: str) -> tuple[discord.Guild, discord.Member] | tuple[None, None]:
         for guild in self.guilds:
             try:
@@ -678,8 +564,7 @@ class ActivityBot(discord.Client):
         return max(time_by_ch, key=lambda ch: time_by_ch[ch])
 
     async def send_notification(self, discord_user_id: str, name: str, activity: str,
-                                 is_return: bool, group_name: str, timestamp: str | None = None,
-                                 checkin_reminder: str | None = None) -> tuple[bool, str | None]:
+                                 is_return: bool, group_name: str, timestamp: str | None = None) -> tuple[bool, str | None]:
         emoji = get_emoji(activity, is_return)
         action = f"**{name}** กลับที่นั่งแล้ว" if is_return else f"**{name}** ไป{activity}"
         if timestamp:
@@ -694,8 +579,6 @@ class ActivityBot(discord.Client):
         else:
             time_part = datetime.now().strftime("%H:%M")
         message = f"{emoji} {action}\n> 🕐 {time_part} · 📌 {group_name}"
-        if checkin_reminder:
-            message += f"\n{checkin_reminder}"
 
         guild, member = await self.find_member(discord_user_id)
         if member is None:
@@ -1016,36 +899,10 @@ async def start_telegram(on_activity):
             sender = getattr(event.message.sender, "username", None) or getattr(event.message.sender, "first_name", "unknown") if event.message.sender else "unknown"
             logger.info(f"[Jun88] from {sender}: {text[:120]!r}")
 
-            # กลุ่มกะงาน → ดักข้อความกะเช้า/กะดึก แล้วเปิดเสียง
+            # กลุ่มกะงาน → ข้าม ไม่ประมวลผล
+            # (ตัดฟีเจอร์เสียงขึ้นกะ + เตือนถ่ายรูปเช็คชื่อออกแล้ว)
             if chat_id in SHIFT_CHAT_IDS:
-                matched = next((kw for kw in SHIFT_KEYWORDS if kw in text), None)
-                if matched:
-                    sound_id = get_shift_sound_id(chat_id)
-                    logger.info(f"[SHIFT] Detected '{matched}' in '{group_name}' (sound_id={sound_id})")
-                    _checkin_window.update({"keyword": matched, "shift_name": shift_keyword_to_name(matched), "shift_group": chat_id})
-                    _photos_sent.clear()
-                    _out_during_window.clear()
-                    # นับทุกคนที่กำลังไม่อยู่โต๊ะ ไม่แยกว่ามาจากกลุ่มเช็คอินไหน
-                    _out_during_window.update(_currently_out.keys())
-                    logger.info(f"[CHECKIN] Window opened: {_checkin_window['shift_name']}, {len(_out_during_window)} already out")
-
-                    async def _run_shift_sound(label=matched, sid=sound_id):
-                        try:
-                            await discord_bot.play_shift_sound(label, sid)
-                            logger.info(f"[SHIFT] Done playing sound for '{label}'")
-                        except Exception as exc:
-                            logger.error(f"[SHIFT] Unhandled error in play_shift_sound: {exc}")
-
-                    asyncio.create_task(_run_shift_sound())
-                    return
-
-                if event.message.photo and _checkin_window["keyword"]:
-                    sender_id = str(getattr(event.message, "sender_id", None) or "")
-                    if sender_id in EMPLOYEES:
-                        _photos_sent.add(sender_id)
-                        logger.info(f"[CHECKIN] Photo from {EMPLOYEES[sender_id]['name']} recorded")
                 return
-
             # กลุ่มเช็คอินปกติ → parse และแจ้ง Discord
             parsed = parse_message(text, group_name, chat_id)
             if parsed:
@@ -1064,14 +921,9 @@ async def start_telegram(on_activity):
                             # (กรณีบอท Telegram รีเซทข้ามตี 1 ทำให้ _currently_out ว่าง)
                             await supabase_close_break(emp["name"], None)
                             if tid in _currently_out:
-                                reminder = None
-                                if tid in _out_during_window and tid not in _photos_sent and _checkin_window["keyword"]:
-                                    reminder = f"📷 {emp['name']} กลับที่นั่งแล้วอย่าลืมถ่ายรูปเช็คชื่อด้วยนะ! · {_checkin_window['shift_name']}"
                                 await discord_bot.send_notification(
                                     emp["discord_id"], emp["name"], "กลับที่นั่ง", True, group_name,
-                                    checkin_reminder=reminder,
                                 )
-                                _out_during_window.discard(tid)
                                 _currently_out.pop(tid, None)
                             logger.info(f"[FAILED RETURN] {emp['name']} — closed break session (bot reset case)")
                 else:
@@ -1109,17 +961,8 @@ async def on_activity(parsed: dict):
         await supabase_close_break(emp["name"], parsed.get("timestamp"))
     else:
         _currently_out[tid] = parsed.get("chat_id", "")
-        if _checkin_window["keyword"]:
-            _out_during_window.add(tid)
         # เปิด break session ใน Supabase ด้วยเวลาจาก Telegram
         await supabase_open_break(emp["name"], parsed["activity"], parsed.get("timestamp"))
-
-    # เช็คว่าต้องแจ้งเตือนถ่ายรูปไหม
-    checkin_reminder = None
-    if parsed["is_return"] and _checkin_window["keyword"]:
-        if tid in _out_during_window and tid not in _photos_sent:
-            checkin_reminder = f"📷 {emp['name']} กลับที่นั่งแล้วอย่าลืมถ่ายรูปเช็คชื่อด้วยนะ! · {_checkin_window['shift_name']}"
-        _out_during_window.discard(tid)  # ล้างออกหลังกลับสำเร็จ ป้องกันแจ้งซ้ำ
 
     await discord_bot.wait_until_ready_event()
     sent, channel = await discord_bot.send_notification(
@@ -1129,7 +972,6 @@ async def on_activity(parsed: dict):
         parsed["is_return"],
         parsed["group_name"],
         parsed.get("timestamp"),
-        checkin_reminder=checkin_reminder,
     )
     status = f"sent to #{channel}" if sent else "not sent (not in voice channel)"
     logger.info(f"{emp['name']} [{parsed['activity']}] → Discord {status}")
