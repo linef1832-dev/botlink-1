@@ -294,70 +294,85 @@ def get_break_date_from_time(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
-async def supabase_open_break(staff_name: str, activity: str, timestamp_str: str | None = None) -> None:
-    """บันทึกเริ่มพักลง break_sessions"""
-    if not supabase:
-        return
-    try:
-        now = parse_telegram_timestamp(timestamp_str) or get_thai_time()
-        break_date = get_break_date_from_time(now)
-        prev_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-        reason = get_break_reason(activity)
-
-        # ถ้ายังมี record ที่ยังไม่ปิดอยู่ → ปิดก่อนแล้วเปิดใหม่ (กรณีบอท Telegram รีเซทข้ามตี 1)
-        res = supabase.from_("break_sessions") \
-            .select("id, break_start") \
-            .eq("staff_name", staff_name) \
-            .in_("break_date", [break_date, prev_date]) \
-            .is_("break_end", "null") \
-            .execute()
-        if res.data:
-            ids = [r["id"] for r in res.data]
-            # ปิด record เก่าด้วยเวลาปัจจุบัน (ถือว่าพักจนถึงตอนนี้)
-            supabase.from_("break_sessions") \
-                .update({"break_end": now.isoformat()}) \
-                .in_("id", ids) \
-                .execute()
-            logger.info(f"[Supabase] {staff_name} มี record ค้าง {len(ids)} รายการ → ปิดแล้วเปิดใหม่")
-
-        supabase.from_("break_sessions").insert({
-            "staff_name": staff_name,
-            "break_start": now.isoformat(),
-            "break_date": break_date,
-            "break_reason": reason,
-        }).execute()
-        logger.info(f"[Supabase] {staff_name} เริ่มพัก ({reason}) break_date={break_date} เวลา={now.strftime('%H:%M:%S')}")
-    except Exception as e:
-        logger.error(f"[Supabase] supabase_open_break error: {e}")
+# ตารางที่บันทึกการพัก
+#   break_logs     = ตารางหลัก บันทึกโดย botlink คนเดียว → K36 ดึงไปแสดง
+#   break_sessions = ตารางเดิม เขียนสำเนาไว้ให้ checkin-bot-render ใช้แจ้งเตือนพักนานต่อได้
+BREAK_TABLES = ["break_logs", "break_sessions"]
 
 
-async def supabase_close_break(staff_name: str, timestamp_str: str | None = None) -> None:
-    """ปิด break_end ให้ record ที่ยังเปิดอยู่ของคนนี้"""
-    if not supabase:
-        return
-    try:
-        now = parse_telegram_timestamp(timestamp_str) or get_thai_time()
-        break_date = get_break_date_from_time(now)
-        prev_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+def _open_break_in(table: str, staff_name: str, reason: str, now: datetime) -> None:
+    break_date = get_break_date_from_time(now)
+    prev_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
 
-        res = supabase.from_("break_sessions") \
-            .select("id") \
-            .eq("staff_name", staff_name) \
-            .in_("break_date", [break_date, prev_date]) \
-            .is_("break_end", "null") \
-            .execute()
-        if not res.data:
-            logger.info(f"[Supabase] {staff_name} ไม่มี record พักที่เปิดอยู่")
-            return
-
+    # ถ้ายังมี record ที่ยังไม่ปิดอยู่ → ปิดก่อนแล้วเปิดใหม่ (กรณีบอท Telegram รีเซทข้ามตี 1)
+    res = supabase.from_(table) \
+        .select("id") \
+        .eq("staff_name", staff_name) \
+        .in_("break_date", [break_date, prev_date]) \
+        .is_("break_end", "null") \
+        .execute()
+    if res.data:
         ids = [r["id"] for r in res.data]
-        supabase.from_("break_sessions") \
+        supabase.from_(table) \
             .update({"break_end": now.isoformat()}) \
             .in_("id", ids) \
             .execute()
-        logger.info(f"[Supabase] {staff_name} กลับแล้ว ปิด {len(ids)} record เวลา={now.strftime('%H:%M:%S')}")
-    except Exception as e:
-        logger.error(f"[Supabase] supabase_close_break error: {e}")
+        logger.info(f"[{table}] {staff_name} มี record ค้าง {len(ids)} รายการ → ปิดแล้วเปิดใหม่")
+
+    supabase.from_(table).insert({
+        "staff_name": staff_name,
+        "break_start": now.isoformat(),
+        "break_date": break_date,
+        "break_reason": reason,
+    }).execute()
+    logger.info(f"[{table}] {staff_name} เริ่มพัก ({reason}) break_date={break_date} เวลา={now.strftime('%H:%M:%S')}")
+
+
+def _close_break_in(table: str, staff_name: str, now: datetime) -> None:
+    break_date = get_break_date_from_time(now)
+    prev_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    res = supabase.from_(table) \
+        .select("id") \
+        .eq("staff_name", staff_name) \
+        .in_("break_date", [break_date, prev_date]) \
+        .is_("break_end", "null") \
+        .execute()
+    if not res.data:
+        logger.info(f"[{table}] {staff_name} ไม่มี record พักที่เปิดอยู่")
+        return
+
+    ids = [r["id"] for r in res.data]
+    supabase.from_(table) \
+        .update({"break_end": now.isoformat()}) \
+        .in_("id", ids) \
+        .execute()
+    logger.info(f"[{table}] {staff_name} กลับแล้ว ปิด {len(ids)} record เวลา={now.strftime('%H:%M:%S')}")
+
+
+async def supabase_open_break(staff_name: str, activity: str, timestamp_str: str | None = None) -> None:
+    """บันทึกเริ่มพักลงทุกตารางใน BREAK_TABLES (ตารางหนึ่งพัง อีกตารางยังบันทึกได้)"""
+    if not supabase:
+        return
+    now = parse_telegram_timestamp(timestamp_str) or get_thai_time()
+    reason = get_break_reason(activity)
+    for table in BREAK_TABLES:
+        try:
+            _open_break_in(table, staff_name, reason, now)
+        except Exception as e:
+            logger.error(f"[{table}] supabase_open_break error: {e}")
+
+
+async def supabase_close_break(staff_name: str, timestamp_str: str | None = None) -> None:
+    """ปิด break_end ให้ record ที่ยังเปิดอยู่ของคนนี้ ในทุกตารางใน BREAK_TABLES"""
+    if not supabase:
+        return
+    now = parse_telegram_timestamp(timestamp_str) or get_thai_time()
+    for table in BREAK_TABLES:
+        try:
+            _close_break_in(table, staff_name, now)
+        except Exception as e:
+            logger.error(f"[{table}] supabase_close_break error: {e}")
 
 
 def parse_message(text: str, group_name: str, chat_id: str = "") -> dict | None:
@@ -737,13 +752,13 @@ async def status_command(interaction: discord.Interaction):
 # Telegram userbot
 # ---------------------------------------------------------------------------
 async def supabase_restore_open_breaks() -> None:
-    """ตอน startup โหลด break_sessions ที่ยังเปิดอยู่กลับเข้า _currently_out"""
+    """ตอน startup โหลดการพักที่ยังเปิดอยู่ (จากตารางหลัก break_logs) กลับเข้า _currently_out"""
     if not supabase:
         return
     try:
         break_date = get_break_date_str()
         prev_date = (get_thai_time() - timedelta(days=1)).strftime("%Y-%m-%d")
-        res = supabase.from_("break_sessions") \
+        res = supabase.from_(BREAK_TABLES[0]) \
             .select("staff_name") \
             .in_("break_date", [break_date, prev_date]) \
             .is_("break_end", "null") \
