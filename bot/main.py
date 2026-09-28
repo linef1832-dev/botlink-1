@@ -217,7 +217,7 @@ def get_break_reason(activity: str) -> str:
 
 
 # บอท Telegram ส่ง timestamp มาเป็นโซนจีน (UTC+8) ต้องแปลงเป็นไทย (UTC+7) ก่อนเก็บเสมอ
-TG_TZ = timezone(timedelta(hours=8))   # โซนที่ข้อความจาก Telegram ใช้
+TG_TZ = timezone(timedelta(hours=7))  # บอท Telegram ส่งเวลาไทยมาอยู่แล้ว   # โซนที่ข้อความจาก Telegram ใช้
 TH_TZ = timezone(timedelta(hours=7))   # โซนไทย ที่เราเก็บลง DB
 
 
@@ -572,7 +572,6 @@ class ActivityBot(discord.Client):
             raw_time = timestamp.split(" ")[-1][:5]
             try:
                 h, m = map(int, raw_time.split(":"))
-                h = (h - 1) % 24
                 time_part = f"{h:02d}:{m:02d}"
             except Exception:
                 time_part = raw_time
