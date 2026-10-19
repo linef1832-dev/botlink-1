@@ -54,6 +54,12 @@ DEFAULT_MISSING = "{สี}เว็บ {เว็บ}{สี}\nไลน์ห�
 
 MessageableChannel = (discord.TextChannel, discord.VoiceChannel, discord.Thread)
 
+# หัวข้อความที่บอทใช้ตอบรีพลายนับแชท (ใช้หาข้อความตอบกลับที่ข้อความต้นฉบับถูกลบไปแล้ว ตอนเก็บกวาด)
+_BOT_REPLY_PREFIXES = (
+    "✅ รับแล้ว", "❌ ชื่อเว็บไม่ถูกต้อง", "⚠️ ไม่เจอชื่อเว็บ", "⚠️ ไม่ได้อยู่ในรอบนี้",
+    "❌ บันทึกไม่สำเร็จ", "ℹ️ รอบนี้",
+)
+
 # "ชื่อ + ตัวเลข": "MK8 15", "MK8:15", "MK8 = 15", "MK8 แชท 15", "MK8 15แชท"
 # ชื่อ = ตัวอักษรอังกฤษนำหน้า ตามด้วยอักษร/ตัวเลข (ชื่อเว็บทุกตัวขึ้นต้นด้วยตัวอักษร)
 _PAIR_RE = re.compile(
@@ -611,16 +617,22 @@ class ChatCount:
             except (KeyError, TypeError, ValueError):
                 continue
             ids = [qid]
-            reply_ids: set[int] = set()
+            chain: set[int] = {qid}
             try:
-                # ไล่ข้อความหลังคำถาม: รีพลายที่ตอบคำถาม + ข้อความบอทที่ตอบรีพลายเหล่านั้น (✅ รับแล้ว / ❌ ชื่อเว็บผิด)
+                # ไล่ข้อความหลังคำถาม เก็บทุกข้อความที่ "รีพลายต่อกันเป็นสาย" จากคำถาม
+                #   คำถาม ← รีพลายพนักงาน ← บอทตอบ (✅/❌) ← พนักงานตอบบอทต่อ ...
+                # + ข้อความตอบกลับของบอทที่ "ข้อความต้นฉบับถูกลบไปแล้ว" (เช่น พนักงานลบข้อความที่พิมพ์ผิดเอง)
+                #   ดูจากหัวข้อความ เพื่อไม่ไปลบข้อความแจ้งเตือนอื่นของบอทในห้องเดียวกัน
                 async for m in ch.history(after=discord.Object(id=qid), limit=None, oldest_first=True):
                     ref = m.reference.message_id if m.reference else None
-                    if ref == qid:
+                    if ref is None:
+                        continue
+                    if ref in chain:
                         ids.append(m.id)
-                        reply_ids.add(m.id)
-                    elif ref in reply_ids and me is not None and m.author.id == me.id:
+                        chain.add(m.id)
+                    elif me is not None and m.author.id == me.id and (m.content or "").startswith(_BOT_REPLY_PREFIXES):
                         ids.append(m.id)
+                        chain.add(m.id)
             except (discord.Forbidden, discord.HTTPException) as e:
                 logger.warning(f"[CHATCOUNT] อ่านประวัติห้อง #{getattr(ch, 'name', '')} ไม่ได้: {e}")
             total += await self._delete_many(ch, ids)
