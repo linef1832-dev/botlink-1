@@ -37,7 +37,8 @@ ANSWERS_TABLE = "chatcount_answers"
 
 SYNC_INTERVAL = 15            # วินาที
 FIRE_WINDOW = 10 * 60         # ถ้าบอทเพิ่งรีสตาร์ท ยังยิงรอบที่เลยเวลามาไม่เกิน 10 นาทีให้
-CHANNEL_PUBLISH_EVERY = 300   # ส่งรายชื่อห้องให้เว็บทุก 5 นาที
+CHANNEL_PUBLISH_EVERY = 300   # ส่งรายชื่อห้อง Discord ให้เว็บทุก 5 นาที (+ ส่งทันทีเมื่อมีห้องเพิ่ม/ลบ/เปลี่ยนชื่อ)
+TG_GROUPS_PUBLISH_EVERY = 120 # ส่งรายชื่อกลุ่ม Telegram ที่บัญชีอยู่ให้เว็บทุก 2 นาที
 ROUND_LOOKBACK_DAYS = 2       # รอบที่ยังเปิดอยู่ ย้อนหลังกี่วันที่ยังรับรีพลาย
 
 DEFAULT_ASK = (
@@ -219,6 +220,9 @@ class ChatCount:
         self._fired: set[tuple[int, str]] = set()  # (schedule_id, วันที่) ที่สร้างรอบแล้ว
         self._send_lock = asyncio.Lock()
         self._last_channel_publish = 0.0
+        self._last_tg_publish = 0.0
+        self._last_tg_groups: list = []
+        self._publish_lock = asyncio.Lock()
         self._last_channels: list = []
         self._tg_cache: dict[str, object] = {}
         self._tg_cache_owner = None
@@ -277,6 +281,8 @@ class ChatCount:
 
         if time_module.time() - self._last_channel_publish > CHANNEL_PUBLISH_EVERY:
             await self.publish_channels()
+        if time_module.time() - self._last_tg_publish > TG_GROUPS_PUBLISH_EVERY:
+            await self.publish_tg_groups()
 
         await self._schedule_tick()
 
@@ -304,7 +310,15 @@ class ChatCount:
                     pass
         self.msg_map = m
 
+    def request_channel_publish(self) -> None:
+        """เรียกจาก event ของ Discord ตอนมีห้องเพิ่ม/ลบ/เปลี่ยนชื่อ → ส่งรายชื่อใหม่ให้เว็บทันที"""
+        asyncio.create_task(self.publish_channels())
+
     async def publish_channels(self) -> None:
+        async with self._publish_lock:
+            await self._publish_channels()
+
+    async def _publish_channels(self) -> None:
         """ส่งรายชื่อห้อง Discord ไปให้หน้าเว็บใช้ทำช่องติ๊ก"""
         chans = []
         for g in self.bot.guilds:
@@ -334,6 +348,35 @@ class ChatCount:
         except Exception as e:
             logger.error(f"[CHATCOUNT] publish channels error: {e}")
 
+    async def publish_tg_groups(self) -> None:
+        """ส่งรายชื่อกลุ่ม Telegram ทั้งหมดที่บัญชี Telethon อยู่ ไปให้หน้าเว็บเลือกปลายทาง"""
+        client = self.get_tg_client()
+        if client is None:
+            return                      # Telegram ยังไม่ต่อ → ลองใหม่รอบหน้า
+        self._last_tg_publish = time_module.time()
+        groups = []
+        try:
+            if self._tg_cache_owner is not client:
+                self._tg_cache, self._tg_cache_owner = {}, client
+            async for d in client.iter_dialogs():
+                self._tg_cache[self.norm_chat_id(d.id)] = d.entity     # ใช้ส่งข้อความได้เลยไม่ต้องค้นซ้ำ
+                if d.is_group:
+                    groups.append({"id": str(d.id), "name": d.name or str(d.id)})
+        except Exception as e:
+            logger.error(f"[CHATCOUNT] read telegram dialogs error: {e}")
+            return
+        groups.sort(key=lambda g: g["name"].lower())
+        if groups == self._last_tg_groups:
+            return
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            await self._db(lambda: self.db.from_(SETTINGS_TABLE)
+                           .update({"tg_groups": groups, "tg_groups_updated_at": now}).eq("id", 1).execute())
+            self._last_tg_groups = groups
+            logger.info(f"[CHATCOUNT] อัปเดตรายชื่อกลุ่ม Telegram {len(groups)} กลุ่ม")
+        except Exception as e:
+            logger.error(f"[CHATCOUNT] publish telegram groups error: {e} (รัน chatcount_v2.sql แล้วหรือยัง?)")
+
     # ---------------- ตั้งเวลา ----------------
     async def _schedule_tick(self) -> None:
         now = datetime.now(TH_TZ)
@@ -347,9 +390,7 @@ class ChatCount:
                 hh, mm = map(int, str(s.get("time") or "").split(":")[:2])
             except ValueError:
                 continue
-            days = s.get("days")
-            if isinstance(days, list) and days and now.weekday() not in [int(d) for d in days]:
-                continue
+            # ส่งทุกวันเสมอ (ไม่ใช้ช่อง days แล้ว)
             due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
             delta = (now - due).total_seconds()
             if not (0 <= delta < FIRE_WINDOW):
@@ -373,7 +414,7 @@ class ChatCount:
             "round_date": round_date,
             "round_time": s.get("time"),
             "channel_ids": s.get("channel_ids") or [],
-            "expected_webs": s.get("webs") or all_webs,
+            "expected_webs": all_webs,              # ถามทุกเว็บเสมอ (ใช้รายชื่อเว็บล่าสุดตอนเริ่มรอบ)
             "telegram_chat_id": s.get("telegram_chat_id"),
             "ask_template": s.get("ask_template"),
             "report_template": s.get("report_template"),
