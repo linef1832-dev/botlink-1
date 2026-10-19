@@ -480,10 +480,29 @@ class ActivityBot(discord.Client):
         self._moved_to_destination: set[int] = set()
 
     async def setup_hook(self):
-        await self.tree.sync()
+        self._commands_synced = False
+
+    async def _sync_commands(self):
+        """ลงทะเบียน slash command แบบ "ต่อเซิร์ฟเวอร์" → ขึ้นในเมนู / ทันที (แบบ global อาจรอนาน)
+        แล้วล้างชุด global เก่าทิ้ง กันคำสั่งขึ้นซ้ำ 2 อัน"""
+        if self._commands_synced:
+            return
+        self._commands_synced = True
+        try:
+            for g in self.guilds:
+                self.tree.copy_global_to(guild=g)
+                cmds = await self.tree.sync(guild=g)
+                logger.info(f"[COMMANDS] ลงทะเบียน {len(cmds)} คำสั่งในเซิร์ฟเวอร์ '{g.name}': {', '.join('/' + c.name for c in cmds)}")
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
+        except discord.Forbidden:
+            logger.error("[COMMANDS] ลงทะเบียนคำสั่งไม่ได้ — ต้องเชิญบอทใหม่ด้วย scope 'applications.commands'")
+        except Exception as e:
+            logger.error(f"[COMMANDS] ลงทะเบียนคำสั่งไม่สำเร็จ: {e}")
 
     async def on_ready(self):
         logger.info(f"Discord bot ready: {self.user}")
+        await self._sync_commands()
         now = time_module.time()
         count = 0
         for guild in self.guilds:
