@@ -1,683 +1,1131 @@
-"""
-📊 นับแชท
-
-การไหลของงาน
-    1. K36 (แท็บ "นับแชท" หน้า Discord) ตั้งรอบเวลา + ติ๊กห้อง + เลือกเว็บ + ตั้งแพทเทิร์นข้อความ
-       → ตาราง chatcount_schedules
-    2. ถึงเวลา บอทสร้างรอบใน chatcount_rounds แล้วส่งข้อความคำถามเข้าทุกห้องที่ติ๊ก
-       (กด "ส่งเลยตอนนี้" ในเว็บ = เว็บสร้างรอบเอง แล้วบอทส่งให้ภายในไม่กี่วินาที)
-    3. พนักงานรีพลายข้อความคำถาม เช่น "MK8 15 JL69 3" → บอทแยกชื่อเว็บ+ตัวเลข เก็บลง chatcount_answers
-       - ชื่อเว็บต้องตรงทุกตัวอักษร (รวมตัวพิมพ์ใหญ่/เล็ก) ถ้ามีชื่อไหนผิด → ไม่รับทั้งข้อความ แจ้งให้พิมพ์ใหม่
-       - ไม่ผูกเว็บกับห้อง (เว็บย้ายห้องได้ทุกวัน) — นับความครบจาก "เว็บ"
-       - ห้องเดิมตอบซ้ำ = แก้ค่า (ใช้อันล่าสุด)
-       - เว็บเดียวกันถูกตอบจาก 2 ห้อง = ตอบซ้อน → รอแอดมินเลือกค่าที่ถูกในเว็บ
-    4. ครบทุกเว็บ (หรือแอดมินกด "ส่งเท่าที่มี") → จัดข้อความตามแพทเทิร์น
-       → ส่งเข้ากลุ่ม Telegram ผ่านบัญชี Telethon ตัวเดียวกับที่บอทใช้ดักเช็คอินอยู่แล้ว
-    5. ส่ง Telegram สำเร็จ → ลบข้อความคำถาม + รีพลายของพนักงาน + ข้อความตอบกลับของบอท ออกจากห้อง Discord
-       (บอทต้องมีสิทธิ์ Manage Messages ในห้อง ไม่งั้นลบได้แค่ข้อความของบอทเอง)
-"""
-from __future__ import annotations
-
 import asyncio
-import logging
-import difflib
 import re
+import os
+import json
+import logging
 import time as time_module
 from collections import defaultdict
-from datetime import date, datetime, timedelta, timezone
-from typing import Awaitable, Callable
+from datetime import datetime, timezone, timedelta
 
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+from telethon.errors import AuthKeyDuplicatedError
 import discord
+from discord import ChannelType
+import aiohttp
+from supabase import create_client, Client as SupabaseClient
 
-logger = logging.getLogger("bot.chatcount")
+from chat_count import ChatCount
 
-TH_TZ = timezone(timedelta(hours=7))
-SETTINGS_TABLE = "chatcount_settings"
-SCHEDULES_TABLE = "chatcount_schedules"
-ROUNDS_TABLE = "chatcount_rounds"
-ANSWERS_TABLE = "chatcount_answers"
-
-SYNC_INTERVAL = 15            # วินาที
-FIRE_WINDOW = 10 * 60         # ถ้าบอทเพิ่งรีสตาร์ท ยังยิงรอบที่เลยเวลามาไม่เกิน 10 นาทีให้
-CHANNEL_PUBLISH_EVERY = 300   # ส่งรายชื่อห้อง Discord ให้เว็บทุก 5 นาที (+ ส่งทันทีเมื่อมีห้องเพิ่ม/ลบ/เปลี่ยนชื่อ)
-TG_GROUPS_PUBLISH_EVERY = 120 # ส่งรายชื่อกลุ่ม Telegram ที่บัญชีอยู่ให้เว็บทุก 2 นาที
-ROUND_LOOKBACK_DAYS = 2       # รอบที่ยังเปิดอยู่ ย้อนหลังกี่วันที่ยังรับรีพลาย
-
-DEFAULT_ASK = (
-    "📊 **นับแชท {รอบ}** · {วันที่}\n"
-    "รีพลายข้อความนี้ บอกชื่อเว็บ + จำนวนแชท\n"
-    "ตัวอย่าง: `MK8 15`  `JL69 3`"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-DEFAULT_REPORT = "ตรวจสอบจำนวนแชท{รอบ}\nเวลา {เวลา} น\n\n{รายการ}"
-DEFAULT_LINE = "{สี}เว็บ {เว็บ}{สี}\nไลน์หลัก {จำนวน} แชท\n"
-DEFAULT_MISSING = "{สี}เว็บ {เว็บ}{สี}\nไลน์หลัก ยังไม่ตอบ\n"
+logger = logging.getLogger("bot")
 
-MessageableChannel = (discord.TextChannel, discord.VoiceChannel, discord.Thread)
+# 🧹 ลบข้อความแจ้งพักใน Discord หลัง "กลับที่นั่ง" กี่วินาที (ลบทั้งข้อความ "ไป..." และ "กลับที่นั่งแล้ว")
+#    ตั้งผ่าน env BREAK_MSG_DELETE_AFTER — 0 = ลบทันที, -1 = ไม่ลบ (แบบเดิม)
+try:
+    BREAK_MSG_DELETE_AFTER = float(os.environ.get("BREAK_MSG_DELETE_AFTER", "60"))
+except ValueError:
+    BREAK_MSG_DELETE_AFTER = 60.0
 
-# หัวข้อความที่บอทใช้ตอบรีพลายนับแชท (ใช้หาข้อความตอบกลับที่ข้อความต้นฉบับถูกลบไปแล้ว ตอนเก็บกวาด)
-_BOT_REPLY_PREFIXES = (
-    "✅ รับแล้ว", "❌ ชื่อเว็บไม่ถูกต้อง", "⚠️ ไม่เจอชื่อเว็บ", "⚠️ ไม่ได้อยู่ในรอบนี้",
-    "❌ บันทึกไม่สำเร็จ", "ℹ️ รอบนี้",
-)
+# ---------------------------------------------------------------------------
+# Supabase client
+# ---------------------------------------------------------------------------
+_supabase_url = os.environ.get("SUPABASE_URL", "")
+_supabase_key = os.environ.get("SUPABASE_KEY", "")
+supabase: SupabaseClient | None = create_client(_supabase_url, _supabase_key) if _supabase_url and _supabase_key else None
+if supabase:
+    logger.info("[Supabase] Client initialized")
+else:
+    logger.warning("[Supabase] SUPABASE_URL or SUPABASE_KEY not set — break tracking disabled")
+# ---------------------------------------------------------------------------
+# EMPLOYEES โหลดจาก Supabase K36 แทน hardcode
+# ---------------------------------------------------------------------------
+EMPLOYEES: dict[str, dict] = {}  # telegram_id → {name, discord_id, allowed_shift}
+_employees_loaded = False
 
-# "ชื่อ + ตัวเลข": "MK8 15", "MK8:15", "MK8 = 15", "MK8 แชท 15", "MK8 15แชท"
-# ชื่อ = ตัวอักษรอังกฤษนำหน้า ตามด้วยอักษร/ตัวเลข (ชื่อเว็บทุกตัวขึ้นต้นด้วยตัวอักษร)
-_PAIR_RE = re.compile(
-    r"(?<![A-Za-z])([A-Za-z][A-Za-z0-9]*)"
-    r"\s*(?:[:=\-–]\s*)?(?:แชท|chat|Chat|CHAT)?\s*(?:[:=\-–]\s*)?(\d{1,5})"
-)
-_IGNORE_WORDS = {"chat"}   # คำที่ไม่ใช่ชื่อเว็บ เช่น "chat 15"
+async def load_employees_from_supabase() -> None:
+    """โหลดข้อมูลพนักงานจาก Supabase K36 ตาราง users"""
+    global EMPLOYEES, _employees_loaded
+    if not supabase:
+        logger.warning("[EMPLOYEES] Supabase ไม่พร้อม — ใช้ข้อมูลเดิม")
+        return
+    try:
+        res = supabase.from_("users") \
+            .select("username, discord_id, telegram_id, allowed_shift, department") \
+            .not_.is_("telegram_id", "null") \
+            .not_.is_("discord_id", "null") \
+            .execute()
+        if not res.data:
+            logger.warning("[EMPLOYEES] ไม่พบข้อมูลพนักงานใน Supabase")
+            return
+        new_map = {}
+        for u in res.data:
+            tid = str(u.get("telegram_id") or "").strip()
+            did = str(u.get("discord_id") or "").strip()
+            name = str(u.get("username") or "").strip().upper()
+            shift = str(u.get("allowed_shift") or "").strip()
+            dept = str(u.get("department") or "").strip()
+            if tid and did and name:
+                new_map[tid] = {
+                    "name": name,
+                    "discord_id": did,
+                    "allowed_shift": shift,
+                    "department": dept,
+                }
+        EMPLOYEES = new_map
+        _employees_loaded = True
+        logger.info(f"[EMPLOYEES] โหลดสำเร็จ {len(EMPLOYEES)} คน จาก Supabase K36")
+    except Exception as e:
+        logger.error(f"[EMPLOYEES] load error: {e}")
+
+# ---------------------------------------------------------------------------
+# กลุ่ม Telegram — โหลดทั้งหมดจาก Supabase ตาราง telegram_groups
+# ไม่มีชื่อกลุ่ม / sound id / การจับคู่ hardcode ไว้ในไฟล์นี้อีกแล้ว
+# แก้ค่าทุกอย่างได้จากหน้าเว็บ แล้วบอทรีโหลดเองผ่าน realtime
+# ---------------------------------------------------------------------------
+GROUPS_BY_CHAT: dict[str, dict] = {}        # chat_id (normalize แล้ว) -> ข้อมูลกลุ่ม
+SHIFT_CHAT_IDS: set[str] = set()            # chat_id ของกลุ่มประเภท shift (ใช้เพื่อ "ข้าม" ไม่ประมวลผล)
+_seen_unknown_chats: set[str] = set()       # กัน log ซ้ำสำหรับกลุ่มที่ยังไม่ได้ตั้งค่า
+
+# ปิดเสียง log ของกลุ่มที่ไม่ได้ตั้งค่าไว้ (ค่าเริ่มต้น = ปิด เพื่อไม่ให้ log รก)
+# ตอนจะหา chat_id ของกลุ่มใหม่ ให้ตั้ง env LOG_UNKNOWN_GROUPS=1 แล้วรีสตาร์ทบอท
+LOG_UNKNOWN_GROUPS = os.environ.get("LOG_UNKNOWN_GROUPS", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
-# ----------------------------------------------------------------------
-# ฟังก์ชันล้วน (ไม่ยุ่งกับ Discord/DB) — ทดสอบแยกได้
-# ----------------------------------------------------------------------
-def web_name_list(webs: list) -> list[str]:
-    out = []
-    for w in webs or []:
-        name = str((w.get("name") if isinstance(w, dict) else w) or "").strip()
-        if name and name not in out:
-            out.append(name)
-    return out
+def norm_chat_id(value) -> str:
+    """ทำให้ chat id รูปแบบต่างๆ เทียบกันได้
 
-
-def parse_reply(text: str, web_names: list[str]) -> tuple[dict[str, int], list[tuple[str, str | None]]]:
-    """แยก "ชื่อเว็บ ตัวเลข" ออกจากข้อความรีพลาย — ชื่อต้องตรงทุกตัวอักษร
-
-    คืน (found {ชื่อเว็บ: จำนวน}, invalid [(คำที่พิมพ์มา, ชื่อที่น่าจะหมายถึง หรือ None)])
+    Telethon คืน 1234567890 แต่ Bot API / ลิงก์ คืน -1001234567890
+    ทั้งคู่คือกลุ่มเดียวกัน ฟังก์ชันนี้ตัดเครื่องหมายลบและ prefix 100 ออกให้เหลือแกนเดียวกัน
+    จะได้ไม่ต้องมานั่งเดาว่าต้องกรอกแบบไหนในหน้าเว็บ
     """
-    found: dict[str, int] = {}
-    invalid: list[tuple[str, str | None]] = []
-    exact = set(web_names)
-    by_lower = {n.lower(): n for n in web_names}
-    for m in _PAIR_RE.finditer(text or ""):
-        token, num = m.group(1), int(m.group(2))
-        if token in exact:
-            found[token] = num
-            continue
-        if token.lower() in _IGNORE_WORDS:
-            continue
-        guess = by_lower.get(token.lower())
-        if not guess:
-            close = difflib.get_close_matches(token.upper(), [n.upper() for n in web_names], n=1, cutoff=0.6)
-            guess = by_lower.get(close[0].lower()) if close else None
-        if all(t != token for t, _ in invalid):
-            invalid.append((token, guess))
-    return found, invalid
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    s = s.lstrip("-")
+    if not s.isdigit():
+        return ""
+    if s.startswith("100") and len(s) > 10:
+        s = s[3:]
+    return s
 
 
-def web_emoji_map(webs: list) -> dict[str, str]:
-    """{ชื่อเว็บ: อีโมจิประจำเว็บ} ใช้แทน {สี} ในแพทเทิร์น"""
-    out = {}
-    for w in webs or []:
-        if isinstance(w, dict) and w.get("name"):
-            out[str(w["name"]).strip()] = str(w.get("emoji") or "").strip()
-    return out
+async def load_target_groups() -> None:
+    """โหลดกลุ่ม Telegram จาก Supabase ตาราง telegram_groups"""
+    global GROUPS_BY_CHAT, SHIFT_CHAT_IDS
+    if not supabase:
+        return
+    try:
+        res = supabase.from_("telegram_groups") \
+            .select("group_name, group_type, chat_id") \
+            .eq("active", True) \
+            .execute()
+
+        groups: dict[str, dict] = {}
+        shifts: set[str] = set()
+        missing_id: list[str] = []
+
+        for r in (res.data or []):
+            cid = norm_chat_id(r.get("chat_id"))
+            if not cid:
+                missing_id.append(r.get("group_name") or "(ไม่มีชื่อ)")
+                continue
+
+            groups[cid] = {
+                "name": r.get("group_name") or "",
+                "type": r.get("group_type") or "checkin",
+            }
+            if groups[cid]["type"] == "shift":
+                shifts.add(cid)
+
+        GROUPS_BY_CHAT = groups
+        SHIFT_CHAT_IDS = shifts
+        _seen_unknown_chats.clear()
+
+        logger.info(f"[GROUPS] โหลดแล้ว {len(groups)} กลุ่ม (กะ {len(shifts)} กลุ่ม)")
+        for cid, g in groups.items():
+            logger.info(f"[GROUPS]   chat_id={cid} · {g['name']} · {g['type']}")
+        if missing_id:
+            logger.warning(f"[GROUPS] ข้าม {len(missing_id)} กลุ่ม เพราะยังไม่ได้ใส่ Chat ID: {missing_id}")
+        if not groups:
+            logger.warning("[GROUPS] ไม่มีกลุ่มที่ใช้งานได้เลย — บอทจะไม่ดักข้อความจากที่ไหน")
+    except Exception as e:
+        logger.error(f"[GROUPS] load error: {e}")
 
 
-def thai_time(t) -> str:
-    """'12:00' → '12.00' (รูปแบบเวลาแบบไทย)"""
-    return str(t or "").replace(":", ".")
+def get_group(chat_id) -> dict | None:
+    return GROUPS_BY_CHAT.get(norm_chat_id(chat_id))
 
 
-def render(template: str, values: dict) -> str:
-    out = template or ""
-    for k, v in values.items():
-        out = out.replace("{" + k + "}", str(v))
-    return out
+async def log_unknown_chat(event, chat_id: str) -> None:
+    """พิมพ์ chat_id ของกลุ่มที่ยังไม่ได้ตั้งค่า ครั้งเดียวต่อกลุ่ม
 
-
-def thai_date(d) -> str:
-    if isinstance(d, str):
-        d = date.fromisoformat(d[:10])
-    return f"{d.day:02d}/{d.month:02d}/{d.year + 543}"
-
-
-def evaluate_round(rnd: dict, answers: list[dict]) -> dict:
-    """คำนวณสถานะรอบจากคำตอบทั้งหมด
-
-    คืน {values: {เว็บ: answer}, conflicts: {เว็บ: [answer,...]}, missing: [เว็บ], complete: bool}
+    เอาไว้ให้แอดมินเปิด log แล้วก๊อป chat_id ไปใส่ในหน้าเว็บได้เลย
+    ดึงชื่อกลุ่มเฉพาะตอนเจอกลุ่มใหม่ครั้งแรกเท่านั้น ไม่ใช่ทุกข้อความ
     """
-    latest: dict[tuple[str, str], dict] = {}
-    for a in sorted(answers, key=lambda x: (str(x.get("created_at") or ""), int(x.get("id") or 0))):
-        latest[(a["web"], str(a.get("channel_id") or ""))] = a   # ห้องเดิมตอบซ้ำ → ใช้อันล่าสุด
-
-    per_web: dict[str, list[dict]] = defaultdict(list)
-    for (web, _ch), a in latest.items():
-        per_web[web].append(a)
-
-    resolved = rnd.get("resolved") or {}
-    values: dict[str, dict] = {}
-    conflicts: dict[str, list[dict]] = {}
-    for web, lst in per_web.items():
-        if len(lst) == 1:
-            values[web] = lst[0]
-            continue
-        pick = next((a for a in lst if str(a.get("channel_id")) == str(resolved.get(web))), None)
-        if pick:
-            values[web] = pick
-        else:
-            conflicts[web] = lst
-
-    expected = list(rnd.get("expected_webs") or [])
-    missing = [w for w in expected if w not in values and w not in conflicts]
-    complete = bool(expected) and not missing and not any(w in conflicts for w in expected)
-    return {"values": values, "conflicts": conflicts, "missing": missing, "complete": complete}
+    if not LOG_UNKNOWN_GROUPS:
+        return
+    if not chat_id or chat_id in _seen_unknown_chats:
+        return
+    _seen_unknown_chats.add(chat_id)
+    title = ""
+    try:
+        chat = await event.get_chat()
+        title = getattr(chat, "title", "") or ""
+    except Exception:
+        pass
+    logger.info(f"[GROUPS] พบกลุ่มที่ยังไม่ได้ตั้งค่า → chat_id={chat_id} · ชื่อ: {title!r}")
 
 
-def build_report(rnd: dict, ev: dict, force: bool, emojis: dict | None = None) -> str:
-    emojis = emojis or {}
-    expected = list(rnd.get("expected_webs") or [])
-    line_t = rnd.get("line_template") or DEFAULT_LINE
-    miss_t = rnd.get("missing_template") or DEFAULT_MISSING
+RETURN_KEYWORDS = ["กลับที่นั่ง", "กลับที่นัง", "回座"]
 
-    lines: list[str] = []
-    total = 0
-    answered = 0
-    still_missing: list[str] = []
-    for web in expected:
-        a = ev["values"].get(web)
-        if a is None and force and web in ev["conflicts"]:
-            # ส่งเท่าที่มีทั้งที่ยังตอบซ้อน → ใช้คำตอบล่าสุด
-            a = max(ev["conflicts"][web], key=lambda x: str(x.get("created_at") or ""))
-        if a is not None:
-            cnt = int(a.get("count") or 0)
-            total += cnt
-            answered += 1
-            lines.append(render(line_t, {
-                "เว็บ": web,
-                "สี": emojis.get(web, ""),
-                "จำนวน": cnt,
-                "ห้อง": a.get("channel_name") or "",
-                "ผู้ตอบ": a.get("staff_name") or a.get("discord_name") or "",
-            }))
-        else:
-            still_missing.append(web)
-            if miss_t.strip():
-                lines.append(render(miss_t, {"เว็บ": web, "สี": emojis.get(web, "")}))
+_currently_out: dict[str, str] = {}   # telegram_id → chat_id ของกลุ่มที่กดเช็คอินมา
 
-    return render(rnd.get("report_template") or DEFAULT_REPORT, {
-        "วันที่": thai_date(rnd["round_date"]),
-        "รอบ": rnd.get("label") or rnd.get("round_time") or "",
-        "เวลา": thai_time(rnd.get("round_time")),
-        "รายการ": "\n".join(lines),
-        "รวม": total,
-        "ตอบแล้ว": answered,
-        "ทั้งหมด": len(expected),
-        "ยังไม่ตอบ": ", ".join(still_missing) or "-",
-    }).strip()
+ACTIVITY_EMOJI = {
+    "กินข้าว": "🍚", "ทานข้าว": "🍚",
+    "ปวดหนัก": "🚽", "ห้องน้ำใหญ่": "🚽",
+    "ปวดน้อย": "🚾", "ห้องน้ำเล็ก": "🚾",
+}
+
+# ---------------------------------------------------------------------------
+# Activity → Discord voice channel auto-move
+# Map activity keyword → Discord voice channel ID (as string)
+# Leave empty string to disable auto-move for that activity
+# ---------------------------------------------------------------------------
+ACTIVITY_MOVE_CHANNEL: dict[str, str] = {
+    "กินข้าว": "1451121950297686106",
+    "ทานข้าว": "1451121950297686106",
+    "ปวดหนัก": "",
+    "ปวดน้อย": "",
+}
+
+# ห้องที่ไม่นับเป็นห้องทำงาน (ห้องปลายทาง)
+DESTINATION_CHANNEL_IDS: set[str] = {
+    v for v in ACTIVITY_MOVE_CHANNEL.values() if v
+}
 
 
-def build_ask(rnd: dict) -> str:
-    return render(rnd.get("ask_template") or DEFAULT_ASK, {
-        "รอบ": rnd.get("label") or rnd.get("round_time") or "",
-        "วันที่": thai_date(rnd["round_date"]),
-        "เวลา": thai_time(rnd.get("round_time")),
-        "เว็บทั้งหมด": ", ".join(rnd.get("expected_webs") or []),
-    }).strip()[:1900]
+def get_emoji(activity: str, is_return: bool) -> str:
+    if is_return:
+        return "✅"
+    for key, emoji in ACTIVITY_EMOJI.items():
+        if key in activity:
+            return emoji
+    return "🚶"
 
 
-# ----------------------------------------------------------------------
-# ตัวจัดการหลัก
-# ----------------------------------------------------------------------
-class ChatCount:
-    def __init__(
-        self,
-        bot: discord.Client,
-        supabase,
-        get_employees: Callable[[], dict],
-        get_tg_client: Callable[[], object | None],
-        norm_chat_id: Callable[[object], str],
-        load_employees: Callable[[], Awaitable[None]] | None = None,
-    ):
-        self.bot = bot
-        self.db = supabase
-        self.get_employees = get_employees
-        self.get_tg_client = get_tg_client
-        self.norm_chat_id = norm_chat_id
-        self.load_employees = load_employees
+def get_break_reason(activity: str) -> str:
+    """แปลงชื่อกิจกรรมเป็น break_reason ที่ตรงกับ checkin-bot-render"""
+    for key, emoji in ACTIVITY_EMOJI.items():
+        if key in activity:
+            return f"{emoji} {key}"
+    return f"☕ {activity}"
 
-        self.webs: list = []
-        self.web_names: list[str] = []
-        self.rounds: dict[int, dict] = {}
-        self.msg_map: dict[int, int] = {}          # message_id คำถาม → round_id
-        self._fired: set[tuple[int, str]] = set()  # (schedule_id, วันที่) ที่สร้างรอบแล้ว
-        self._send_lock = asyncio.Lock()
-        self._last_channel_publish = 0.0
-        self._last_tg_publish = 0.0
-        self._last_tg_groups: list = []
-        self._publish_lock = asyncio.Lock()
-        self._last_channels: list = []
-        self._tg_cache: dict[str, object] = {}
-        self._tg_cache_owner = None
 
-    # ---------------- ตัวช่วย ----------------
-    async def _db(self, fn):
-        """supabase เป็นแบบ sync → รันใน thread แยก กันบอท Discord ค้าง"""
-        return await asyncio.to_thread(fn)
+# บอท Telegram ส่ง timestamp มาเป็นโซนจีน (UTC+8) ต้องแปลงเป็นไทย (UTC+7) ก่อนเก็บเสมอ
+TG_TZ = timezone(timedelta(hours=7))  # บอท Telegram ส่งเวลาไทยมาอยู่แล้ว   # โซนที่ข้อความจาก Telegram ใช้
+TH_TZ = timezone(timedelta(hours=7))   # โซนไทย ที่เราเก็บลง DB
 
-    def _resolve_channel(self, channel_id):
+
+def get_thai_time() -> datetime:
+    """คืน datetime ปัจจุบันในโซนเวลาไทย (UTC+7)"""
+    return datetime.now(TH_TZ)
+
+
+def get_break_date_str() -> str:
+    """
+    คืนวันที่สำหรับบันทึก break_date
+    ถ้าตอนนี้เป็น 00:00-07:59 ไทย (ยังอยู่ในกะดึกที่เริ่มเมื่อวาน) → คืนวันเมื่อวาน
+    """
+    t = get_thai_time()
+    if t.hour < 8:
+        t = t - timedelta(days=1)
+    return t.strftime("%Y-%m-%d")
+
+
+def parse_telegram_timestamp(ts_str: str | None) -> datetime | None:
+    """แปลง timestamp จาก Telegram เป็น datetime ไทย (UTC+7)
+
+    [FIX] เวลาที่บอท Telegram ส่งมาเป็นโซนจีน (UTC+8) ของเดิมเอาเลขดิบมาแปะป้ายว่า
+    เป็น +7 เลย ทำให้เวลาที่เก็บลง break_sessions เร็วไป 1 ชั่วโมงทุกแถว
+    (ส่วนข้อความที่ส่งเข้า Discord แปลงถูกอยู่แล้ว เลยไม่ตรงกับ DB)
+    ตอนนี้อ่านเป็น +8 ก่อน แล้วค่อยแปลงเป็น +7 ให้ถูกต้อง
+
+    รองรับทั้ง dd/mm และ mm/dd โดยเลือก format ที่ใกล้เคียงวันปัจจุบันมากสุด"""
+    if not ts_str:
+        return None
+    try:
+        parts = ts_str.strip().split()
+        date_part, time_part = parts[0], parts[1]
+        a, b = map(int, date_part.split('/'))
+        h, m, s = map(int, time_part.split(':'))
+        year = get_thai_time().year
+        today = get_thai_time()
+
+        # ลอง dd/mm (วัน/เดือน)
         try:
-            ch = self.bot.get_channel(int(str(channel_id).strip()))
-        except (TypeError, ValueError):
-            return None
-        return ch if isinstance(ch, MessageableChannel) else None
+            dt_ddmm = datetime(year, b, a, h, m, s, tzinfo=TG_TZ).astimezone(TH_TZ)
+            diff_ddmm = abs((dt_ddmm - today).total_seconds())
+        except ValueError:
+            dt_ddmm = None
+            diff_ddmm = float("inf")
 
-    def _staff_name(self, discord_id) -> str | None:
-        did = str(discord_id)
-        for emp in (self.get_employees() or {}).values():
-            if str(emp.get("discord_id")) == did:
-                return emp.get("name")
+        # ลอง mm/dd (เดือน/วัน)
+        try:
+            dt_mmdd = datetime(year, a, b, h, m, s, tzinfo=TG_TZ).astimezone(TH_TZ)
+            diff_mmdd = abs((dt_mmdd - today).total_seconds())
+        except ValueError:
+            dt_mmdd = None
+            diff_mmdd = float("inf")
+
+        if dt_ddmm is None and dt_mmdd is None:
+            return None
+        if dt_ddmm is None:
+            return dt_mmdd
+        if dt_mmdd is None:
+            return dt_ddmm
+
+        result = dt_ddmm if diff_ddmm <= diff_mmdd else dt_mmdd
+        logger.info(f"[parse_timestamp] {ts_str!r} → {result.strftime('%Y-%m-%d %H:%M:%S')}")
+        return result
+    except Exception as e:
+        logger.warning(f"[parse_telegram_timestamp] parse failed: {ts_str!r} — {e}")
         return None
 
-    async def _update_round(self, rid: int, patch: dict) -> None:
+
+def get_break_date_from_time(dt: datetime) -> str:
+    """คืน break_date จาก datetime — ถ้าก่อน 08:00 ไทย ถือว่าเป็นวันก่อนหน้า (กะดึก)"""
+    if dt.hour < 8:
+        dt = dt - timedelta(days=1)
+    return dt.strftime("%Y-%m-%d")
+
+
+# ตารางที่บันทึกการพัก
+#   break_logs     = ตารางหลัก บันทึกโดย botlink คนเดียว → K36 ดึงไปแสดง
+#   break_sessions = ตารางเดิม เขียนสำเนาไว้ให้ checkin-bot-render ใช้แจ้งเตือนพักนานต่อได้
+BREAK_TABLES = ["break_logs", "break_sessions"]
+
+
+def _open_break_in(table: str, staff_name: str, reason: str, now: datetime) -> None:
+    break_date = get_break_date_from_time(now)
+    prev_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # ถ้ายังมี record ที่ยังไม่ปิดอยู่ → ปิดก่อนแล้วเปิดใหม่ (กรณีบอท Telegram รีเซทข้ามตี 1)
+    res = supabase.from_(table) \
+        .select("id") \
+        .eq("staff_name", staff_name) \
+        .in_("break_date", [break_date, prev_date]) \
+        .is_("break_end", "null") \
+        .execute()
+    if res.data:
+        ids = [r["id"] for r in res.data]
+        supabase.from_(table) \
+            .update({"break_end": now.isoformat()}) \
+            .in_("id", ids) \
+            .execute()
+        logger.info(f"[{table}] {staff_name} มี record ค้าง {len(ids)} รายการ → ปิดแล้วเปิดใหม่")
+
+    supabase.from_(table).insert({
+        "staff_name": staff_name,
+        "break_start": now.isoformat(),
+        "break_date": break_date,
+        "break_reason": reason,
+    }).execute()
+    logger.info(f"[{table}] {staff_name} เริ่มพัก ({reason}) break_date={break_date} เวลา={now.strftime('%H:%M:%S')}")
+
+
+def _close_break_in(table: str, staff_name: str, now: datetime) -> None:
+    break_date = get_break_date_from_time(now)
+    prev_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    res = supabase.from_(table) \
+        .select("id") \
+        .eq("staff_name", staff_name) \
+        .in_("break_date", [break_date, prev_date]) \
+        .is_("break_end", "null") \
+        .execute()
+    if not res.data:
+        logger.info(f"[{table}] {staff_name} ไม่มี record พักที่เปิดอยู่")
+        return
+
+    ids = [r["id"] for r in res.data]
+    supabase.from_(table) \
+        .update({"break_end": now.isoformat()}) \
+        .in_("id", ids) \
+        .execute()
+    logger.info(f"[{table}] {staff_name} กลับแล้ว ปิด {len(ids)} record เวลา={now.strftime('%H:%M:%S')}")
+
+
+async def supabase_open_break(staff_name: str, activity: str, timestamp_str: str | None = None) -> None:
+    """บันทึกเริ่มพักลงทุกตารางใน BREAK_TABLES (ตารางหนึ่งพัง อีกตารางยังบันทึกได้)"""
+    if not supabase:
+        return
+    now = parse_telegram_timestamp(timestamp_str) or get_thai_time()
+    reason = get_break_reason(activity)
+    for table in BREAK_TABLES:
         try:
-            await self._db(lambda: self.db.from_(ROUNDS_TABLE).update(patch).eq("id", rid).execute())
+            _open_break_in(table, staff_name, reason, now)
         except Exception as e:
-            logger.error(f"[CHATCOUNT] update round {rid} error: {e}")
+            logger.error(f"[{table}] supabase_open_break error: {e}")
 
-    async def _fetch_answers(self, rid: int) -> list[dict]:
-        res = await self._db(lambda: self.db.from_(ANSWERS_TABLE).select("*").eq("round_id", rid)
-                             .order("created_at").execute())
-        return res.data or []
 
-    # ---------------- ลูปหลัก ----------------
-    async def run(self) -> None:
-        if hasattr(self.bot, "wait_until_ready_event"):
-            await self.bot.wait_until_ready_event()
+async def supabase_close_break(staff_name: str, timestamp_str: str | None = None) -> None:
+    """ปิด break_end ให้ record ที่ยังเปิดอยู่ของคนนี้ ในทุกตารางใน BREAK_TABLES"""
+    if not supabase:
+        return
+    now = parse_telegram_timestamp(timestamp_str) or get_thai_time()
+    for table in BREAK_TABLES:
+        try:
+            _close_break_in(table, staff_name, now)
+        except Exception as e:
+            logger.error(f"[{table}] supabase_close_break error: {e}")
+
+
+def parse_message(text: str, group_name: str, chat_id: str = "") -> dict | None:
+    if not text:
+        return None
+
+    # Skip error/failed messages (❌ with ไม่สามารถ)
+    if "❌" in text and ("ไม่สามารถ" in text or "失败" in text):
+        return None
+
+    # Extract Telegram ID — supports both plain and markdown-wrapped:
+    # "รหัสผู้ใช้：12345"  or  "**รหัสผู้ใช้：** `12345`"
+    tid_match = re.search(r"รหัสผู้ใช้[：:][^\d]*(\d+)", text)
+    if not tid_match:
+        return None
+
+    activity = None
+
+    # Format A: check-in success with backticks  "✅ **ลงทะเบียนสำเร็จ：** `ปวดหนัก`"
+    a_match = re.search(r"ลงทะเบียนสำเร็จ[：:][^`]*`([^`]+)`", text)
+    if a_match:
+        activity = a_match.group(1).strip()
+
+    # Format A2: check-in success without backticks  "✅ ลงทะเบียนสำเร็จ：ปวดหนัก 06/09 16:14:07"
+    if not activity:
+        a2_match = re.search(r"ลงทะเบียนสำเร็จ[：:]\s*([^\s\d/][^\s\d/]*)", text)
+        if a2_match:
+            activity = a2_match.group(1).strip()
+
+    # Format B: กลับที่นั่ง  "ลงทะเบียนสำหรับ กลับที่นั่ง สำเร็จ"
+    if not activity:
+        b_match = re.search(r"ลงทะเบียนสำหรับ\s+(.+?)\s+สำเร็จ", text)
+        if b_match:
+            activity = b_match.group(1).strip()
+
+    # Format C: plain  "ลงทะเบียนสำหรับ <activity>" without สำเร็จ
+    if not activity:
+        c_match = re.search(r"ลงทะเบียนสำหรับ\s+(\S+)", text)
+        if c_match:
+            activity = c_match.group(1).strip()
+
+    if not activity:
+        return None
+
+    # Strip location suffix e.g. "ปวดน้อย.สูบบุหรี่" → "ปวดน้อย"
+    activity = activity.split(".")[0].strip()
+
+    is_return = any(kw in activity for kw in RETURN_KEYWORDS)
+
+    ts_match = re.search(r"(\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})", text)
+    timestamp = ts_match.group(1) if ts_match else get_thai_time().strftime("%d/%m %H:%M:%S")
+
+    dur_match = re.search(r"เวลากิจกรรมนี้[：:][^`]*`([^`]+)`", text)
+    duration = dur_match.group(1) if dur_match else None
+
+    return {
+        "telegram_id": tid_match.group(1),
+        "activity": "กลับที่นั่ง" if is_return else activity,
+        "is_return": is_return,
+        "timestamp": timestamp,
+        "duration": duration,
+        "group_name": group_name,
+        "chat_id": chat_id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Discord bot
+# ---------------------------------------------------------------------------
+STATUS_CHANNEL_ID = int(os.environ.get("DISCORD_STATUS_CHANNEL_ID", "0") or "0")
+
+
+class ActivityBot(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.members = True
+        intents.voice_states = True
+        # 📊 นับแชท ต้องอ่านข้อความรีพลาย → ต้องเปิด MESSAGE CONTENT INTENT ใน Discord Developer Portal ด้วย
+        intents.message_content = True
+        super().__init__(intents=intents)
+        self._ready_event = asyncio.Event()
+        self.tree = discord.app_commands.CommandTree(self)
+
+        # ระบบจำห้องทำงานแบบนับเวลา รายชั่วโมง
+        # member_id → (channel_id, join_timestamp) — ห้องที่กำลังอยู่ตอนนี้
+        self._voice_join_time: dict[int, tuple[int, float]] = {}
+        # member_id → {channel_id: วินาทีที่อยู่} — สะสมไว้ตลอดชั่วโมงนี้
+        self._hour_time: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        # ชั่วโมงปัจจุบัน (0-23) เพื่อรู้เมื่อขึ้นชั่วโมงใหม่
+        self._current_hour: int = datetime.now().hour
+        # member_id → channel_id ห้องที่แจ้งกิจกรรมล่าสุด (ใช้สำหรับ "กลับที่นั่ง")
+        self._last_notified_channel: dict[int, int] = {}
+        # member_id → discord.Message ของกิจกรรมล่าสุด (ใช้สำหรับ reply ตอนกลับที่นั่ง)
+        self._last_activity_message: dict[int, discord.Message] = {}
+        # member_id ที่ถูกย้ายไปห้องปลายทาง (เช่น Dining) — คนเหล่านี้เท่านั้นที่ต้องย้ายกลับ
+        self._moved_to_destination: set[int] = set()
+
+    async def setup_hook(self):
+        await self.tree.sync()
+
+    async def on_ready(self):
+        logger.info(f"Discord bot ready: {self.user}")
+        now = time_module.time()
+        count = 0
+        for guild in self.guilds:
+            for channel in guild.voice_channels:
+                for member in channel.members:
+                    if str(channel.id) not in DESTINATION_CHANNEL_IDS:
+                        self._voice_join_time[member.id] = (channel.id, now)
+                        count += 1
+        if count:
+            logger.info(f"Snapshot: found {count} member(s) already in voice channels")
+        self._ready_event.set()
+
+    async def send_status(self, message: str):
+        """ส่งข้อความสถานะไปยัง DISCORD_STATUS_CHANNEL_ID ถ้ากำหนดไว้"""
+        channel_id = os.environ.get("DISCORD_STATUS_CHANNEL_ID", "")
+        if not channel_id:
+            return
+        try:
+            channel = self.get_channel(int(channel_id))
+            if channel:
+                now = datetime.now().strftime("%d/%m %H:%M")
+                await channel.send(f"{message}\n> 🕐 {now}")
+        except Exception as e:
+            logger.error(f"Failed to send status message: {e}")
+
+    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+        now = time_module.time()
+        current_hour = datetime.now().hour
+
+        # ขึ้นชั่วโมงใหม่ → reset สถิติทั้งหมด
+        if current_hour != self._current_hour:
+            self._current_hour = current_hour
+            self._hour_time.clear()
+            logger.info(f"New hour slot {current_hour:02d}:00 — resetting work channel stats")
+
+        # บันทึกเวลาที่อยู่ในห้องก่อนหน้า
+        if member.id in self._voice_join_time:
+            prev_ch_id, join_ts = self._voice_join_time[member.id]
+            duration = now - join_ts
+            if str(prev_ch_id) not in DESTINATION_CHANNEL_IDS:
+                self._hour_time[member.id][prev_ch_id] += duration
+
+        # บันทึกห้องใหม่ที่เข้า
+        if after.channel:
+            self._voice_join_time[member.id] = (after.channel.id, now)
         else:
-            await self.bot.wait_until_ready()
-        logger.info(f"[CHATCOUNT] เริ่มทำงาน (เช็คทุก {SYNC_INTERVAL} วินาที)")
-        while True:
-            try:
-                await self.sync_once()
-            except Exception as e:
-                logger.error(f"[CHATCOUNT] sync error: {e}")
-            await asyncio.sleep(SYNC_INTERVAL)
+            self._voice_join_time.pop(member.id, None)
 
-    async def sync_once(self) -> None:
-        if self.load_employees and not self.get_employees():
-            await self.load_employees()
+    async def wait_until_ready_event(self):
+        await self._ready_event.wait()
 
-        res = await self._db(lambda: self.db.from_(SETTINGS_TABLE).select("webs").eq("id", 1).execute())
-        self.webs = (res.data or [{}])[0].get("webs") or []
-        self.web_names = web_name_list(self.webs)
+    # ห้อง Discord เพิ่ม/ลบ/เปลี่ยนชื่อ → ส่งรายชื่อห้องใหม่ให้หน้าเว็บนับแชททันที
+    async def on_guild_channel_create(self, channel):
+        if chat_count is not None:
+            chat_count.request_channel_publish()
 
-        if time_module.time() - self._last_channel_publish > CHANNEL_PUBLISH_EVERY:
-            await self.publish_channels()
-        if time_module.time() - self._last_tg_publish > TG_GROUPS_PUBLISH_EVERY:
-            await self.publish_tg_groups()
+    async def on_guild_channel_delete(self, channel):
+        if chat_count is not None:
+            chat_count.request_channel_publish()
 
-        await self._schedule_tick()
+    async def on_guild_channel_update(self, before, after):
+        if chat_count is not None and (before.name != after.name or before.category_id != after.category_id
+                                       or before.position != after.position):
+            chat_count.request_channel_publish()
 
-        since = (datetime.now(TH_TZ).date() - timedelta(days=ROUND_LOOKBACK_DAYS)).isoformat()
-        res = await self._db(lambda: self.db.from_(ROUNDS_TABLE).select("*").eq("status", "open")
-                             .gte("round_date", since).execute())
-        rows = res.data or []
-        self.rounds = {int(r["id"]): r for r in rows}
-        self._rebuild_msg_map()
-
-        for r in rows:
-            if not r.get("posted"):
-                await self._post_round(r)
-        for r in rows:
-            if r.get("posted"):
-                await self.evaluate_and_send(int(r["id"]))
-
-    def _rebuild_msg_map(self) -> None:
-        m: dict[int, int] = {}
-        for rid, r in self.rounds.items():
-            for msg in r.get("messages") or []:
-                try:
-                    m[int(msg["message_id"])] = rid
-                except (KeyError, TypeError, ValueError):
-                    pass
-        self.msg_map = m
-
-    def request_channel_publish(self) -> None:
-        """เรียกจาก event ของ Discord ตอนมีห้องเพิ่ม/ลบ/เปลี่ยนชื่อ → ส่งรายชื่อใหม่ให้เว็บทันที"""
-        asyncio.create_task(self.publish_channels())
-
-    async def publish_channels(self) -> None:
-        async with self._publish_lock:
-            await self._publish_channels()
-
-    async def _publish_channels(self) -> None:
-        """ส่งรายชื่อห้อง Discord ไปให้หน้าเว็บใช้ทำช่องติ๊ก"""
-        chans = []
-        for g in self.bot.guilds:
-            for ch in g.channels:
-                if not isinstance(ch, (discord.TextChannel, discord.VoiceChannel)):
-                    continue
-                cat = ch.category
-                chans.append({
-                    "id": str(ch.id),
-                    "name": ch.name,
-                    "type": "voice" if isinstance(ch, discord.VoiceChannel) else "text",
-                    "category": cat.name if cat else "",
-                    "cat_pos": cat.position if cat else -1,
-                    "pos": ch.position,
-                    "guild": g.name,
-                })
-        chans.sort(key=lambda c: (c["guild"], c["cat_pos"], c["type"] == "voice", c["pos"]))
-        self._last_channel_publish = time_module.time()
-        if chans == self._last_channels:
+    async def on_message(self, message: discord.Message):
+        # 📊 นับแชท — รับรีพลายตอบข้อความคำถาม (ดู bot/chat_count.py)
+        if chat_count is None:
             return
         try:
-            now = datetime.now(timezone.utc).isoformat()
-            await self._db(lambda: self.db.from_(SETTINGS_TABLE)
-                           .update({"channels": chans, "channels_updated_at": now}).eq("id", 1).execute())
-            self._last_channels = chans
-            logger.info(f"[CHATCOUNT] อัปเดตรายชื่อห้อง {len(chans)} ห้อง")
+            await chat_count.handle_message(message)
         except Exception as e:
-            logger.error(f"[CHATCOUNT] publish channels error: {e}")
+            logger.error(f"[CHATCOUNT] on_message error: {e}")
 
-    async def publish_tg_groups(self) -> None:
-        """ส่งรายชื่อกลุ่ม Telegram ทั้งหมดที่บัญชี Telethon อยู่ ไปให้หน้าเว็บเลือกปลายทาง"""
-        client = self.get_tg_client()
-        if client is None:
-            return                      # Telegram ยังไม่ต่อ → ลองใหม่รอบหน้า
-        self._last_tg_publish = time_module.time()
-        groups = []
-        try:
-            if self._tg_cache_owner is not client:
-                self._tg_cache, self._tg_cache_owner = {}, client
-            async for d in client.iter_dialogs():
-                self._tg_cache[self.norm_chat_id(d.id)] = d.entity     # ใช้ส่งข้อความได้เลยไม่ต้องค้นซ้ำ
-                if d.is_group:
-                    groups.append({"id": str(d.id), "name": d.name or str(d.id)})
-        except Exception as e:
-            logger.error(f"[CHATCOUNT] read telegram dialogs error: {e}")
-            return
-        groups.sort(key=lambda g: g["name"].lower())
-        if groups == self._last_tg_groups:
-            return
-        try:
-            now = datetime.now(timezone.utc).isoformat()
-            await self._db(lambda: self.db.from_(SETTINGS_TABLE)
-                           .update({"tg_groups": groups, "tg_groups_updated_at": now}).eq("id", 1).execute())
-            self._last_tg_groups = groups
-            logger.info(f"[CHATCOUNT] อัปเดตรายชื่อกลุ่ม Telegram {len(groups)} กลุ่ม")
-        except Exception as e:
-            logger.error(f"[CHATCOUNT] publish telegram groups error: {e} (รัน chatcount_v2.sql แล้วหรือยัง?)")
-
-    # ---------------- ตั้งเวลา ----------------
-    async def _schedule_tick(self) -> None:
-        now = datetime.now(TH_TZ)
-        today = now.date().isoformat()
-        res = await self._db(lambda: self.db.from_(SCHEDULES_TABLE).select("*").eq("active", True).execute())
-        for s in res.data or []:
-            sid = int(s["id"])
-            if (sid, today) in self._fired:
-                continue
+    async def find_member(self, discord_user_id: str) -> tuple[discord.Guild, discord.Member] | tuple[None, None]:
+        for guild in self.guilds:
             try:
-                hh, mm = map(int, str(s.get("time") or "").split(":")[:2])
-            except ValueError:
-                continue
-            # ส่งทุกวันเสมอ (ไม่ใช้ช่อง days แล้ว)
-            due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-            delta = (now - due).total_seconds()
-            if not (0 <= delta < FIRE_WINDOW):
-                continue
-            self._fired.add((sid, today))
-            row = self.round_from_schedule(s, today, "auto")
-            try:
-                ins = await self._db(lambda: self.db.from_(ROUNDS_TABLE).insert(row).execute())
-                logger.info(f"[CHATCOUNT] เริ่มรอบ '{row['label']}' ({today}) id={(ins.data or [{}])[0].get('id')}")
-            except Exception as e:
-                # ชน unique index = มีรอบของวันนี้แล้ว (เช่น บอทรีสตาร์ท) → ข้าม
-                if "duplicate" not in str(e).lower() and "23505" not in str(e):
-                    logger.error(f"[CHATCOUNT] create round error: {e}")
-
-    def round_from_schedule(self, s: dict, round_date: str, trigger: str) -> dict:
-        all_webs = web_name_list(self.webs)
-        return {
-            "schedule_id": int(s["id"]),
-            "trigger": trigger,
-            "label": s.get("name") or f"รอบ {s.get('time')}",
-            "round_date": round_date,
-            "round_time": s.get("time"),
-            "channel_ids": s.get("channel_ids") or [],
-            "expected_webs": all_webs,              # ถามทุกเว็บเสมอ (ใช้รายชื่อเว็บล่าสุดตอนเริ่มรอบ)
-            "telegram_chat_id": s.get("telegram_chat_id"),
-            "ask_template": s.get("ask_template"),
-            "report_template": s.get("report_template"),
-            "line_template": s.get("line_template"),
-            "missing_template": s.get("missing_template"),
-        }
-
-    # ---------------- ส่งคำถามเข้าห้อง ----------------
-    async def _post_round(self, r: dict) -> None:
-        rid = int(r["id"])
-        content = build_ask(r)
-        messages, errors = [], []
-        for cid in r.get("channel_ids") or []:
-            ch = self._resolve_channel(cid)
-            if ch is None:
-                errors.append(f"{cid}: ไม่พบห้อง (บอทไม่อยู่ในห้องนี้)")
-                continue
-            try:
-                m = await ch.send(content, allowed_mentions=discord.AllowedMentions.none())
-                messages.append({"channel_id": str(cid), "channel_name": ch.name, "message_id": str(m.id)})
-            except discord.Forbidden:
-                errors.append(f"#{ch.name}: บอทไม่มีสิทธิ์ส่งข้อความ")
-            except discord.HTTPException as e:
-                errors.append(f"#{ch.name}: {e.text or e.status}")
-        r.update({"posted": True, "messages": messages, "post_errors": errors})
-        await self._update_round(rid, {"posted": True, "messages": messages, "post_errors": errors})
-        self._rebuild_msg_map()
-        logger.info(f"[CHATCOUNT] ส่งคำถามรอบ #{rid} แล้ว {len(messages)} ห้อง" + (f" · ผิดพลาด {errors}" if errors else ""))
-
-    # ---------------- รับรีพลาย ----------------
-    async def handle_message(self, message: discord.Message) -> bool:
-        if message.author.bot or not message.reference or not message.reference.message_id:
-            return False
-        rid = self.msg_map.get(int(message.reference.message_id))
-        if not rid:
-            return False
-        rnd = self.rounds.get(rid)
-        if not rnd or rnd.get("status") != "open":
-            # ข้อความคำถามถูกลบไปแล้วหลังส่งสรุป → แจ้งสั้นๆ แล้วลบตัวเองทิ้งใน 10 วินาที
-            try:
-                await message.reply("ℹ️ รอบนี้ส่งสรุปไปแล้วครับ", mention_author=False, delete_after=10)
+                member = guild.get_member(int(discord_user_id))
+                if member is None:
+                    member = await guild.fetch_member(int(discord_user_id))
+                if member:
+                    return guild, member
             except Exception:
-                pass
-            return True
+                continue
+        return None, None
 
-        found, invalid = parse_reply(message.content or "", self.web_names)
-        names_hint = " ".join(f"`{w}`" for w in (rnd.get("expected_webs") or self.web_names))
+    async def find_voice_channel_by_id(self, channel_id: str) -> discord.VoiceChannel | None:
+        try:
+            channel = self.get_channel(int(channel_id))
+            if isinstance(channel, discord.VoiceChannel):
+                return channel
+        except Exception as e:
+            logger.error(f"Failed to find channel by ID {channel_id}: {e}")
+        return None
 
-        if invalid:
-            # มีชื่อเว็บผิดแม้แต่ตัวเดียว → ไม่รับทั้งข้อความ กันนับครึ่งๆ กลางๆ
-            wrong = ", ".join(f"`{t}`" + (f" (หมายถึง `{g}` ?)" if g else "") for t, g in invalid)
-            await message.reply(
-                f"❌ ชื่อเว็บไม่ถูกต้อง: {wrong}\n"
-                f"ข้อความนี้ยังไม่ถูกบันทึก กรุณารีพลายใหม่ โดยพิมพ์ชื่อเว็บให้ตรงทุกตัวอักษร\n"
-                f"ชื่อที่ใช้ได้: {names_hint}",
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
+    async def find_voice_channel_for_member(self, discord_user_id: str) -> discord.VoiceChannel | None:
+        _, member = await self.find_member(discord_user_id)
+        if member is None:
+            return None
+        voice = member.voice
+        if not voice or not voice.channel:
+            logger.info(f"{discord_user_id} not in any voice channel")
+            return None
+        vc = voice.channel
+        logger.info(f"Found {discord_user_id} in voice channel: '{vc.name}'")
+        return vc
+
+    def get_target_channel_name(self, activity: str) -> str:
+        for keyword, channel_name in ACTIVITY_MOVE_CHANNEL.items():
+            if keyword in activity:
+                return channel_name
+        return ""
+
+    def get_work_channel_id(self, member_id: int) -> int | None:
+        """คืน channel_id ที่อยู่นานสุดในชั่วโมงนี้ (ไม่นับห้องปลายทาง)"""
+        now = time_module.time()
+
+        # รวมเวลาที่สะสมไว้ + session ที่กำลังอยู่ตอนนี้
+        time_by_ch: dict[int, float] = dict(self._hour_time[member_id])
+        if member_id in self._voice_join_time:
+            cur_ch_id, join_ts = self._voice_join_time[member_id]
+            if str(cur_ch_id) not in DESTINATION_CHANNEL_IDS:
+                time_by_ch[cur_ch_id] = time_by_ch.get(cur_ch_id, 0) + (now - join_ts)
+
+        if not time_by_ch:
+            return None
+        return max(time_by_ch, key=lambda ch: time_by_ch[ch])
+
+    async def _find_last_activity_msg(self, channel, name: str):
+        """หาข้อความแจ้ง "**ชื่อ** ไป..." ล่าสุดของบอทในห้อง (ใช้ตอนบอทรีสตาร์ทแล้วไม่มีข้อมูลในความจำ)"""
+        needle = f"**{name}** ไป"
+        try:
+            async for m in channel.history(limit=100):
+                if m.author.id == self.user.id and needle in (m.content or ""):
+                    return m
+                if m.author.id == self.user.id and f"**{name}** กลับที่นั่งแล้ว" in (m.content or ""):
+                    return None   # เจอข้อความกลับที่นั่งก่อน = ข้อความไปล่าสุดถูกจับคู่ไปแล้ว
+        except Exception as e:
+            logger.warning(f"ค้นข้อความแจ้งพักของ {name} ไม่ได้: {e}")
+        return None
+
+    async def send_notification(self, discord_user_id: str, name: str, activity: str,
+                                 is_return: bool, group_name: str, timestamp: str | None = None) -> tuple[bool, str | None]:
+        emoji = get_emoji(activity, is_return)
+        action = f"**{name}** กลับที่นั่งแล้ว" if is_return else f"**{name}** ไป{activity}"
+        if timestamp:
+            # timestamp format: "dd/mm HH:MM:SS" → extract HH:MM then convert +8 → +7 (Thai time)
+            raw_time = timestamp.split(" ")[-1][:5]
+            try:
+                h, m = map(int, raw_time.split(":"))
+                time_part = f"{h:02d}:{m:02d}"
+            except Exception:
+                time_part = raw_time
+        else:
+            time_part = datetime.now().strftime("%H:%M")
+        message = f"{emoji} {action}\n> 🕐 {time_part} · 📌 {group_name}"
+
+        guild, member = await self.find_member(discord_user_id)
+        if member is None:
+            logger.warning(f"No member found for {name} ({discord_user_id})")
+            return False, None
+
+        # ห้องทำงาน = ห้องที่อยู่นานสุดในชั่วโมงนี้
+        work_ch_id = self.get_work_channel_id(member.id)
+        work_vc = await self.find_voice_channel_by_id(str(work_ch_id)) if work_ch_id else None
+
+        # ห้องที่ member อยู่ตอนนี้ (fallback ถ้ายังไม่มีสถิติ)
+        current_ch = None
+        if member.voice and member.voice.channel:
+            ch = member.voice.channel
+            if str(ch.id) not in DESTINATION_CHANNEL_IDS:
+                current_ch = ch
+
+        if is_return:
+            # กลับที่นั่ง → ย้ายกลับถ้า: ถูกบอทย้ายออก หรือ ตอนนี้อยู่ในห้องปลายทาง (กินข้าวเองก่อนกด / บอท restart)
+            currently_in_destination = (
+                member.voice and
+                member.voice.channel and
+                str(member.voice.channel.id) in DESTINATION_CHANNEL_IDS
             )
-            return True
+            should_move_back = member.id in self._moved_to_destination or currently_in_destination
+            if should_move_back:
+                move_target = work_vc or current_ch
+                if move_target:
+                    try:
+                        await member.move_to(move_target)
+                        logger.info(f"Moved {name} back → #{move_target.name}")
+                    except discord.Forbidden:
+                        logger.error(f"No permission to move {name} — bot needs 'Move Members' permission")
+                    except Exception as e:
+                        logger.error(f"Failed to move {name} back: {e}")
+                else:
+                    logger.info(f"No work channel found for {name}, skipping return move")
+                self._moved_to_destination.discard(member.id)
+            else:
+                logger.info(f"{name} was not moved out — skipping return move")
 
-        if not found:
-            if re.search(r"\d", message.content or ""):
-                await message.reply(
-                    f"⚠️ ไม่เจอชื่อเว็บในข้อความ กรุณาพิมพ์ชื่อเว็บนำหน้าตัวเลข เช่น `MK8 15`\n"
-                    f"ชื่อที่ใช้ได้: {names_hint}",
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            return True
+            # แจ้งในห้องที่เคยแจ้งกิจกรรมล่าสุด
+            last_ch_id = self._last_notified_channel.get(member.id)
+            last_vc = await self.find_voice_channel_by_id(str(last_ch_id)) if last_ch_id else None
+            notify_vc = last_vc or current_ch
 
-        expected = set(rnd.get("expected_webs") or [])
-        ch_id = str(message.channel.id)
-        staff = self._staff_name(message.author.id)
-        rows, accepted, skipped = [], [], []
-        for web, count in found.items():
-            if web not in expected:
-                skipped.append(web)
-                continue
-            accepted.append(web)
-            rows.append({
-                "round_id": rid,
-                "web": web,
-                "count": count,
-                "channel_id": ch_id,
-                "channel_name": getattr(message.channel, "name", ""),
-                "discord_id": str(message.author.id),
-                "discord_name": getattr(message.author, "display_name", None) or message.author.name,
-                "staff_name": staff,
-                "message_id": str(message.id),
-                "raw_text": (message.content or "")[:500],
-            })
+        else:
+            target_channel_id = self.get_target_channel_name(activity)
 
-        if rows:
+            if target_channel_id:
+                # กินข้าว / ทานข้าว → แจ้งในห้องทำงาน แล้วย้ายไป Dining
+                notify_vc = work_vc or current_ch
+                target_vc = await self.find_voice_channel_by_id(target_channel_id)
+                if target_vc:
+                    mem_vc = member.voice.channel if member.voice else None
+                    if mem_vc and mem_vc.id == target_vc.id:
+                        logger.info(f"{name} already in target channel '{target_vc.name}', skipping move")
+                    else:
+                        try:
+                            await member.move_to(target_vc)
+                            self._moved_to_destination.add(member.id)
+                            logger.info(f"Moved {name} → #{target_vc.name}")
+                        except discord.Forbidden:
+                            logger.error(f"No permission to move {name} — bot needs 'Move Members' permission")
+                        except Exception as e:
+                            logger.error(f"Failed to move {name}: {e}")
+                else:
+                    logger.warning(f"Target channel ID '{target_channel_id}' not found")
+            else:
+                # ปวดน้อย / ปวดหนัก / พัก → แจ้งห้องที่นั่งอยู่ตอนนี้เลย
+                notify_vc = current_ch
+                if notify_vc is None:
+                    logger.warning(f"{name} is not in any voice channel — notification skipped")
+
+        # ส่งแจ้งเตือน + บันทึกห้องที่แจ้ง (เพื่อใช้ตอนกลับที่นั่ง)
+        if notify_vc:
             try:
-                await self._db(lambda: self.db.from_(ANSWERS_TABLE).insert(rows).execute())
+                if is_return:
+                    # reply กลับไปที่ message กิจกรรมล่าสุด (ถ้ามี)
+                    ref_msg = self._last_activity_message.get(member.id)
+                    if ref_msg is None:
+                        # บอทเพิ่งรีสตาร์ท (ความจำหาย) → หาข้อความ "ไป..." ล่าสุดของคนนี้จากประวัติห้อง
+                        ref_msg = await self._find_last_activity_msg(notify_vc, name)
+                    if ref_msg and ref_msg.channel.id == notify_vc.id:
+                        sent_msg = await ref_msg.reply(message)
+                    else:
+                        sent_msg = await notify_vc.send(message)
+                    self._last_activity_message.pop(member.id, None)
+                    # 🧹 กลับที่นั่งแล้ว → ลบชุดข้อความ (แจ้งไป + แจ้งกลับ) ออกจากห้อง หลังหน่วงเวลาให้เห็นสักครู่
+                    if BREAK_MSG_DELETE_AFTER >= 0:
+                        for msg in (ref_msg, sent_msg):
+                            if msg is not None:
+                                try:
+                                    await msg.delete(delay=BREAK_MSG_DELETE_AFTER)
+                                except Exception as e:
+                                    logger.warning(f"ลบข้อความแจ้งพักไม่สำเร็จ: {e}")
+                else:
+                    sent_msg = await notify_vc.send(message)
+                    self._last_notified_channel[member.id] = notify_vc.id
+                    self._last_activity_message[member.id] = sent_msg
+                logger.info(f"Sent to voice channel #{notify_vc.name}: {name} - {activity}")
+                return True, notify_vc.name
             except Exception as e:
-                logger.error(f"[CHATCOUNT] save answers error: {e}")
-                await message.reply("❌ บันทึกไม่สำเร็จ ลองรีพลายใหม่อีกครั้งครับ", mention_author=False)
-                return True
+                logger.error(f"Failed to send to voice channel #{notify_vc.name}: {e}")
+        elif not is_return:
+            logger.warning(f"No work channel found for {name} ({discord_user_id}) — notification skipped")
 
-        lines = []
-        if accepted:
-            lines.append("✅ รับแล้ว: " + ", ".join(f"{w} = {found[w]}" for w in accepted))
-        if skipped:
-            lines.append("⚠️ ไม่ได้อยู่ในรอบนี้: " + ", ".join(skipped))
+        return False, None
 
-        answers = await self._fetch_answers(rid) if rows else []
-        resolved = rnd.get("resolved") or {}
-        clash = sorted({a["web"] for a in answers
-                        if a["web"] in accepted and str(a.get("channel_id")) != ch_id and a["web"] not in resolved})
-        if clash:
-            lines.append("⚠️ " + ", ".join(clash) + " มีคำตอบจากห้องอื่นด้วย — รอแอดมินตรวจในเว็บก่อนส่งสรุป")
 
+discord_bot = ActivityBot()
+
+# Telethon client ที่ต่ออยู่ตอนนี้ (ใช้ส่งสรุปนับแชทเข้ากลุ่ม Telegram ด้วยบัญชีเดียวกัน)
+TG_CLIENT: TelegramClient | None = None
+
+# 📊 นับแชท — ตั้งค่าในหน้า K36 แท็บ "นับแชท"
+chat_count: ChatCount | None = (
+    ChatCount(discord_bot, supabase, lambda: EMPLOYEES, lambda: TG_CLIENT,
+              norm_chat_id, load_employees_from_supabase)
+    if supabase else None
+)
+
+
+@discord_bot.tree.command(name="status", description="ดูสถานะบอทและห้องทำงานของพนักงาน")
+async def status_command(interaction: discord.Interaction):
+    # จำกัดให้ใช้ได้เฉพาะ status channel เท่านั้น
+    if STATUS_CHANNEL_ID and interaction.channel_id != STATUS_CHANNEL_ID:
+        await interaction.response.send_message(
+            "❌ คำสั่งนี้ใช้ได้เฉพาะใน status channel เท่านั้น", ephemeral=True
+        )
+        return
+
+    now = datetime.now().strftime("%d/%m %H:%M:%S")
+    hour = datetime.now().hour
+    lines = [f"🟢 **Bot Status** — `{now}`",
+             f"⏱ Hour slot: `{hour:02d}:00 – {(hour+1)%24:02d}:00`",
+             ""]
+
+    # สร้าง reverse map: discord_id → name
+    discord_to_name = {v["discord_id"]: v["name"] for v in EMPLOYEES.values()}
+
+    # รวบรวมข้อมูลห้องทำงานของทุกคนที่มีสถิติ
+    work_info: list[tuple[str, str, float]] = []  # (name, channel_name, seconds)
+    for member_id, ch_map in discord_bot._hour_time.items():
+        # รวม ongoing session
+        total: dict[int, float] = dict(ch_map)
+        if member_id in discord_bot._voice_join_time:
+            cur_ch_id, join_ts = discord_bot._voice_join_time[member_id]
+            if str(cur_ch_id) not in DESTINATION_CHANNEL_IDS:
+                total[cur_ch_id] = total.get(cur_ch_id, 0) + (time_module.time() - join_ts)
+
+        if not total:
+            continue
+
+        best_ch_id = max(total, key=lambda c: total[c])
+        best_secs = total[best_ch_id]
+
+        # หาชื่อห้องและชื่อพนักงาน
+        ch_obj = discord_bot.get_channel(best_ch_id)
+        ch_name = f"#{ch_obj.name}" if ch_obj else f"ID:{best_ch_id}"
+        disc_id = str(member_id)
+        name = discord_to_name.get(disc_id, disc_id)
+        work_info.append((name, ch_name, best_secs))
+
+    if work_info:
+        work_info.sort(key=lambda x: x[1])  # เรียงตามห้อง
+        lines.append(f"**ห้องทำงาน ({len(work_info)} คน):**")
+        for name, ch_name, secs in work_info:
+            mins = int(secs // 60)
+            lines.append(f"• **{name}** → {ch_name} ({mins} นาที)")
+    else:
+        lines.append("_ยังไม่มีข้อมูลห้องทำงาน (รอพนักงานเข้า voice channel)_")
+
+    await interaction.response.send_message("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Telegram userbot
+# ---------------------------------------------------------------------------
+async def supabase_restore_open_breaks() -> None:
+    """ตอน startup โหลดการพักที่ยังเปิดอยู่ (จากตารางหลัก break_logs) กลับเข้า _currently_out"""
+    if not supabase:
+        return
+    try:
+        break_date = get_break_date_str()
+        prev_date = (get_thai_time() - timedelta(days=1)).strftime("%Y-%m-%d")
+        res = supabase.from_(BREAK_TABLES[0]) \
+            .select("staff_name") \
+            .in_("break_date", [break_date, prev_date]) \
+            .is_("break_end", "null") \
+            .execute()
+        if not res.data:
+            logger.info("[Supabase] ไม่มี open break sessions ค้างอยู่")
+            return
+        name_to_tid = {v["name"]: k for k, v in EMPLOYEES.items()}
+        restored = 0
+        for r in res.data:
+            tid = name_to_tid.get(r["staff_name"])
+            if tid and tid not in _currently_out:
+                _currently_out[tid] = ""  # ไม่รู้ group_name เดิม
+                restored += 1
+        logger.info(f"[Supabase] Restored {restored} open break sessions → _currently_out")
+    except Exception as e:
+        logger.error(f"[Supabase] supabase_restore_open_breaks error: {e}")
+
+
+async def start_telegram(on_activity):
+    api_id = int(os.environ.get("TELEGRAM_API_ID", "0"))
+    api_hash = os.environ.get("TELEGRAM_API_HASH", "")
+    phone = os.environ.get("TELEGRAM_PHONE", "")
+    session_str = os.environ.get("TELEGRAM_SESSION", "")
+
+    if not api_id or not api_hash or not phone:
+        logger.warning("Missing TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_PHONE. Telegram bot disabled.")
+        return
+
+    if not session_str:
+        logger.error(
+            "TELEGRAM_SESSION is not set. "
+            "Run 'python bot/auth.py' in the Shell to authenticate and get the session string, "
+            "then save it as TELEGRAM_SESSION environment variable."
+        )
+        return
+
+    session = StringSession(session_str)
+    client = TelegramClient(session, api_id, api_hash)
+
+    await client.start(phone=phone)
+
+    saved = client.session.save()
+    if saved != session_str:
+        logger.info("=" * 60)
+        logger.info("NEW SESSION STRING — save as TELEGRAM_SESSION secret:")
+        logger.info(saved)
+        logger.info("=" * 60)
+
+    me = await client.get_me()
+    logger.info(f"Telegram connected as: {me.username or me.first_name}")
+    global TG_CLIENT
+    TG_CLIENT = client
+    await discord_bot.wait_until_ready_event()
+    # โหลดกลุ่ม Telegram จาก Supabase K36
+    await load_target_groups()
+    # โหลดพนักงานจาก Supabase K36
+    await load_employees_from_supabase()
+    await supabase_restore_open_breaks()
+    await discord_bot.send_status("🟢 **Bot online** — Telegram + Discord connected")
+
+    # ดักการเปลี่ยนแปลงตาราง users ผ่าน Supabase Realtime → รีโหลดทันที
+    async def watch_employees_realtime():
         try:
-            if accepted:
-                await message.add_reaction("✅")
-            await message.reply("\n".join(lines), mention_author=False,
-                                allowed_mentions=discord.AllowedMentions.none())
-        except Exception as e:
-            logger.warning(f"[CHATCOUNT] reply error: {e}")
-
-        logger.info(f"[CHATCOUNT] รอบ #{rid} {staff or message.author} → {found}")
-        if rows:
-            await self.evaluate_and_send(rid)
-        return True
-
-    # ---------------- ตรวจครบ + ส่ง Telegram ----------------
-    async def evaluate_and_send(self, rid: int) -> None:
-        async with self._send_lock:
-            res = await self._db(lambda: self.db.from_(ROUNDS_TABLE).select("*").eq("id", rid).execute())
-            if not res.data:
-                return
-            rnd = res.data[0]
-            self.rounds[rid] = rnd
-            if rnd.get("status") != "open" or not rnd.get("posted"):
-                return
-
-            answers = await self._fetch_answers(rid)
-            ev = evaluate_round(rnd, answers)
-            force = bool(rnd.get("force_send"))
-            if not ev["complete"] and not force:
-                return
-
-            text = build_report(rnd, ev, force, web_emoji_map(self.webs))
-            ok, err = await self._send_telegram(rnd.get("telegram_chat_id"), text)
-            if not ok:
-                if rnd.get("send_error") != err:
-                    await self._update_round(rid, {"send_error": err, "report_text": text})
-                    logger.warning(f"[CHATCOUNT] รอบ #{rid} ส่ง Telegram ไม่ได้: {err}")
-                return
-
-            await self._update_round(rid, {
-                "status": "sent",
-                "report_text": text,
-                "send_error": None,
-                "sent_at": datetime.now(timezone.utc).isoformat(),
-            })
-            rnd["status"] = "sent"
-            logger.info(f"[CHATCOUNT] รอบ #{rid} ส่งสรุปเข้า Telegram แล้ว ({'ส่งเท่าที่มี' if force else 'ครบ'})")
-
-        try:
-            await self._cleanup_discord(rnd)
-        except Exception as e:
-            logger.error(f"[CHATCOUNT] cleanup discord error: {e}")
-
-    async def _cleanup_discord(self, rnd: dict) -> None:
-        """ลบข้อความคำถาม + รีพลายของพนักงาน + ข้อความตอบกลับของบอท ของรอบนี้ออกจากทุกห้อง"""
-        me = self.bot.user
-        total = 0
-        for msg in rnd.get("messages") or []:
-            ch = self._resolve_channel(msg.get("channel_id"))
-            if not ch:
-                continue
-            try:
-                qid = int(msg["message_id"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            ids = [qid]
-            chain: set[int] = {qid}
-            try:
-                # ไล่ข้อความหลังคำถาม เก็บทุกข้อความที่ "รีพลายต่อกันเป็นสาย" จากคำถาม
-                #   คำถาม ← รีพลายพนักงาน ← บอทตอบ (✅/❌) ← พนักงานตอบบอทต่อ ...
-                # + ข้อความตอบกลับของบอทที่ "ข้อความต้นฉบับถูกลบไปแล้ว" (เช่น พนักงานลบข้อความที่พิมพ์ผิดเอง)
-                #   ดูจากหัวข้อความ เพื่อไม่ไปลบข้อความแจ้งเตือนอื่นของบอทในห้องเดียวกัน
-                async for m in ch.history(after=discord.Object(id=qid), limit=None, oldest_first=True):
-                    ref = m.reference.message_id if m.reference else None
-                    if ref is None:
-                        continue
-                    if ref in chain:
-                        ids.append(m.id)
-                        chain.add(m.id)
-                    elif me is not None and m.author.id == me.id and (m.content or "").startswith(_BOT_REPLY_PREFIXES):
-                        ids.append(m.id)
-                        chain.add(m.id)
-            except (discord.Forbidden, discord.HTTPException) as e:
-                logger.warning(f"[CHATCOUNT] อ่านประวัติห้อง #{getattr(ch, 'name', '')} ไม่ได้: {e}")
-            total += await self._delete_many(ch, ids)
-        logger.info(f"[CHATCOUNT] รอบ #{rnd.get('id')} ลบข้อความใน Discord แล้ว {total} ข้อความ")
-
-    async def _delete_many(self, ch, ids: list[int]) -> int:
-        deleted = 0
-        for i in range(0, len(ids), 100):                    # bulk delete ได้ครั้งละไม่เกิน 100
-            chunk = ids[i:i + 100]
-            try:
-                await ch.delete_messages([discord.Object(id=x) for x in chunk])
-                deleted += len(chunk)
-                continue
-            except discord.Forbidden:
-                logger.warning(f"[CHATCOUNT] บอทไม่มีสิทธิ์ Manage Messages ใน #{getattr(ch, 'name', '')} → ลบได้เฉพาะข้อความของบอท")
-            except discord.HTTPException as e:
-                logger.warning(f"[CHATCOUNT] bulk delete ไม่สำเร็จ ({e}) → ลบทีละข้อความ")
-            for x in chunk:                                   # สำรอง: ลบทีละข้อความ (ข้อความของบอทเองลบได้เสมอ)
+            from realtime import AsyncRealtimeClient
+            realtime_url = _supabase_url.replace("https://", "wss://") + "/realtime/v1"
+            while True:
                 try:
-                    await ch.get_partial_message(x).delete()
-                    deleted += 1
-                except Exception:
-                    pass
-        return deleted
+                    rt_client = AsyncRealtimeClient(realtime_url, _supabase_key)
+                    await rt_client.connect()
+                    channel = rt_client.channel("users-changes")
+                    _loop = asyncio.get_running_loop()
 
-    async def _send_telegram(self, chat_id, text: str) -> tuple[bool, str]:
-        client = self.get_tg_client()
-        if client is None:
-            return False, "Telegram ยังไม่เชื่อมต่อ (บอทจะลองส่งใหม่เอง)"
-        target = self.norm_chat_id(chat_id)
-        if not target:
-            return False, "ยังไม่ได้เลือกกลุ่ม Telegram ปลายทาง"
+                    # [FIX] callback ต้องเป็นฟังก์ชันธรรมดา ไม่ใช่ async def
+                    # ไลบรารี realtime เรียกแบบ binding.callback(payload, ref) เฉยๆ ไม่ได้ await
+                    # ถ้าเขียนเป็น async def จะได้แค่ coroutine ที่ไม่มีใครรัน (RuntimeWarning: never awaited)
+                    def on_users_change(*_args, **_kwargs):
+                        logger.info("[EMPLOYEES] Realtime: ตรวจพบการเปลี่ยนแปลง → รีโหลด")
+                        asyncio.run_coroutine_threadsafe(load_employees_from_supabase(), _loop)
+                    await channel.on_postgres_changes(
+                        event="*",
+                        schema="public",
+                        table="users",
+                        callback=on_users_change
+                    ).subscribe()
+                    logger.info("[EMPLOYEES] Realtime: watching users...")
+                    while True:
+                        await asyncio.sleep(1)
+                except Exception as e:
+                    logger.error(f"[EMPLOYEES] Realtime disconnected: {e} → reconnect in 10s")
+                    await asyncio.sleep(10)
+        except ImportError:
+            logger.warning("[EMPLOYEES] ไม่มี realtime library → poll ทุก 30 วินาที")
+            while True:
+                await asyncio.sleep(30)
+                await load_employees_from_supabase()
+    asyncio.create_task(watch_employees_realtime())
 
-        if self._tg_cache_owner is not client:
-            self._tg_cache, self._tg_cache_owner = {}, client
-        entity = self._tg_cache.get(target)
+    # ⏱️ กันเหนียว: รีโหลดพนักงาน+กลุ่มทุก 5 นาที "เสมอ" — แม้ Realtime ต่อได้แต่ไม่มี event วิ่งมา
+    #    (เช่น ตาราง users ยังไม่ถูก add เข้า publication supabase_realtime ฝั่ง K36)
+    #    ข้อมูลจะตามทันภายใน 5 นาทีโดยไม่ต้องรีสตาร์ทบอท (ถ้า Realtime ทำงาน จะเห็นทันทีเหมือนเดิม)
+    async def poll_data_forever():
+        while True:
+            await asyncio.sleep(300)  # 5 นาที
+            try:
+                await load_employees_from_supabase()
+                await load_target_groups()
+            except Exception as e:
+                logger.error(f"[Poll] reload error: {e}")
+    asyncio.create_task(poll_data_forever())
+
+    # ดักการเปลี่ยนแปลงตาราง telegram_groups → รีโหลดรายชื่อกลุ่มทันที
+    async def watch_groups_realtime():
         try:
-            if entity is None:
-                async for d in client.iter_dialogs():
-                    self._tg_cache[self.norm_chat_id(d.id)] = d.entity
-                entity = self._tg_cache.get(target)
-            if entity is None:
-                return False, f"บัญชี Telegram นี้ไม่ได้อยู่ในกลุ่ม {chat_id}"
-            await client.send_message(entity, text, parse_mode=None, link_preview=False)
-            return True, ""
+            from realtime import AsyncRealtimeClient
+            realtime_url = _supabase_url.replace("https://", "wss://") + "/realtime/v1"
+            rt_client = AsyncRealtimeClient(realtime_url, _supabase_key)
+            await rt_client.connect()
+            channel = rt_client.channel("groups-changes")
+            _loop = asyncio.get_running_loop()
+
+            # [FIX] เหตุผลเดียวกับ on_users_change ข้างบน — ต้องเป็นฟังก์ชันธรรมดา
+            def on_groups_change(*_args, **_kwargs):
+                logger.info("[GROUPS] Realtime: ตรวจพบการเปลี่ยนแปลงใน telegram_groups → รีโหลดทันที")
+                asyncio.run_coroutine_threadsafe(load_target_groups(), _loop)
+            await channel.on_postgres_changes(
+                event="*",
+                schema="public",
+                table="telegram_groups",
+                callback=on_groups_change
+            ).subscribe()
+            logger.info("[GROUPS] Realtime: กำลัง watch ตาราง telegram_groups...")
+            await rt_client.listen()
         except Exception as e:
-            self._tg_cache.pop(target, None)
-            return False, f"ส่ง Telegram ไม่สำเร็จ: {type(e).__name__}: {e}"[:300]
+            logger.error(f"[GROUPS] Realtime error: {e}")
+    asyncio.create_task(watch_groups_realtime())
+
+    @client.on(events.NewMessage())
+    async def handler(event):
+        try:
+            # ตัดจบตั้งแต่บรรทัดแรก — event.chat_id มีมาให้ในตัว event อยู่แล้ว
+            # ไม่ต้องเรียก get_chat() (ซึ่งบางครั้งต้องยิงถาม Telegram กลับไป) ทุกข้อความ
+            chat_id = norm_chat_id(getattr(event, "chat_id", None))
+
+            group = GROUPS_BY_CHAT.get(chat_id)
+            if not group:
+                if not getattr(event, "is_private", False):
+                    await log_unknown_chat(event, chat_id)
+                return
+
+            group_name = group["name"]
+
+            text = event.message.text or ""
+            sender = getattr(event.message.sender, "username", None) or getattr(event.message.sender, "first_name", "unknown") if event.message.sender else "unknown"
+            logger.info(f"[Jun88] from {sender}: {text[:120]!r}")
+
+            # กลุ่มกะงาน → ข้าม ไม่ประมวลผล
+            # (ตัดฟีเจอร์เสียงขึ้นกะ + เตือนถ่ายรูปเช็คชื่อออกแล้ว)
+            if chat_id in SHIFT_CHAT_IDS:
+                return
+            # กลุ่มเช็คอินปกติ → parse และแจ้ง Discord
+            parsed = parse_message(text, group_name, chat_id)
+            if parsed:
+                logger.info(f"[PARSE OK] id={parsed['telegram_id']} activity={parsed['activity']}")
+                await on_activity(parsed)
+            elif "รหัสผู้ใช้" in text:
+                # กรณีกลับที่นั่งล้มเหลวเพราะบอทเทเลแกรมรีเซท
+                is_failed_return = any(kw in text for kw in RETURN_KEYWORDS) and "ไม่มีกิจกรรม" in text
+                if is_failed_return:
+                    tid_match = re.search(r"รหัสผู้ใช้[：:][^\d]*(\d+)", text)
+                    if tid_match:
+                        tid = tid_match.group(1)
+                        emp = EMPLOYEES.get(tid)
+                        if emp:
+                            # ปิด break session ใน Supabase เสมอ ไม่ว่าจะอยู่ใน _currently_out หรือไม่
+                            # (กรณีบอท Telegram รีเซทข้ามตี 1 ทำให้ _currently_out ว่าง)
+                            await supabase_close_break(emp["name"], None)
+                            if tid in _currently_out:
+                                await discord_bot.send_notification(
+                                    emp["discord_id"], emp["name"], "กลับที่นั่ง", True, group_name,
+                                )
+                                _currently_out.pop(tid, None)
+                            logger.info(f"[FAILED RETURN] {emp['name']} — closed break session (bot reset case)")
+                else:
+                    logger.warning(f"[PARSE FAIL] Has รหัสผู้ใช้ but parse failed. Full text: {text!r}")
+        except Exception as e:
+            logger.error(f"Error handling Telegram message: {e}")
+
+    logger.info(f"[GROUPS] เริ่มฟัง {len(GROUPS_BY_CHAT)} กลุ่ม (จับคู่ด้วย chat_id)")
+    if not LOG_UNKNOWN_GROUPS:
+        logger.info("[GROUPS] ปิด log กลุ่มที่ไม่ได้ตั้งค่าไว้ — ถ้าจะหา chat_id ใหม่ ตั้ง env LOG_UNKNOWN_GROUPS=1 แล้วรีสตาร์ท")
+    try:
+        await client.run_until_disconnected()
+    finally:
+        if TG_CLIENT is client:
+            TG_CLIENT = None
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Main orchestrator
+# ---------------------------------------------------------------------------
+async def on_activity(parsed: dict):
+    emp = EMPLOYEES.get(parsed["telegram_id"])
+    if not emp:
+        logger.warning(f"Unknown Telegram ID: {parsed['telegram_id']}")
+        return
+
+    tid = parsed["telegram_id"]
+
+    # Track activity state
+    if parsed["is_return"]:
+        _currently_out.pop(tid, None)
+        # ปิด break session ใน Supabase ด้วยเวลาจาก Telegram
+        await supabase_close_break(emp["name"], parsed.get("timestamp"))
+    else:
+        _currently_out[tid] = parsed.get("chat_id", "")
+        # เปิด break session ใน Supabase ด้วยเวลาจาก Telegram
+        await supabase_open_break(emp["name"], parsed["activity"], parsed.get("timestamp"))
+
+    await discord_bot.wait_until_ready_event()
+    sent, channel = await discord_bot.send_notification(
+        emp["discord_id"],
+        emp["name"],
+        parsed["activity"],
+        parsed["is_return"],
+        parsed["group_name"],
+        parsed.get("timestamp"),
+    )
+    status = f"sent to #{channel}" if sent else "not sent (not in voice channel)"
+    logger.info(f"{emp['name']} [{parsed['activity']}] → Discord {status}")
+
+
+async def start_telegram_with_reconnect(on_activity):
+    """Wrap start_telegram with auto-reconnect on disconnect."""
+    backoff = 5
+    first_run = True
+    while True:
+        try:
+            await start_telegram(on_activity)
+            # Telegram disconnected cleanly
+            await discord_bot.send_status(f"🟡 **Telegram disconnected** — reconnecting in {backoff}s...")
+            logger.warning("Telegram disconnected — reconnecting in %ds...", backoff)
+        except AuthKeyDuplicatedError:
+            # Session ถูกใช้จาก 2 IP พร้อมกัน (Railway overlap) — รอให้ instance เก่าตายก่อน
+            wait = 120
+            await discord_bot.send_status(
+                f"🔴 **Telegram error** — `AuthKeyDuplicatedError` (session conflict)\n"
+                f"> รอ {wait}s ให้ instance เก่าตายก่อน..."
+            )
+            logger.error("AuthKeyDuplicatedError — waiting %ds for old instance to die...", wait)
+            await asyncio.sleep(wait)
+            backoff = 5  # reset backoff หลังจาก conflict หาย
+            await discord_bot.send_status("🔄 **Telegram reconnecting...**")
+            continue
+        except Exception as e:
+            await discord_bot.send_status(f"🔴 **Telegram error** — `{type(e).__name__}` reconnecting in {backoff}s...")
+            logger.error("Telegram error: %s — reconnecting in %ds...", e, backoff)
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 300)  # cap at 5 minutes
+        if not first_run:
+            await discord_bot.send_status("🔄 **Telegram reconnecting...**")
+        first_run = False
+
+
+async def start_discord_with_reconnect(token: str):
+    """Wrap discord bot start with auto-reconnect on disconnect."""
+    backoff = 5
+    while True:
+        try:
+            await discord_bot.start(token)
+            logger.warning("Discord disconnected — reconnecting in %ds...", backoff)
+        except Exception as e:
+            logger.error("Discord error: %s — reconnecting in %ds...", e, backoff)
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 300)
+
+
+async def main():
+    discord_token = os.environ.get("DISCORD_BOT_TOKEN", "")
+    if not discord_token:
+        logger.warning("Missing DISCORD_BOT_TOKEN. Discord bot disabled.")
+        discord_task = asyncio.create_task(asyncio.sleep(0))
+    else:
+        discord_task = asyncio.create_task(start_discord_with_reconnect(discord_token))
+
+    telegram_task = asyncio.create_task(start_telegram_with_reconnect(on_activity))
+
+    tasks = [discord_task, telegram_task]
+    if discord_token and chat_count is not None:
+        tasks.append(asyncio.create_task(chat_count.run()))
+    else:
+        logger.warning("[CHATCOUNT] นับแชทปิดอยู่ (ต้องมีทั้ง DISCORD_BOT_TOKEN และ SUPABASE_URL/KEY)")
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
