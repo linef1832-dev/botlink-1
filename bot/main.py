@@ -23,6 +23,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bot")
 
+# 🧹 ลบข้อความแจ้งพักใน Discord หลัง "กลับที่นั่ง" กี่วินาที (ลบทั้งข้อความ "ไป..." และ "กลับที่นั่งแล้ว")
+#    ตั้งผ่าน env BREAK_MSG_DELETE_AFTER — 0 = ลบทันที, -1 = ไม่ลบ (แบบเดิม)
+try:
+    BREAK_MSG_DELETE_AFTER = float(os.environ.get("BREAK_MSG_DELETE_AFTER", "60"))
+except ValueError:
+    BREAK_MSG_DELETE_AFTER = 60.0
+
 # ---------------------------------------------------------------------------
 # Supabase client
 # ---------------------------------------------------------------------------
@@ -605,6 +612,19 @@ class ActivityBot(discord.Client):
             return None
         return max(time_by_ch, key=lambda ch: time_by_ch[ch])
 
+    async def _find_last_activity_msg(self, channel, name: str):
+        """หาข้อความแจ้ง "**ชื่อ** ไป..." ล่าสุดของบอทในห้อง (ใช้ตอนบอทรีสตาร์ทแล้วไม่มีข้อมูลในความจำ)"""
+        needle = f"**{name}** ไป"
+        try:
+            async for m in channel.history(limit=100):
+                if m.author.id == self.user.id and needle in (m.content or ""):
+                    return m
+                if m.author.id == self.user.id and f"**{name}** กลับที่นั่งแล้ว" in (m.content or ""):
+                    return None   # เจอข้อความกลับที่นั่งก่อน = ข้อความไปล่าสุดถูกจับคู่ไปแล้ว
+        except Exception as e:
+            logger.warning(f"ค้นข้อความแจ้งพักของ {name} ไม่ได้: {e}")
+        return None
+
     async def send_notification(self, discord_user_id: str, name: str, activity: str,
                                  is_return: bool, group_name: str, timestamp: str | None = None) -> tuple[bool, str | None]:
         emoji = get_emoji(activity, is_return)
@@ -700,11 +720,22 @@ class ActivityBot(discord.Client):
                 if is_return:
                     # reply กลับไปที่ message กิจกรรมล่าสุด (ถ้ามี)
                     ref_msg = self._last_activity_message.get(member.id)
+                    if ref_msg is None:
+                        # บอทเพิ่งรีสตาร์ท (ความจำหาย) → หาข้อความ "ไป..." ล่าสุดของคนนี้จากประวัติห้อง
+                        ref_msg = await self._find_last_activity_msg(notify_vc, name)
                     if ref_msg and ref_msg.channel.id == notify_vc.id:
                         sent_msg = await ref_msg.reply(message)
                     else:
                         sent_msg = await notify_vc.send(message)
                     self._last_activity_message.pop(member.id, None)
+                    # 🧹 กลับที่นั่งแล้ว → ลบชุดข้อความ (แจ้งไป + แจ้งกลับ) ออกจากห้อง หลังหน่วงเวลาให้เห็นสักครู่
+                    if BREAK_MSG_DELETE_AFTER >= 0:
+                        for msg in (ref_msg, sent_msg):
+                            if msg is not None:
+                                try:
+                                    await msg.delete(delay=BREAK_MSG_DELETE_AFTER)
+                                except Exception as e:
+                                    logger.warning(f"ลบข้อความแจ้งพักไม่สำเร็จ: {e}")
                 else:
                     sent_msg = await notify_vc.send(message)
                     self._last_notified_channel[member.id] = notify_vc.id
@@ -730,6 +761,126 @@ chat_count: ChatCount | None = (
               norm_chat_id, load_employees_from_supabase)
     if supabase else None
 )
+
+
+# ── 🧹 ล้างข้อความแจ้งพักเก่า ─────────────────────────────────────────
+_BREAK_MSG_RE = re.compile(r"\*\*(.+?)\*\* (กลับที่นั่งแล้ว|ไป)")
+KEEP_OPEN_BREAK_HOURS = 3   # ข้อความ "ไป..." ที่ยังไม่มีคู่ "กลับที่นั่ง" และใหม่กว่านี้ = อาจยังพักอยู่ → เก็บไว้
+
+
+async def _purge_break_messages(channel, since: datetime) -> int:
+    """ลบข้อความแจ้งพักของบอทในห้องเดียว คืนจำนวนที่ลบ"""
+    me = discord_bot.user
+    now = datetime.now(timezone.utc)
+    returned: set[str] = set()
+    to_delete: list[discord.Message] = []
+    async for m in channel.history(after=since, limit=None, oldest_first=False):   # ใหม่ → เก่า (since=None = ทั้งหมด)
+        if me is None or m.author.id != me.id:
+            continue
+        content = m.content or ""
+        if "\n> 🕐 " not in content or "📌" not in content:
+            continue                                   # ไม่ใช่ข้อความแจ้งพัก (เช่น ข้อความนับแชท/สถานะ)
+        mt = _BREAK_MSG_RE.search(content)
+        if not mt:
+            continue
+        name, kind = mt.group(1), mt.group(2)
+        if kind == "กลับที่นั่งแล้ว":
+            to_delete.append(m)
+            returned.add(name)
+        elif name in returned:                         # "ไป..." ที่กลับมาแล้ว
+            to_delete.append(m)
+            returned.discard(name)
+        elif (now - m.created_at).total_seconds() > KEEP_OPEN_BREAK_HOURS * 3600:
+            to_delete.append(m)                        # ค้างนานแล้ว ถือว่าจบไปแล้ว
+        # นอกนั้น = อาจยังพักอยู่ → ไม่ลบ
+
+    deleted = 0
+    bulk_cut = now - timedelta(days=13, hours=12)      # bulk delete ได้เฉพาะข้อความอายุไม่เกิน 14 วัน
+    recent = [m for m in to_delete if m.created_at > bulk_cut]
+    old = [m for m in to_delete if m.created_at <= bulk_cut]
+    for i in range(0, len(recent), 100):
+        chunk = recent[i:i + 100]
+        try:
+            await channel.delete_messages(chunk)
+            deleted += len(chunk)
+        except (discord.Forbidden, discord.HTTPException):
+            old.extend(chunk)                          # ไม่มีสิทธิ์ Manage Messages → ลบทีละข้อความ (ข้อความบอทเองลบได้)
+    for m in old:
+        try:
+            await m.delete()
+            deleted += 1
+        except Exception:
+            pass
+    return deleted
+
+
+_purge_running = False
+
+
+@discord_bot.tree.command(name="clear_break_messages", description="ลบข้อความแจ้งพัก (ไป.../กลับที่นั่งแล้ว) ของบอทในทุกห้อง")
+@discord.app_commands.describe(days="ย้อนหลังกี่วัน — เว้นว่าง = ลบทั้งหมดตั้งแต่แรก")
+@discord.app_commands.default_permissions(manage_messages=True)
+async def clear_break_messages_command(interaction: discord.Interaction, days: int = 0):
+    global _purge_running
+    if _purge_running:
+        await interaction.response.send_message("⏳ กำลังลบรอบก่อนหน้าอยู่ รอให้เสร็จก่อนครับ", ephemeral=True)
+        return
+    days = max(0, int(days))
+    since = datetime.now(timezone.utc) - timedelta(days=days) if days else None
+    scope = f"ย้อนหลัง {days} วัน" if days else "ทั้งหมดตั้งแต่แรก"
+    await interaction.response.send_message(
+        f"🧹 เริ่มลบข้อความแจ้งพัก ({scope}) ในทุกห้องแล้ว\n"
+        f"ข้อความเก่ากว่า 14 วัน Discord ให้ลบได้ทีละข้อความ อาจใช้เวลานาน — เสร็จแล้วบอทจะแจ้งในห้องนี้",
+        ephemeral=True,
+    )
+    _purge_running = True
+    asyncio.create_task(_run_purge(interaction, since, scope))
+
+
+async def _run_purge(interaction: discord.Interaction, since, scope: str):
+    global _purge_running
+    started = time_module.time()
+    total, rooms, skipped = 0, 0, 0
+    sem = asyncio.Semaphore(4)                         # ลบพร้อมกันได้หลายห้อง (rate limit ของ Discord แยกตามห้อง)
+
+    async def one(ch, me_member):
+        nonlocal total, rooms, skipped
+        perms = ch.permissions_for(me_member)
+        if not (perms.view_channel and perms.read_message_history):
+            skipped += 1
+            return
+        async with sem:
+            try:
+                n = await _purge_break_messages(ch, since)
+            except Exception as e:
+                logger.warning(f"[CLEAR] #{ch.name}: {e}")
+                skipped += 1
+                return
+        if n:
+            total += n
+            rooms += 1
+            logger.info(f"[CLEAR] ลบข้อความแจ้งพัก {n} ข้อความใน #{ch.name}")
+
+    try:
+        guilds = [interaction.guild] if interaction.guild else discord_bot.guilds
+        jobs = [one(ch, g.me) for g in guilds for ch in [*g.text_channels, *g.voice_channels]]
+        await asyncio.gather(*jobs)
+    finally:
+        _purge_running = False
+
+    mins = (time_module.time() - started) / 60
+    msg = (f"🧹 ลบข้อความแจ้งพักเสร็จแล้ว ({scope}): **{total}** ข้อความ จาก {rooms} ห้อง · ใช้เวลา {mins:.1f} นาที\n"
+           f"ข้อความ \"ไป...\" ที่ยังไม่กลับที่นั่งภายใน {KEEP_OPEN_BREAK_HOURS} ชม.ล่าสุด เก็บไว้ให้")
+    if skipped:
+        msg += f"\n⚠️ ข้าม {skipped} ห้องที่บอทอ่านประวัติไม่ได้"
+    logger.info(f"[CLEAR] เสร็จ: {total} ข้อความ {rooms} ห้อง {mins:.1f} นาที")
+    try:
+        if time_module.time() - started < 14 * 60:
+            await interaction.followup.send(msg, ephemeral=True)     # token ของคำสั่งใช้ได้ 15 นาที
+        elif interaction.channel is not None:
+            await interaction.channel.send(f"{interaction.user.mention} {msg}", delete_after=600)
+    except Exception as e:
+        logger.warning(f"[CLEAR] แจ้งผลไม่สำเร็จ: {e}")
 
 
 @discord_bot.tree.command(name="status", description="ดูสถานะบอทและห้องทำงานของพนักงาน")
