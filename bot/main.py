@@ -22,6 +22,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("bot")
+# 🔒 ปิด log ระดับ INFO ของไลบรารีที่พิมพ์ API key ของ Supabase ออกมา (realtime พิมพ์ URL ที่มี apikey เต็มๆ)
+#    และ httpx ที่พิมพ์ทุก request (นับแชทเช็คทุก 15 วิ ทำให้ log รก) — error/warning ยังแสดงตามปกติ
+for _noisy in ("realtime", "realtime._async.client", "httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # 🧹 ลบข้อความแจ้งพักใน Discord หลัง "กลับที่นั่ง" กี่วินาที (ลบทั้งข้อความ "ไป..." และ "กลับที่นั่งแล้ว")
 #    ตั้งผ่าน env BREAK_MSG_DELETE_AFTER — 0 = ลบทันที, -1 = ไม่ลบ (แบบเดิม)
@@ -834,13 +838,25 @@ async def _purge_break_messages(channel, since: datetime) -> int:
 
 
 _purge_running = False
+# role ที่ใช้ /clear_break_messages ได้ (ชื่อ role คั่นด้วย , ไม่สนตัวพิมพ์ใหญ่/เล็ก)
+CLEAR_ALLOWED_ROLES = {x.strip().lower() for x in os.environ.get("CLEAR_ALLOWED_ROLES", "PTT").split(",") if x.strip()}
 
 
 @discord_bot.tree.command(name="clear_break_messages", description="ลบข้อความแจ้งพัก (ไป.../กลับที่นั่งแล้ว) ของบอทในทุกห้อง")
 @discord.app_commands.describe(days="ย้อนหลังกี่วัน — เว้นว่าง = ลบทั้งหมดตั้งแต่แรก")
-@discord.app_commands.default_permissions(manage_messages=True)
 async def clear_break_messages_command(interaction: discord.Interaction, days: int = 0):
     global _purge_running
+    # สิทธิ์: role ที่ตั้งใน env CLEAR_ALLOWED_ROLES (ค่าเริ่มต้น "PTT") หรือคนที่มีสิทธิ์ Manage Messages
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    role_names = {r.name.strip().lower() for r in (member.roles if member else [])}
+    allowed_by_role = bool(role_names & CLEAR_ALLOWED_ROLES)
+    allowed_by_perm = bool(member and member.guild_permissions.manage_messages)
+    if not (allowed_by_role or allowed_by_perm):
+        await interaction.response.send_message(
+            "❌ คำสั่งนี้ใช้ได้เฉพาะ role " + ", ".join(sorted(CLEAR_ALLOWED_ROLES)).upper() + " หรือคนที่มีสิทธิ์จัดการข้อความ",
+            ephemeral=True,
+        )
+        return
     if _purge_running:
         await interaction.response.send_message("⏳ กำลังลบรอบก่อนหน้าอยู่ รอให้เสร็จก่อนครับ", ephemeral=True)
         return
