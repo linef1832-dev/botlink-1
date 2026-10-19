@@ -528,6 +528,20 @@ class ActivityBot(discord.Client):
     async def wait_until_ready_event(self):
         await self._ready_event.wait()
 
+    # ห้อง Discord เพิ่ม/ลบ/เปลี่ยนชื่อ → ส่งรายชื่อห้องใหม่ให้หน้าเว็บนับแชททันที
+    async def on_guild_channel_create(self, channel):
+        if chat_count is not None:
+            chat_count.request_channel_publish()
+
+    async def on_guild_channel_delete(self, channel):
+        if chat_count is not None:
+            chat_count.request_channel_publish()
+
+    async def on_guild_channel_update(self, before, after):
+        if chat_count is not None and (before.name != after.name or before.category_id != after.category_id
+                                       or before.position != after.position):
+            chat_count.request_channel_publish()
+
     async def on_message(self, message: discord.Message):
         # 📊 นับแชท — รับรีพลายตอบข้อความคำถาม (ดู bot/chat_count.py)
         if chat_count is None:
