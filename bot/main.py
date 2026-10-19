@@ -15,6 +15,8 @@ from discord import ChannelType
 import aiohttp
 from supabase import create_client, Client as SupabaseClient
 
+from chat_count import ChatCount
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -450,6 +452,8 @@ class ActivityBot(discord.Client):
         intents = discord.Intents.default()
         intents.members = True
         intents.voice_states = True
+        # 📊 นับแชท ต้องอ่านข้อความรีพลาย → ต้องเปิด MESSAGE CONTENT INTENT ใน Discord Developer Portal ด้วย
+        intents.message_content = True
         super().__init__(intents=intents)
         self._ready_event = asyncio.Event()
         self.tree = discord.app_commands.CommandTree(self)
@@ -523,6 +527,15 @@ class ActivityBot(discord.Client):
 
     async def wait_until_ready_event(self):
         await self._ready_event.wait()
+
+    async def on_message(self, message: discord.Message):
+        # 📊 นับแชท — รับรีพลายตอบข้อความคำถาม (ดู bot/chat_count.py)
+        if chat_count is None:
+            return
+        try:
+            await chat_count.handle_message(message)
+        except Exception as e:
+            logger.error(f"[CHATCOUNT] on_message error: {e}")
 
     async def find_member(self, discord_user_id: str) -> tuple[discord.Guild, discord.Member] | tuple[None, None]:
         for guild in self.guilds:
@@ -694,6 +707,16 @@ class ActivityBot(discord.Client):
 
 discord_bot = ActivityBot()
 
+# Telethon client ที่ต่ออยู่ตอนนี้ (ใช้ส่งสรุปนับแชทเข้ากลุ่ม Telegram ด้วยบัญชีเดียวกัน)
+TG_CLIENT: TelegramClient | None = None
+
+# 📊 นับแชท — ตั้งค่าในหน้า K36 แท็บ "นับแชท"
+chat_count: ChatCount | None = (
+    ChatCount(discord_bot, supabase, lambda: EMPLOYEES, lambda: TG_CLIENT,
+              norm_chat_id, load_employees_from_supabase)
+    if supabase else None
+)
+
 
 @discord_bot.tree.command(name="status", description="ดูสถานะบอทและห้องทำงานของพนักงาน")
 async def status_command(interaction: discord.Interaction):
@@ -810,6 +833,8 @@ async def start_telegram(on_activity):
 
     me = await client.get_me()
     logger.info(f"Telegram connected as: {me.username or me.first_name}")
+    global TG_CLIENT
+    TG_CLIENT = client
     await discord_bot.wait_until_ready_event()
     # โหลดกลุ่ม Telegram จาก Supabase K36
     await load_target_groups()
@@ -951,6 +976,8 @@ async def start_telegram(on_activity):
     try:
         await client.run_until_disconnected()
     finally:
+        if TG_CLIENT is client:
+            TG_CLIENT = None
         try:
             await client.disconnect()
         except Exception:
@@ -1046,7 +1073,13 @@ async def main():
 
     telegram_task = asyncio.create_task(start_telegram_with_reconnect(on_activity))
 
-    await asyncio.gather(discord_task, telegram_task, return_exceptions=True)
+    tasks = [discord_task, telegram_task]
+    if discord_token and chat_count is not None:
+        tasks.append(asyncio.create_task(chat_count.run()))
+    else:
+        logger.warning("[CHATCOUNT] นับแชทปิดอยู่ (ต้องมีทั้ง DISCORD_BOT_TOKEN และ SUPABASE_URL/KEY)")
+
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":
