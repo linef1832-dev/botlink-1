@@ -46,9 +46,9 @@ DEFAULT_ASK = (
     "รีพลายข้อความนี้ บอกชื่อเว็บ + จำนวนแชท\n"
     "ตัวอย่าง: `MK8 15`  `JL69 3`"
 )
-DEFAULT_REPORT = "📊 นับแชท {วันที่} {รอบ}\n\n{รายการ}\n\nรวม {รวม} แชท"
-DEFAULT_LINE = "{เว็บ} = {จำนวน}"
-DEFAULT_MISSING = "{เว็บ} = ยังไม่ตอบ"
+DEFAULT_REPORT = "ตรวจสอบจำนวนแชท{รอบ}\nเวลา {เวลา} น\n\n{รายการ}"
+DEFAULT_LINE = "{สี}เว็บ {เว็บ}{สี}\nไลน์หลัก {จำนวน} แชท\n"
+DEFAULT_MISSING = "{สี}เว็บ {เว็บ}{สี}\nไลน์หลัก ยังไม่ตอบ\n"
 
 MessageableChannel = (discord.TextChannel, discord.VoiceChannel, discord.Thread)
 
@@ -98,6 +98,20 @@ def parse_reply(text: str, web_names: list[str]) -> tuple[dict[str, int], list[t
     return found, invalid
 
 
+def web_emoji_map(webs: list) -> dict[str, str]:
+    """{ชื่อเว็บ: อีโมจิประจำเว็บ} ใช้แทน {สี} ในแพทเทิร์น"""
+    out = {}
+    for w in webs or []:
+        if isinstance(w, dict) and w.get("name"):
+            out[str(w["name"]).strip()] = str(w.get("emoji") or "").strip()
+    return out
+
+
+def thai_time(t) -> str:
+    """'12:00' → '12.00' (รูปแบบเวลาแบบไทย)"""
+    return str(t or "").replace(":", ".")
+
+
 def render(template: str, values: dict) -> str:
     out = template or ""
     for k, v in values.items():
@@ -143,7 +157,8 @@ def evaluate_round(rnd: dict, answers: list[dict]) -> dict:
     return {"values": values, "conflicts": conflicts, "missing": missing, "complete": complete}
 
 
-def build_report(rnd: dict, ev: dict, force: bool) -> str:
+def build_report(rnd: dict, ev: dict, force: bool, emojis: dict | None = None) -> str:
+    emojis = emojis or {}
     expected = list(rnd.get("expected_webs") or [])
     line_t = rnd.get("line_template") or DEFAULT_LINE
     miss_t = rnd.get("missing_template") or DEFAULT_MISSING
@@ -163,6 +178,7 @@ def build_report(rnd: dict, ev: dict, force: bool) -> str:
             answered += 1
             lines.append(render(line_t, {
                 "เว็บ": web,
+                "สี": emojis.get(web, ""),
                 "จำนวน": cnt,
                 "ห้อง": a.get("channel_name") or "",
                 "ผู้ตอบ": a.get("staff_name") or a.get("discord_name") or "",
@@ -170,12 +186,12 @@ def build_report(rnd: dict, ev: dict, force: bool) -> str:
         else:
             still_missing.append(web)
             if miss_t.strip():
-                lines.append(render(miss_t, {"เว็บ": web}))
+                lines.append(render(miss_t, {"เว็บ": web, "สี": emojis.get(web, "")}))
 
     return render(rnd.get("report_template") or DEFAULT_REPORT, {
         "วันที่": thai_date(rnd["round_date"]),
         "รอบ": rnd.get("label") or rnd.get("round_time") or "",
-        "เวลา": rnd.get("round_time") or "",
+        "เวลา": thai_time(rnd.get("round_time")),
         "รายการ": "\n".join(lines),
         "รวม": total,
         "ตอบแล้ว": answered,
@@ -188,7 +204,7 @@ def build_ask(rnd: dict) -> str:
     return render(rnd.get("ask_template") or DEFAULT_ASK, {
         "รอบ": rnd.get("label") or rnd.get("round_time") or "",
         "วันที่": thai_date(rnd["round_date"]),
-        "เวลา": rnd.get("round_time") or "",
+        "เวลา": thai_time(rnd.get("round_time")),
         "เว็บทั้งหมด": ", ".join(rnd.get("expected_webs") or []),
     }).strip()[:1900]
 
@@ -554,7 +570,7 @@ class ChatCount:
             if not ev["complete"] and not force:
                 return
 
-            text = build_report(rnd, ev, force)
+            text = build_report(rnd, ev, force, web_emoji_map(self.webs))
             ok, err = await self._send_telegram(rnd.get("telegram_chat_id"), text)
             if not ok:
                 if rnd.get("send_error") != err:
