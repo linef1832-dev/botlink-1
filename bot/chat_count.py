@@ -13,6 +13,8 @@
        - เว็บเดียวกันถูกตอบจาก 2 ห้อง = ตอบซ้อน → รอแอดมินเลือกค่าที่ถูกในเว็บ
     4. ครบทุกเว็บ (หรือแอดมินกด "ส่งเท่าที่มี") → จัดข้อความตามแพทเทิร์น
        → ส่งเข้ากลุ่ม Telegram ผ่านบัญชี Telethon ตัวเดียวกับที่บอทใช้ดักเช็คอินอยู่แล้ว
+    5. ส่ง Telegram สำเร็จ → ลบข้อความคำถาม + รีพลายของพนักงาน + ข้อความตอบกลับของบอท ออกจากห้อง Discord
+       (บอทต้องมีสิทธิ์ Manage Messages ในห้อง ไม่งั้นลบได้แค่ข้อความของบอทเอง)
 """
 from __future__ import annotations
 
@@ -469,7 +471,11 @@ class ChatCount:
             return False
         rnd = self.rounds.get(rid)
         if not rnd or rnd.get("status") != "open":
-            await message.reply("ℹ️ รอบนี้ปิดไปแล้วครับ", mention_author=False)
+            # ข้อความคำถามถูกลบไปแล้วหลังส่งสรุป → แจ้งสั้นๆ แล้วลบตัวเองทิ้งใน 10 วินาที
+            try:
+                await message.reply("ℹ️ รอบนี้ส่งสรุปไปแล้วครับ", mention_author=False, delete_after=10)
+            except Exception:
+                pass
             return True
 
         found, invalid = parse_reply(message.content or "", self.web_names)
@@ -587,19 +593,58 @@ class ChatCount:
             rnd["status"] = "sent"
             logger.info(f"[CHATCOUNT] รอบ #{rid} ส่งสรุปเข้า Telegram แล้ว ({'ส่งเท่าที่มี' if force else 'ครบ'})")
 
-        await self._mark_closed_in_discord(rnd, force and not ev["complete"])
+        try:
+            await self._cleanup_discord(rnd)
+        except Exception as e:
+            logger.error(f"[CHATCOUNT] cleanup discord error: {e}")
 
-    async def _mark_closed_in_discord(self, rnd: dict, partial: bool) -> None:
-        note = "\n\n🔒 ปิดรอบแล้ว (ส่งเท่าที่มี)" if partial else "\n\n✅ ครบแล้ว ส่งสรุปเรียบร้อย"
-        content = (build_ask(rnd) + note)[:2000]
+    async def _cleanup_discord(self, rnd: dict) -> None:
+        """ลบข้อความคำถาม + รีพลายของพนักงาน + ข้อความตอบกลับของบอท ของรอบนี้ออกจากทุกห้อง"""
+        me = self.bot.user
+        total = 0
         for msg in rnd.get("messages") or []:
             ch = self._resolve_channel(msg.get("channel_id"))
             if not ch:
                 continue
             try:
-                await ch.get_partial_message(int(msg["message_id"])).edit(content=content)
-            except Exception:
-                pass
+                qid = int(msg["message_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            ids = [qid]
+            reply_ids: set[int] = set()
+            try:
+                # ไล่ข้อความหลังคำถาม: รีพลายที่ตอบคำถาม + ข้อความบอทที่ตอบรีพลายเหล่านั้น (✅ รับแล้ว / ❌ ชื่อเว็บผิด)
+                async for m in ch.history(after=discord.Object(id=qid), limit=None, oldest_first=True):
+                    ref = m.reference.message_id if m.reference else None
+                    if ref == qid:
+                        ids.append(m.id)
+                        reply_ids.add(m.id)
+                    elif ref in reply_ids and me is not None and m.author.id == me.id:
+                        ids.append(m.id)
+            except (discord.Forbidden, discord.HTTPException) as e:
+                logger.warning(f"[CHATCOUNT] อ่านประวัติห้อง #{getattr(ch, 'name', '')} ไม่ได้: {e}")
+            total += await self._delete_many(ch, ids)
+        logger.info(f"[CHATCOUNT] รอบ #{rnd.get('id')} ลบข้อความใน Discord แล้ว {total} ข้อความ")
+
+    async def _delete_many(self, ch, ids: list[int]) -> int:
+        deleted = 0
+        for i in range(0, len(ids), 100):                    # bulk delete ได้ครั้งละไม่เกิน 100
+            chunk = ids[i:i + 100]
+            try:
+                await ch.delete_messages([discord.Object(id=x) for x in chunk])
+                deleted += len(chunk)
+                continue
+            except discord.Forbidden:
+                logger.warning(f"[CHATCOUNT] บอทไม่มีสิทธิ์ Manage Messages ใน #{getattr(ch, 'name', '')} → ลบได้เฉพาะข้อความของบอท")
+            except discord.HTTPException as e:
+                logger.warning(f"[CHATCOUNT] bulk delete ไม่สำเร็จ ({e}) → ลบทีละข้อความ")
+            for x in chunk:                                   # สำรอง: ลบทีละข้อความ (ข้อความของบอทเองลบได้เสมอ)
+                try:
+                    await ch.get_partial_message(x).delete()
+                    deleted += 1
+                except Exception:
+                    pass
+        return deleted
 
     async def _send_telegram(self, chat_id, text: str) -> tuple[bool, str]:
         client = self.get_tg_client()
