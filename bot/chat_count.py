@@ -469,12 +469,42 @@ class ChatCount:
         logger.info(f"[CHATCOUNT] ส่งคำถามรอบ #{rid} แล้ว {len(messages)} ห้อง" + (f" · ผิดพลาด {errors}" if errors else ""))
 
     # ---------------- รับรีพลาย ----------------
+    async def _round_from_chain(self, message: discord.Message) -> int | None:
+        """ไล่สายรีพลายขึ้นไป (สูงสุด 3 ทอด) หาคำถามของรอบ
+        เช่น พนักงานรีพลายข้อความ "❌ ชื่อเว็บไม่ถูกต้อง" ของบอท → ข้อความผิดของเขา → คำถาม
+        ใช้ได้แม้บอทเพิ่งรีสตาร์ท (ความจำหาย) — ดึงข้อความจาก Discord เฉพาะตอนที่ทอดบนเป็นข้อความตอบของบอทเท่านั้น"""
+        ref = message.reference
+        target = ref.resolved if isinstance(getattr(ref, "resolved", None), discord.Message) else None
+        me = self.bot.user
+        for _ in range(3):
+            if target is None:
+                return None
+            if target.id in self.msg_map:
+                return self.msg_map[target.id]
+            nxt = target.reference.message_id if target.reference else None
+            if not nxt:
+                return None
+            if nxt in self.msg_map:
+                return self.msg_map[nxt]
+            is_our_reply = me is not None and target.author.id == me.id and (target.content or "").startswith(_BOT_REPLY_PREFIXES)
+            if not is_our_reply:
+                return None                       # รีพลายเรื่องอื่น (เช่น ข้อความแจ้งพัก) → ไม่เกี่ยว
+            try:
+                target = await message.channel.fetch_message(nxt)
+            except Exception:
+                return None
+        return None
+
     async def handle_message(self, message: discord.Message) -> bool:
         if message.author.bot or not message.reference or not message.reference.message_id:
             return False
         rid = self.msg_map.get(int(message.reference.message_id))
         if not rid:
-            return False
+            # ไม่ได้รีพลายคำถามตรงๆ → อาจรีพลายข้อความตอบกลับของบอท (✅ รับแล้ว / ❌ ชื่อเว็บผิด) หรือคำตอบของเพื่อน
+            rid = await self._round_from_chain(message)
+            if not rid:
+                return False
+        self.msg_map[int(message.id)] = rid      # คนอื่นรีพลายต่อข้อความนี้ ก็นับเข้ารอบเดียวกัน
         rnd = self.rounds.get(rid)
         if not rnd or rnd.get("status") != "open":
             # ข้อความคำถามถูกลบไปแล้วหลังส่งสรุป → แจ้งสั้นๆ แล้วลบตัวเองทิ้งใน 10 วินาที
@@ -555,8 +585,9 @@ class ChatCount:
         try:
             if accepted:
                 await message.add_reaction("✅")
-            await message.reply("\n".join(lines), mention_author=False,
-                                allowed_mentions=discord.AllowedMentions.none())
+            ack = await message.reply("\n".join(lines), mention_author=False,
+                                      allowed_mentions=discord.AllowedMentions.none())
+            self.msg_map[int(ack.id)] = rid      # รีพลายตอบข้อความ ✅ ของบอทได้เลย ไม่ต้องเลื่อนหาคำถาม
         except Exception as e:
             logger.warning(f"[CHATCOUNT] reply error: {e}")
 
