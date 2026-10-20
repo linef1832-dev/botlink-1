@@ -506,6 +506,17 @@ class ActivityBot(discord.Client):
 
     async def on_ready(self):
         logger.info(f"Discord bot ready: {self.user}")
+        now = time_module.time()
+        count = 0
+        for guild in self.guilds:
+            for channel in guild.voice_channels:
+                for member in channel.members:
+                    if str(channel.id) not in DESTINATION_CHANNEL_IDS:
+                        self._voice_join_time[member.id] = (channel.id, now)
+                        count += 1
+        if count:
+            logger.info(f"Snapshot: found {count} member(s) already in voice channels")
+        self._ready_event.set()          # ⚠️ ต้องถึงบรรทัดนี้เสมอ — งาน Telegram/นับแชท รอสัญญาณนี้อยู่
         await self._sync_commands()
         if BREAK_MSG_DELETE_AFTER >= 0 and not getattr(self, "_sweeper_started", False):
             self._sweeper_started = True
@@ -552,17 +563,6 @@ class ActivityBot(discord.Client):
             except Exception as e:
                 logger.warning(f"[SWEEP] error: {e}")
             await asyncio.sleep(120)
-        now = time_module.time()
-        count = 0
-        for guild in self.guilds:
-            for channel in guild.voice_channels:
-                for member in channel.members:
-                    if str(channel.id) not in DESTINATION_CHANNEL_IDS:
-                        self._voice_join_time[member.id] = (channel.id, now)
-                        count += 1
-        if count:
-            logger.info(f"Snapshot: found {count} member(s) already in voice channels")
-        self._ready_event.set()
 
     async def send_status(self, message: str):
         """ส่งข้อความสถานะไปยัง DISCORD_STATUS_CHANNEL_ID ถ้ากำหนดไว้"""
