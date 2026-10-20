@@ -507,6 +507,51 @@ class ActivityBot(discord.Client):
     async def on_ready(self):
         logger.info(f"Discord bot ready: {self.user}")
         await self._sync_commands()
+        if BREAK_MSG_DELETE_AFTER >= 0 and not getattr(self, "_sweeper_started", False):
+            self._sweeper_started = True
+            asyncio.create_task(self._break_sweeper())
+
+    async def _break_sweeper(self):
+        """🧹 เก็บกวาดข้อความ "กลับที่นั่งแล้ว" ที่ค้าง ทุก 2 นาที
+        การลบหลัง 60 วิ เป็นงานในความจำ ถ้าบอทรีสตาร์ท/deploy ภายใน 60 วินั้น งานลบจะหาย → ตัวนี้ตามลบให้
+        (ลบทั้งข้อความกลับที่นั่ง + ข้อความ "ไป..." ที่มันรีพลายอยู่)"""
+        await asyncio.sleep(30)
+        while True:
+            try:
+                min_age = max(BREAK_MSG_DELETE_AFTER, 0) + 10
+                now = datetime.now(timezone.utc)
+                removed = 0
+                for g in self.guilds:
+                    for ch in [*g.voice_channels, *g.text_channels]:
+                        perms = ch.permissions_for(g.me)
+                        if not (perms.view_channel and perms.read_message_history):
+                            continue
+                        try:
+                            async for m in ch.history(limit=50):
+                                if m.author.id != self.user.id:
+                                    continue
+                                c = m.content or ""
+                                if "** กลับที่นั่งแล้ว" not in c or "📌" not in c:
+                                    continue
+                                if (now - m.created_at).total_seconds() < min_age:
+                                    continue
+                                if m.reference and m.reference.message_id:
+                                    try:
+                                        await ch.get_partial_message(m.reference.message_id).delete()
+                                    except Exception:
+                                        pass
+                                try:
+                                    await m.delete()
+                                    removed += 1
+                                except Exception:
+                                    pass
+                        except Exception:
+                            continue
+                if removed:
+                    logger.info(f"[SWEEP] ลบข้อความกลับที่นั่งที่ค้าง {removed} ชุด")
+            except Exception as e:
+                logger.warning(f"[SWEEP] error: {e}")
+            await asyncio.sleep(120)
         now = time_module.time()
         count = 0
         for guild in self.guilds:
@@ -635,11 +680,28 @@ class ActivityBot(discord.Client):
             return None
         return max(time_by_ch, key=lambda ch: time_by_ch[ch])
 
-    async def _find_last_activity_msg(self, channel, name: str):
+    async def _find_activity_msg_anywhere(self, guild, name: str):
+        """หาข้อความ "**ชื่อ** ไป..." ล่าสุดที่ยังไม่มีคู่กลับที่นั่ง จากทุกห้องในเซิร์ฟเวอร์ (ย้อนหลัง 6 ชม.)"""
+        if guild is None:
+            return None
+        since = datetime.now(timezone.utc) - timedelta(hours=6)
+        best = None
+        for ch in [*guild.voice_channels, *guild.text_channels]:
+            if str(ch.id) in DESTINATION_CHANNEL_IDS:
+                continue
+            perms = ch.permissions_for(guild.me)
+            if not (perms.view_channel and perms.read_message_history):
+                continue
+            m = await self._find_last_activity_msg(ch, name, after=since, limit=60)
+            if m is not None and (best is None or m.created_at > best.created_at):
+                best = m
+        return best
+
+    async def _find_last_activity_msg(self, channel, name: str, after=None, limit: int = 100):
         """หาข้อความแจ้ง "**ชื่อ** ไป..." ล่าสุดของบอทในห้อง (ใช้ตอนบอทรีสตาร์ทแล้วไม่มีข้อมูลในความจำ)"""
         needle = f"**{name}** ไป"
         try:
-            async for m in channel.history(limit=100):
+            async for m in channel.history(limit=limit, after=after, oldest_first=False):
                 if m.author.id == self.user.id and needle in (m.content or ""):
                     return m
                 if m.author.id == self.user.id and f"**{name}** กลับที่นั่งแล้ว" in (m.content or ""):
@@ -680,6 +742,16 @@ class ActivityBot(discord.Client):
             if str(ch.id) not in DESTINATION_CHANNEL_IDS:
                 current_ch = ch
 
+        found_ref = None
+        fallback_vc = None
+        if is_return and member.id not in self._last_activity_message and member.id not in self._last_notified_channel:
+            # บอทรีสตาร์ทระหว่างที่คนนี้พักอยู่ (ความจำหาย) → ไล่หาข้อความ "ไป..." ล่าสุดของเขาจากทุกห้อง
+            # ห้องที่เจอ = ห้องที่แจ้งตอนไป (= ห้องทำงาน) ใช้ทั้งเป็นที่แจ้งกลับและห้องที่ย้ายกลับ
+            found_ref = await self._find_activity_msg_anywhere(guild, name)
+            if found_ref is not None:
+                fallback_vc = found_ref.channel
+                logger.info(f"[RESTORE] เจอข้อความไปของ {name} ใน #{fallback_vc.name} (หลังบอทรีสตาร์ท)")
+
         if is_return:
             # กลับที่นั่ง → ย้ายกลับถ้า: ถูกบอทย้ายออก หรือ ตอนนี้อยู่ในห้องปลายทาง (กินข้าวเองก่อนกด / บอท restart)
             currently_in_destination = (
@@ -689,7 +761,8 @@ class ActivityBot(discord.Client):
             )
             should_move_back = member.id in self._moved_to_destination or currently_in_destination
             if should_move_back:
-                move_target = work_vc or current_ch
+                move_target = work_vc or current_ch or (
+                    fallback_vc if isinstance(fallback_vc, discord.VoiceChannel) else None)
                 if move_target:
                     try:
                         await member.move_to(move_target)
@@ -707,7 +780,7 @@ class ActivityBot(discord.Client):
             # แจ้งในห้องที่เคยแจ้งกิจกรรมล่าสุด
             last_ch_id = self._last_notified_channel.get(member.id)
             last_vc = await self.find_voice_channel_by_id(str(last_ch_id)) if last_ch_id else None
-            notify_vc = last_vc or current_ch
+            notify_vc = last_vc or fallback_vc or current_ch
 
         else:
             target_channel_id = self.get_target_channel_name(activity)
@@ -742,7 +815,7 @@ class ActivityBot(discord.Client):
             try:
                 if is_return:
                     # reply กลับไปที่ message กิจกรรมล่าสุด (ถ้ามี)
-                    ref_msg = self._last_activity_message.get(member.id)
+                    ref_msg = self._last_activity_message.get(member.id) or found_ref
                     if ref_msg is None:
                         # บอทเพิ่งรีสตาร์ท (ความจำหาย) → หาข้อความ "ไป..." ล่าสุดของคนนี้จากประวัติห้อง
                         ref_msg = await self._find_last_activity_msg(notify_vc, name)
