@@ -243,6 +243,7 @@ class ChatCount:
         self.msg_map: dict[int, int] = {}          # message_id คำถาม → round_id
         self._fired: set[tuple[int, str]] = set()  # (schedule_id, วันที่) ที่สร้างรอบแล้ว
         self._send_lock = asyncio.Lock()
+        self._caught_up: set[int] = set()          # รอบที่ไล่เก็บรีพลายตกหล่นแล้ว (ทำครั้งเดียวต่อการเปิดบอท)
         self._last_channel_publish = 0.0
         self._last_tg_publish = 0.0
         self._last_tg_groups: list = []
@@ -320,6 +321,13 @@ class ChatCount:
         for r in rows:
             if not r.get("posted"):
                 await self._post_round(r)
+        for r in rows:
+            if r.get("posted") and int(r["id"]) not in self._caught_up:
+                self._caught_up.add(int(r["id"]))
+                try:
+                    await self._catch_up(r)
+                except Exception as e:
+                    logger.error(f"[CHATCOUNT] catch-up round {r.get('id')} error: {e}")
         for r in rows:
             if r.get("posted"):
                 await self.evaluate_and_send(int(r["id"]))
@@ -467,6 +475,51 @@ class ChatCount:
         await self._update_round(rid, {"posted": True, "messages": messages, "post_errors": errors})
         self._rebuild_msg_map()
         logger.info(f"[CHATCOUNT] ส่งคำถามรอบ #{rid} แล้ว {len(messages)} ห้อง" + (f" · ผิดพลาด {errors}" if errors else ""))
+
+    async def _catch_up(self, rnd: dict) -> None:
+        """ไล่เก็บรีพลายที่ส่งมาตอนบอทออฟไลน์ (deploy/รีสตาร์ท) — Discord ไม่ส่งข้อความย้อนหลังให้บอท
+        ข้อความไหนบอทเคยตอบไปแล้ว (มีข้อความบอทรีพลายมันอยู่) หรือบันทึกไปแล้ว = ข้าม"""
+        rid = int(rnd["id"])
+        answers = await self._fetch_answers(rid)
+        done_ids = {str(a.get("message_id")) for a in answers}
+        me = self.bot.user
+        picked = 0
+        for msg in rnd.get("messages") or []:
+            ch = self._resolve_channel(msg.get("channel_id"))
+            if ch is None:
+                continue
+            try:
+                qid = int(msg["message_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            chain: set[int] = {qid}
+            candidates: list[discord.Message] = []
+            replied_by_bot: set[int] = set()
+            try:
+                async for m in ch.history(after=discord.Object(id=qid), limit=500, oldest_first=True):
+                    ref = m.reference.message_id if m.reference else None
+                    if ref is None:
+                        continue
+                    if me is not None and m.author.id == me.id:
+                        replied_by_bot.add(ref)
+                        if ref in chain:
+                            chain.add(m.id)
+                            self.msg_map.setdefault(int(m.id), rid)
+                        continue
+                    if ref in chain and not m.author.bot:
+                        chain.add(m.id)
+                        candidates.append(m)
+            except (discord.Forbidden, discord.HTTPException) as e:
+                logger.warning(f"[CHATCOUNT] catch-up อ่านห้อง #{getattr(ch, 'name', '')} ไม่ได้: {e}")
+                continue
+            for m in candidates:
+                self.msg_map.setdefault(int(m.id), rid)
+                if m.id in replied_by_bot or str(m.id) in done_ids:
+                    continue
+                await self.handle_message(m)
+                picked += 1
+        if picked:
+            logger.info(f"[CHATCOUNT] รอบ #{rid} เก็บรีพลายที่ตกหล่นตอนบอทออฟไลน์ {picked} ข้อความ")
 
     # ---------------- รับรีพลาย ----------------
     async def _round_from_chain(self, message: discord.Message) -> int | None:
