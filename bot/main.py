@@ -204,10 +204,17 @@ TID_RE = re.compile(r"รหัสผู้ใช้[：:][^\d]*(\d+)")
 
 _currently_out: dict[str, str] = {}   # telegram_id → chat_id ของกลุ่มที่กดเช็คอินมา
 
-ACTIVITY_EMOJI = {
+# อีโมจิที่ "บันทึกลง K36" (break_reason) — ต้องตรงกับ checkin-bot-render ห้ามเปลี่ยน
+BREAK_REASON_EMOJI = {
     "กินข้าว": "🍚", "ทานข้าว": "🍚",
     "ปวดหนัก": "🚽", "ห้องน้ำใหญ่": "🚽",
     "ปวดน้อย": "🚾", "ห้องน้ำเล็ก": "🚾",
+}
+# อีโมจิที่ "แสดงใน Discord" (ข้อความแจ้งพัก + หน้าชื่อ) — เปลี่ยนได้อิสระ
+ACTIVITY_EMOJI = {
+    "กินข้าว": "🍚", "ทานข้าว": "🍚",
+    "ปวดหนัก": "🚽", "ห้องน้ำใหญ่": "🚽",
+    "ปวดน้อย": "🚬", "ห้องน้ำเล็ก": "🚬",
 }
 
 # ---------------------------------------------------------------------------
@@ -233,6 +240,34 @@ def is_destination(channel_id) -> bool:
     return str(channel_id) in DESTINATION_CHANNEL_IDS
 
 
+# ── 🏷️ อีโมจิหน้าชื่อตอนพัก ── กดไปปวดหนัก → ชื่อเป็น "🚽👑 LAYLA" / กดกลับ → คืนชื่อเดิม
+# ปิดได้ด้วย env NICK_STATUS=0 / บอทต้องมีสิทธิ์ Manage Nicknames และ role สูงกว่าพนักงาน
+NICK_STATUS_ENABLED = os.environ.get("NICK_STATUS", "1").strip() != "0"
+# (รวมอีโมจิรุ่นเก่า เช่น 🚾 ไว้ด้วย เพื่อให้ยังลบออกจากชื่อที่ค้างอยู่ได้)
+STATUS_NICK_EMOJIS = tuple(sorted(set(ACTIVITY_EMOJI.values()) | set(BREAK_REASON_EMOJI.values()) | {"🚶"},
+                                  key=len, reverse=True))
+NICK_MAX = 32                     # Discord จำกัดชื่อเล่นไม่เกิน 32 ตัวอักษร
+
+
+def strip_status_prefix(nick: str | None) -> str | None:
+    """ตัดอีโมจิสถานะพักที่บอทใส่ไว้หน้าชื่อออก"""
+    changed = True
+    while nick and changed:
+        changed = False
+        for e in STATUS_NICK_EMOJIS:
+            if nick.startswith(e):
+                nick, changed = nick[len(e):], True
+    return nick
+
+
+def _fit_nick(prefix: str, base: str) -> str:
+    """ต่ออีโมจิหน้าชื่อ ตัดท้ายถ้ายาวเกินที่ Discord รับ (นับแบบ UTF-16 ให้ตรงกับฝั่ง Discord)"""
+    u16 = lambda x: len(x.encode("utf-16-le")) // 2
+    while base and u16(prefix + base) > NICK_MAX:
+        base = base[:-1]
+    return prefix + base
+
+
 def get_emoji(activity: str, is_return: bool) -> str:
     if is_return:
         return "✅"
@@ -244,7 +279,7 @@ def get_emoji(activity: str, is_return: bool) -> str:
 
 def get_break_reason(activity: str) -> str:
     """แปลงชื่อกิจกรรมเป็น break_reason ที่ตรงกับ checkin-bot-render"""
-    for key, emoji in ACTIVITY_EMOJI.items():
+    for key, emoji in BREAK_REASON_EMOJI.items():
         if key in activity:
             return f"{emoji} {key}"
     return f"☕ {activity}"
@@ -489,6 +524,7 @@ def parse_break_message(m, bot_user_id) -> tuple[str, str] | None:
 # ---------------------------------------------------------------------------
 # Discord bot
 # ---------------------------------------------------------------------------
+_out_restored = False     # โหลดรายชื่อคนที่ยังพักอยู่จาก K36 เสร็จแล้วหรือยัง (ก่อนนั้นห้ามคืนชื่อ)
 STATUS_CHANNEL_ID = int(os.environ.get("DISCORD_STATUS_CHANNEL_ID", "0") or "0")
 
 
@@ -522,6 +558,9 @@ class ActivityBot(discord.Client):
         self._return_channel: dict[int, int] = {}
         # member_id → ห้องทำงานล่าสุดที่อยู่ (ไม่นับห้องกินข้าว) — ไม่ถูกล้างรายชั่วโมง
         self._last_work_channel: dict[int, int] = {}
+        # ── อีโมจิหน้าชื่อ ── member_id → ชื่อเล่นเดิมก่อนใส่อีโมจิ (None = ไม่ได้ตั้งชื่อเล่น)
+        self._orig_nick: dict[int, str | None] = {}
+        self._nick_forbidden: set[int] = set()     # เปลี่ยนชื่อไม่ได้ (เจ้าของเซิร์ฟ / role สูงกว่าบอท) → ไม่ลองซ้ำ
         # channel_id → เวลาที่แจ้งกลับที่นั่งล่าสุด (ตัวเก็บกวาดตรวจเฉพาะห้องเหล่านี้)
         self._sweep_channels: dict[int, float] = {}
 
@@ -586,12 +625,67 @@ class ActivityBot(discord.Client):
         while True:
             try:
                 removed = await self._sweep_once(full)
+                if await self.cleanup_status_nicks():
+                    logger.info("[NICK] คืนชื่อที่มีอีโมจิพักค้างให้แล้ว")
                 full = False
                 if removed:
                     logger.info(f"[SWEEP] ลบข้อความกลับที่นั่งที่ค้าง {removed} ชุด")
             except Exception as e:
                 logger.warning(f"[SWEEP] error: {e}")
             await asyncio.sleep(self.SWEEP_EVERY)
+
+    async def set_status_nick(self, member: discord.Member, emoji: str | None) -> None:
+        """ใส่อีโมจิสถานะหน้าชื่อ (emoji) หรือคืนชื่อเดิม (emoji=None)"""
+        if not NICK_STATUS_ENABLED or member.id in self._nick_forbidden:
+            return
+        if member.id == getattr(member.guild, "owner_id", None):
+            self._nick_forbidden.add(member.id)
+            logger.info(f"[NICK] {member} เป็นเจ้าของเซิร์ฟเวอร์ — Discord ไม่ให้บอทเปลี่ยนชื่อ")
+            return
+        current = member.nick
+        base_nick = strip_status_prefix(current)              # ชื่อเล่นที่ไม่มีอีโมจิสถานะ
+        if emoji is None:
+            orig = self._orig_nick.pop(member.id, ...)
+            if not current or base_nick == current:
+                return                                          # ไม่มีอีโมจิให้ลบ
+            if orig is not ...:
+                new = orig
+            else:
+                # บอทรีสตาร์ท (ไม่รู้ชื่อเดิม) → ตัดอีโมจิออก ถ้าเหลือเท่าชื่อบัญชี ก็ล้างชื่อเล่นทิ้ง
+                new = base_nick or None
+                if new in (member.global_name, member.name):
+                    new = None
+        else:
+            if member.id not in self._orig_nick:
+                self._orig_nick[member.id] = base_nick or None
+            new = _fit_nick(emoji, base_nick or member.global_name or member.name)
+            if new == current:
+                return
+        try:
+            await member.edit(nick=new, reason="สถานะพัก (botlink)")
+        except discord.Forbidden:
+            self._nick_forbidden.add(member.id)
+            logger.warning(f"[NICK] เปลี่ยนชื่อ {member} ไม่ได้ — ต้องให้สิทธิ์ Manage Nicknames "
+                           f"และลาก role ของบอทให้สูงกว่า role ของคนนี้")
+        except discord.HTTPException as e:
+            logger.warning(f"[NICK] เปลี่ยนชื่อ {member} ไม่สำเร็จ: {e}")
+
+    async def cleanup_status_nicks(self) -> int:
+        """คืนชื่อให้พนักงานที่ยังมีอีโมจิสถานะค้าง แต่ไม่ได้พักอยู่แล้ว (เช่น บอทรีสตาร์ทตอนเขากดกลับ)"""
+        if not NICK_STATUS_ENABLED or not _out_restored:
+            return 0
+        out_ids = {EMPLOYEES[t]["discord_id"] for t in _currently_out if t in EMPLOYEES}
+        fixed = 0
+        for g in self.guilds:
+            for m in g.members:
+                if not m.nick or strip_status_prefix(m.nick) == m.nick:
+                    continue
+                did = str(m.id)
+                if did not in NAME_BY_DISCORD or did in out_ids:
+                    continue                    # ไม่ใช่พนักงานในระบบ (อาจตั้งชื่อเอง) / ยังพักอยู่จริง
+                await self.set_status_nick(m, None)
+                fixed += 1
+        return fixed
 
     async def _sweep_once(self, full: bool) -> int:
         min_age = max(BREAK_MSG_DELETE_AFTER, 0) + 10
@@ -811,6 +905,12 @@ class ActivityBot(discord.Client):
         if member is None:
             logger.warning(f"No member found for {name} ({discord_user_id})")
             return False, None
+
+        # 🏷️ อีโมจิหน้าชื่อ: ไป → ใส่ / กลับ → คืนชื่อเดิม (พังก็ไม่กระทบการแจ้ง/ย้ายห้อง)
+        try:
+            await self.set_status_nick(member, None if is_return else emoji)
+        except Exception as e:
+            logger.warning(f"[NICK] {name}: {e}")
 
         # ห้องทำงาน = ห้องที่อยู่นานสุดในชั่วโมงนี้
         work_ch_id = self.get_work_channel_id(member.id)
@@ -1121,7 +1221,9 @@ async def status_command(interaction: discord.Interaction):
 # ---------------------------------------------------------------------------
 async def supabase_restore_open_breaks() -> None:
     """ตอน startup โหลดการพักที่ยังเปิดอยู่ (จากตารางหลัก break_logs) กลับเข้า _currently_out"""
+    global _out_restored
     if not supabase:
+        _out_restored = True
         return
     try:
         now = get_thai_time()
@@ -1134,6 +1236,7 @@ async def supabase_restore_open_breaks() -> None:
                        .execute())
         if not res.data:
             logger.info("[Supabase] ไม่มี open break sessions ค้างอยู่")
+            _out_restored = True
             return
         restored = 0
         for r in res.data:
@@ -1142,6 +1245,7 @@ async def supabase_restore_open_breaks() -> None:
                 _currently_out[tid] = ""  # ไม่รู้ group_name เดิม
                 restored += 1
         logger.info(f"[Supabase] Restored {restored} open break sessions → _currently_out")
+        _out_restored = True
     except Exception as e:
         logger.error(f"[Supabase] supabase_restore_open_breaks error: {e}")
 
