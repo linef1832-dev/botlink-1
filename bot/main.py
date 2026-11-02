@@ -232,6 +232,11 @@ DESTINATION_CHANNEL_IDS: set[str] = {
 }
 
 
+def is_destination(channel_id) -> bool:
+    """ห้องปลายทาง (ห้องกินข้าว) — ไม่นับเป็นห้องทำงาน"""
+    return str(channel_id) in DESTINATION_CHANNEL_IDS
+
+
 def get_emoji(activity: str, is_return: bool) -> str:
     if is_return:
         return "✅"
@@ -317,8 +322,17 @@ def parse_telegram_timestamp(ts_str: str | None) -> datetime | None:
 BREAK_TABLES = ["break_logs", "break_sessions"]
 
 
-# กันการเขียนตารางพักสลับลำดับกัน (เช่น "ไป" กับ "กลับ" ของคนเดียวกันเข้ามาติดๆ กัน)
-_break_db_lock = asyncio.Lock()
+# ล็อก "ต่อคน" — งานของคนเดียวกัน (บันทึก DB + แจ้ง/ย้ายห้อง Discord) ทำทีละอย่างตามลำดับที่กด
+# เช่น กด "ไปกินข้าว" แล้ว "กลับที่นั่ง" ติดๆ กัน → ต้องย้ายไปห้องกินข้าวให้เสร็จก่อน แล้วค่อยย้ายกลับ
+# (คนละคนทำพร้อมกันได้ ไม่ต้องรอคิวกัน — ตอนเปลี่ยนกะที่กดพร้อมกันหลายคน จะไม่ช้า)
+_person_locks: dict[str, asyncio.Lock] = {}
+
+
+def person_lock(key: str) -> asyncio.Lock:
+    lock = _person_locks.get(key)
+    if lock is None:
+        lock = _person_locks[key] = asyncio.Lock()
+    return lock
 
 
 def _find_open_break_ids(table: str, staff_name: str, now: datetime) -> list:
@@ -374,12 +388,11 @@ async def supabase_open_break(staff_name: str, activity: str, timestamp_str: str
         return
     now = parse_telegram_timestamp(timestamp_str) or get_thai_time()
     reason = get_break_reason(activity)
-    async with _break_db_lock:
-        for table in BREAK_TABLES:
-            try:
-                await sb(lambda t=table: _open_break_in(t, staff_name, reason, now))
-            except Exception as e:
-                logger.error(f"[{table}] supabase_open_break error: {e}")
+    for table in BREAK_TABLES:
+        try:
+            await sb(lambda t=table: _open_break_in(t, staff_name, reason, now))
+        except Exception as e:
+            logger.error(f"[{table}] supabase_open_break error: {e}")
 
 
 async def supabase_close_break(staff_name: str, timestamp_str: str | None = None) -> None:
@@ -387,12 +400,11 @@ async def supabase_close_break(staff_name: str, timestamp_str: str | None = None
     if not supabase:
         return
     now = parse_telegram_timestamp(timestamp_str) or get_thai_time()
-    async with _break_db_lock:
-        for table in BREAK_TABLES:
-            try:
-                await sb(lambda t=table: _close_break_in(t, staff_name, now))
-            except Exception as e:
-                logger.error(f"[{table}] supabase_close_break error: {e}")
+    for table in BREAK_TABLES:
+        try:
+            await sb(lambda t=table: _close_break_in(t, staff_name, now))
+        except Exception as e:
+            logger.error(f"[{table}] supabase_close_break error: {e}")
 
 
 def parse_message(text: str, group_name: str, chat_id: str = "") -> dict | None:
@@ -506,8 +518,14 @@ class ActivityBot(discord.Client):
         self._last_notified_channel: dict[int, int] = {}
         # member_id → discord.Message ของกิจกรรมล่าสุด (ใช้สำหรับ reply ตอนกลับที่นั่ง)
         self._last_activity_message: dict[int, discord.Message] = {}
-        # member_id ที่ถูกย้ายไปห้องปลายทาง (เช่น Dining) — คนเหล่านี้เท่านั้นที่ต้องย้ายกลับ
-        self._moved_to_destination: set[int] = set()
+        # ── ห้องที่ต้องย้ายกลับ ──
+        # [FIX] เดิมใช้ "ห้องที่อยู่นานสุดในชั่วโมงนี้" อย่างเดียว ซึ่งถูกล้างทุกต้นชั่วโมง
+        #       → กินข้าวข้ามชั่วโมง (เช่น ไป 12:50 กลับ 13:10) บอทหาห้องเดิมไม่เจอ ไม่ย้ายกลับ
+        #       → และถ้าชั่วโมงนั้นย้ายห้องมา ก็ย้ายกลับผิดห้อง
+        # member_id → ห้องที่อยู่ "ตอนบอทย้ายไปห้องกินข้าว" (ห้องเดิมจริงๆ)
+        self._return_channel: dict[int, int] = {}
+        # member_id → ห้องทำงานล่าสุดที่อยู่ (ไม่นับห้องกินข้าว) — ไม่ถูกล้างรายชั่วโมง
+        self._last_work_channel: dict[int, int] = {}
         # channel_id → เวลาที่แจ้งกลับที่นั่งล่าสุด (ตัวเก็บกวาดตรวจเฉพาะห้องเหล่านี้)
         self._sweep_channels: dict[int, float] = {}
 
@@ -539,11 +557,12 @@ class ActivityBot(discord.Client):
         for guild in self.guilds:
             for channel in guild.voice_channels:
                 for member in channel.members:
-                    if str(channel.id) not in DESTINATION_CHANNEL_IDS:
+                    if not is_destination(channel.id):
                         # on_ready เกิดซ้ำได้ตอน Discord reconnect → ถ้ายังอยู่ห้องเดิม ไม่ต้องรีเซ็ตเวลาที่นับไว้
                         prev = self._voice_join_time.get(member.id)
                         if prev is None or prev[0] != channel.id:
                             self._voice_join_time[member.id] = (channel.id, now)
+                        self._last_work_channel[member.id] = channel.id
                         count += 1
         if count:
             logger.info(f"Snapshot: found {count} member(s) already in voice channels")
@@ -637,7 +656,7 @@ class ActivityBot(discord.Client):
         if member.id in self._voice_join_time:
             prev_ch_id, join_ts = self._voice_join_time[member.id]
             duration = now - join_ts
-            if str(prev_ch_id) not in DESTINATION_CHANNEL_IDS:
+            if not is_destination(prev_ch_id):
                 self._hour_time[member.id][prev_ch_id] += duration
 
         # บันทึกห้องใหม่ที่เข้า
@@ -645,6 +664,12 @@ class ActivityBot(discord.Client):
             self._voice_join_time[member.id] = (after.channel.id, now)
         else:
             self._voice_join_time.pop(member.id, None)
+
+        # จำห้องทำงานล่าสุด (ห้องที่อยู่ตอนนี้ หรือห้องที่เพิ่งออกมา ถ้าไม่ใช่ห้องกินข้าว)
+        if after.channel and not is_destination(after.channel.id):
+            self._last_work_channel[member.id] = after.channel.id
+        elif before.channel and not is_destination(before.channel.id):
+            self._last_work_channel[member.id] = before.channel.id
 
     async def wait_until_ready_event(self):
         await self._ready_event.wait()
@@ -684,6 +709,22 @@ class ActivityBot(discord.Client):
                 continue
         return None, None
 
+    async def is_in_destination(self, discord_user_id: str) -> bool:
+        """ตอนนี้คนนี้นั่งอยู่ในห้องกินข้าวหรือเปล่า"""
+        _, member = await self.find_member(discord_user_id)
+        ch = member.voice.channel if member is not None and member.voice else None
+        return ch is not None and is_destination(ch.id)
+
+    async def _pick_return_channel(self, candidates: list) -> discord.VoiceChannel | None:
+        """เลือกห้องที่จะย้ายกลับ: ตัวแรกในรายการที่ยังมีอยู่จริง และไม่ใช่ห้องกินข้าว"""
+        for c in candidates:
+            if c is None:
+                continue
+            vc = c if isinstance(c, discord.VoiceChannel) else await self.find_voice_channel_by_id(str(c))
+            if vc is not None and not is_destination(vc.id):
+                return vc
+        return None
+
     async def find_voice_channel_by_id(self, channel_id: str) -> discord.VoiceChannel | None:
         try:
             channel = self.get_channel(int(channel_id))
@@ -704,7 +745,7 @@ class ActivityBot(discord.Client):
         time_by_ch: dict[int, float] = dict(self._hour_time.get(member_id) or {})
         if member_id in self._voice_join_time:
             cur_ch_id, join_ts = self._voice_join_time[member_id]
-            if str(cur_ch_id) not in DESTINATION_CHANNEL_IDS:
+            if not is_destination(cur_ch_id):
                 time_by_ch[cur_ch_id] = time_by_ch.get(cur_ch_id, 0) + (time_module.time() - join_ts)
         return time_by_ch
 
@@ -728,7 +769,7 @@ class ActivityBot(discord.Client):
 
         chans = []
         for ch in [*guild.voice_channels, *guild.text_channels]:
-            if str(ch.id) in DESTINATION_CHANNEL_IDS:
+            if is_destination(ch.id):
                 continue
             perms = ch.permissions_for(guild.me)
             if perms.view_channel and perms.read_message_history:
@@ -779,7 +820,7 @@ class ActivityBot(discord.Client):
         current_ch = None
         if member.voice and member.voice.channel:
             ch = member.voice.channel
-            if str(ch.id) not in DESTINATION_CHANNEL_IDS:
+            if not is_destination(ch.id):
                 current_ch = ch
 
         found_ref = None
@@ -792,17 +833,27 @@ class ActivityBot(discord.Client):
                 fallback_vc = found_ref.channel
                 logger.info(f"[RESTORE] เจอข้อความไปของ {name} ใน #{fallback_vc.name} (หลังบอทรีสตาร์ท)")
 
+        move_target = None
         if is_return:
-            # กลับที่นั่ง → ย้ายกลับถ้า: ถูกบอทย้ายออก หรือ ตอนนี้อยู่ในห้องปลายทาง (กินข้าวเองก่อนกด / บอท restart)
-            currently_in_destination = (
-                member.voice and
-                member.voice.channel and
-                str(member.voice.channel.id) in DESTINATION_CHANNEL_IDS
-            )
-            should_move_back = member.id in self._moved_to_destination or currently_in_destination
-            if should_move_back:
-                move_target = work_vc or current_ch or (
-                    fallback_vc if isinstance(fallback_vc, discord.VoiceChannel) else None)
+            # กลับที่นั่ง → ย้ายกลับเมื่อ "ตอนนี้อยู่ในห้องกินข้าว" เท่านั้น
+            # (ถ้าเดินกลับห้องเองแล้ว หรือออกจากห้องเสียงไปแล้ว ไม่ต้องย้าย)
+            mem_vc = member.voice.channel if member.voice else None
+            if mem_vc is not None and is_destination(mem_vc.id):
+                if (member.id not in self._return_channel and member.id not in self._last_work_channel
+                        and work_vc is None and fallback_vc is None):
+                    # ไม่มีข้อมูลในความจำเลย (บอทรีสตาร์ทระหว่างกินข้าว) → หาห้องจากข้อความ "ไป..." ล่าสุด
+                    found_ref = await self._find_activity_msg_anywhere(guild, name)
+                    if found_ref is not None:
+                        fallback_vc = found_ref.channel
+                        logger.info(f"[RESTORE] เจอข้อความไปของ {name} ใน #{fallback_vc.name} (หลังบอทรีสตาร์ท)")
+                # ลำดับความสำคัญ: ห้องที่อยู่ตอนถูกย้ายไปกินข้าว → ห้องทำงานล่าสุด → ห้องที่อยู่นานสุดชั่วโมงนี้
+                #                 → ห้องที่แจ้ง "ไป..." (กรณีบอทรีสตาร์ท)
+                move_target = await self._pick_return_channel([
+                    self._return_channel.get(member.id),
+                    self._last_work_channel.get(member.id),
+                    work_vc,
+                    fallback_vc if isinstance(fallback_vc, discord.VoiceChannel) else None,
+                ])
                 if move_target:
                     try:
                         await member.move_to(move_target)
@@ -812,22 +863,25 @@ class ActivityBot(discord.Client):
                     except Exception as e:
                         logger.error(f"Failed to move {name} back: {e}")
                 else:
-                    logger.info(f"No work channel found for {name}, skipping return move")
-                self._moved_to_destination.discard(member.id)
+                    logger.warning(f"No work channel found for {name}, skipping return move")
+            elif mem_vc is None:
+                logger.info(f"{name} is not in a voice channel — skipping return move")
             else:
-                logger.info(f"{name} was not moved out — skipping return move")
+                logger.info(f"{name} is not in the dining room — skipping return move")
+            self._return_channel.pop(member.id, None)
 
-            # แจ้งในห้องที่เคยแจ้งกิจกรรมล่าสุด
+            # แจ้งในห้องที่เคยแจ้งกิจกรรมล่าสุด (ไม่มี → ห้องที่ย้ายกลับไป / ห้องที่อยู่ตอนนี้)
             last_ch_id = self._last_notified_channel.get(member.id)
             last_vc = await self.find_voice_channel_by_id(str(last_ch_id)) if last_ch_id else None
-            notify_vc = last_vc or fallback_vc or current_ch
+            notify_vc = last_vc or fallback_vc or move_target or current_ch
 
         else:
             target_channel_id = self.get_move_channel_id(activity)
 
             if target_channel_id:
                 # กินข้าว / ทานข้าว → แจ้งในห้องทำงาน แล้วย้ายไป Dining
-                notify_vc = work_vc or current_ch
+                notify_vc = work_vc or current_ch or await self._pick_return_channel(
+                    [self._last_work_channel.get(member.id)])
                 target_vc = await self.find_voice_channel_by_id(target_channel_id)
                 if target_vc:
                     mem_vc = member.voice.channel if member.voice else None
@@ -839,8 +893,9 @@ class ActivityBot(discord.Client):
                     else:
                         try:
                             await member.move_to(target_vc)
-                            self._moved_to_destination.add(member.id)
-                            logger.info(f"Moved {name} → #{target_vc.name}")
+                            if not is_destination(mem_vc.id):
+                                self._return_channel[member.id] = mem_vc.id   # จำห้องเดิมไว้ย้ายกลับ
+                            logger.info(f"Moved {name} → #{target_vc.name} (ห้องเดิม #{mem_vc.name})")
                         except discord.Forbidden:
                             logger.error(f"No permission to move {name} — bot needs 'Move Members' permission")
                         except Exception as e:
@@ -1277,13 +1332,8 @@ async def start_telegram(on_activity):
                         if emp:
                             # ปิด break session ใน Supabase เสมอ ไม่ว่าจะอยู่ใน _currently_out หรือไม่
                             # (กรณีบอท Telegram รีเซทข้ามตี 1 ทำให้ _currently_out ว่าง)
-                            await supabase_close_break(emp["name"], None)
-                            if tid in _currently_out:
-                                await discord_bot.send_notification(
-                                    emp["discord_id"], emp["name"], "กลับที่นั่ง", True, group_name,
-                                )
-                                _currently_out.pop(tid, None)
-                            logger.info(f"[FAILED RETURN] {emp['name']} — closed break session (bot reset case)")
+                            async with person_lock(emp["name"]):
+                                await _handle_failed_return(tid, emp, group_name)
                 else:
                     logger.warning(f"[PARSE FAIL] Has รหัสผู้ใช้ but parse failed. Full text: {text!r}")
         except Exception as e:
@@ -1312,6 +1362,11 @@ async def on_activity(parsed: dict):
         logger.warning(f"Unknown Telegram ID: {parsed['telegram_id']}")
         return
 
+    async with person_lock(emp["name"]):
+        await _handle_activity(emp, parsed)
+
+
+async def _handle_activity(emp: dict, parsed: dict) -> None:
     tid = parsed["telegram_id"]
 
     # Track activity state
@@ -1335,6 +1390,18 @@ async def on_activity(parsed: dict):
     )
     status = f"sent to #{channel}" if sent else "not sent (not in voice channel)"
     logger.info(f"{emp['name']} [{parsed['activity']}] → Discord {status}")
+
+
+async def _handle_failed_return(tid: str, emp: dict, group_name: str) -> None:
+    """กด "กลับที่นั่ง" แต่บอทเช็คอินฝั่ง Telegram ตอบว่าไม่มีกิจกรรม (บอท Telegram รีเซท)"""
+    await supabase_close_break(emp["name"], None)
+    # [FIX] เดิมย้ายกลับ/แจ้งเฉพาะคนที่อยู่ใน _currently_out
+    #       ถ้าบอทจำไม่ได้ แต่คนนั้นยังนั่งอยู่ห้องกินข้าว → ก็ต้องย้ายกลับด้วย
+    await discord_bot.wait_until_ready_event()
+    if tid in _currently_out or await discord_bot.is_in_destination(emp["discord_id"]):
+        await discord_bot.send_notification(emp["discord_id"], emp["name"], "กลับที่นั่ง", True, group_name)
+        _currently_out.pop(tid, None)
+    logger.info(f"[FAILED RETURN] {emp['name']} — closed break session (bot reset case)")
 
 
 async def start_telegram_with_reconnect(on_activity):
