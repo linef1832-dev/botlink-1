@@ -30,11 +30,13 @@ for _noisy in ("realtime", "realtime._async.client", "httpx", "httpcore"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # 🧹 ลบข้อความแจ้งพักใน Discord หลัง "กลับที่นั่ง" กี่วินาที (ลบทั้งข้อความ "ไป..." และ "กลับที่นั่งแล้ว")
-#    ตั้งผ่าน env BREAK_MSG_DELETE_AFTER — 0 = ลบทันที, -1 = ไม่ลบ (แบบเดิม)
+#    ค่าเริ่มต้น 7200 = 2 ชั่วโมง (ให้หัวหน้าเลื่อนดูได้ว่าใครกลับมาแล้ว / ใครยังไม่กลับ)
+#    ตั้งผ่าน env BREAK_MSG_DELETE_AFTER — 0 = ลบทันที, -1 = ไม่ลบเลย
+#    ข้อความ "ไป..." ที่ยังไม่กดกลับ จะไม่ถูกลบ (เห็นตลอดว่าใครยังไม่กลับ)
 try:
-    BREAK_MSG_DELETE_AFTER = float(os.environ.get("BREAK_MSG_DELETE_AFTER", "60"))
+    BREAK_MSG_DELETE_AFTER = float(os.environ.get("BREAK_MSG_DELETE_AFTER", "7200"))
 except ValueError:
-    BREAK_MSG_DELETE_AFTER = 60.0
+    BREAK_MSG_DELETE_AFTER = 7200.0
 
 # ---------------------------------------------------------------------------
 # Supabase client
@@ -60,7 +62,6 @@ EMPLOYEES: dict[str, dict] = {}  # telegram_id → {name, discord_id, allowed_sh
 # ดัชนีค้นกลับ — สร้างใหม่ทุกครั้งที่โหลดพนักงาน (เดิมสร้าง map ใหม่ซ้ำๆ หลายที่)
 NAME_BY_DISCORD: dict[str, str] = {}   # discord_id → ชื่อ
 TID_BY_NAME: dict[str, str] = {}       # ชื่อ → telegram_id
-_employees_loaded = False
 
 
 def staff_name_by_discord(discord_id) -> str | None:
@@ -68,7 +69,7 @@ def staff_name_by_discord(discord_id) -> str | None:
 
 async def load_employees_from_supabase() -> None:
     """โหลดข้อมูลพนักงานจาก Supabase K36 ตาราง users"""
-    global EMPLOYEES, NAME_BY_DISCORD, TID_BY_NAME, _employees_loaded
+    global EMPLOYEES, NAME_BY_DISCORD, TID_BY_NAME
     if not supabase:
         logger.warning("[EMPLOYEES] Supabase ไม่พร้อม — ใช้ข้อมูลเดิม")
         return
@@ -98,7 +99,6 @@ async def load_employees_from_supabase() -> None:
         EMPLOYEES = new_map
         NAME_BY_DISCORD = {v["discord_id"]: v["name"] for v in new_map.values()}
         TID_BY_NAME = {v["name"]: k for k, v in new_map.items()}
-        _employees_loaded = True
         logger.info(f"[EMPLOYEES] โหลดสำเร็จ {len(EMPLOYEES)} คน จาก Supabase K36")
     except Exception as e:
         logger.error(f"[EMPLOYEES] load error: {e}")
@@ -176,10 +176,6 @@ async def load_target_groups() -> None:
             logger.warning("[GROUPS] ไม่มีกลุ่มที่ใช้งานได้เลย — บอทจะไม่ดักข้อความจากที่ไหน")
     except Exception as e:
         logger.error(f"[GROUPS] load error: {e}")
-
-
-def get_group(chat_id) -> dict | None:
-    return GROUPS_BY_CHAT.get(norm_chat_id(chat_id))
 
 
 async def log_unknown_chat(event, chat_id: str) -> None:
@@ -573,16 +569,18 @@ class ActivityBot(discord.Client):
             spawn(self._break_sweeper())
 
     SWEEP_EVERY = 120          # วินาที
-    SWEEP_KEEP = 30 * 60       # ห้องที่มีคนกลับที่นั่ง จะถูกตรวจซ้ำต่ออีก 30 นาที
+    # ห้องที่มีคนกลับที่นั่ง จะถูกตรวจต่อไปจนเลยเวลาลบ + 30 นาที (ต้องนานกว่าเวลาลบ ไม่งั้นตามลบไม่ทัน)
+    SWEEP_KEEP = max(BREAK_MSG_DELETE_AFTER, 0) + 30 * 60
+    SWEEP_HISTORY = 200        # ย้อนดูกี่ข้อความต่อห้อง (รอ 2 ชม. ห้องที่คุยเยอะข้อความจะดันขึ้นไปไกล)
 
     async def _break_sweeper(self):
         """🧹 เก็บกวาดข้อความ "กลับที่นั่งแล้ว" ที่ค้าง ทุก 2 นาที
-        การลบหลัง 60 วิ เป็นงานในความจำ ถ้าบอทรีสตาร์ท/deploy ภายใน 60 วินั้น งานลบจะหาย → ตัวนี้ตามลบให้
+        การลบหลังหน่วงเวลา (ค่าเริ่มต้น 2 ชม.) เป็นงานในความจำ ถ้าบอทรีสตาร์ท/deploy ระหว่างรอ งานลบจะหาย → ตัวนี้ตามลบให้
         (ลบทั้งข้อความกลับที่นั่ง + ข้อความ "ไป..." ที่มันรีพลายอยู่)
 
         [FIX] เดิมอ่านประวัติทุกห้องทุก 2 นาที เปลือง API มาก
         ตอนนี้: รอบแรกหลังเปิดบอทตรวจทุกห้อง (เก็บของที่ค้างจากก่อนรีสตาร์ท)
-                รอบต่อไปตรวจเฉพาะห้องที่มีคนกลับที่นั่งใน 30 นาทีล่าสุด (เผื่องานลบหลัง 60 วิ พลาด)"""
+                รอบต่อไปตรวจเฉพาะห้องที่ยังมีข้อความกลับที่นั่งรอลบอยู่"""
         await asyncio.sleep(30)
         full = True
         while True:
@@ -610,11 +608,13 @@ class ActivityBot(discord.Client):
                 if not (perms.view_channel and perms.read_message_history):
                     continue
                 try:
-                    async for m in ch.history(limit=50):
+                    async for m in ch.history(limit=self.SWEEP_HISTORY):
                         parsed = parse_break_message(m, me_id)
                         if parsed is None or parsed[1] != "กลับที่นั่งแล้ว":
                             continue
                         if (now - m.created_at).total_seconds() < min_age:
+                            # ยังไม่ถึงเวลาลบ → จำห้องนี้ไว้ ตรวจซ้ำรอบหน้า (สำคัญตอนเพิ่งรีสตาร์ท บอทจะยังตามลบให้)
+                            self._sweep_channels[ch.id] = time_module.time()
                             continue
                         if m.reference and m.reference.message_id:
                             try:
