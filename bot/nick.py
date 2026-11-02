@@ -26,9 +26,12 @@ DEFAULT_WEB_EMOJI = {
     "NM9": "🔴", "VV72": "🔘", "TH26": "🟤", "K188": "🩷", "BT678": "⚪️",
 }
 
-# อีโมจิที่ Discord บน Windows แสดงในชื่อไม่ได้ (ขึ้นเป็นกล่อง □) → ใช้ตัวที่หน้าตาใกล้กันแทน เฉพาะในชื่อ
-# (🩷 เป็นอีโมจิใหม่ Unicode 15 — ในข้อความ Telegram ยังใช้ 🩷 ตามที่ตั้งในเว็บได้ปกติ)
-NICK_EMOJI_FALLBACK = {"🩷": "💗", "🩵": "💙", "🩶": "🤍"}
+# อีโมจิที่ Discord แสดงในชื่อไม่ได้ (ขึ้นเป็นกล่อง □) → ใช้ตัวอื่นแทน เฉพาะในชื่อ
+# 🩷 (K188 สีชมพู) เป็นอีโมจิใหม่ Unicode 15 และไม่มีวงกลมสีชมพู → ใช้ ⭕ ให้กลมเหมือนเว็บอื่น
+# (ในข้อความ Telegram ยังใช้ 🩷 ตามที่ตั้งในเว็บได้ปกติ)
+NICK_EMOJI_FALLBACK = {"🩷": "⭕", "🩵": "💙", "🩶": "🤍"}
+# สีที่บอทเคยใส่ในชื่อรุ่นก่อน → ยังต้องรู้จัก เพื่อเอาออกจากชื่อเก่าได้
+LEGACY_NICK_WEB_EMOJIS = {"💗"}
 
 VS16 = "\ufe0f"                    # ตัวแปรรูปอีโมจิ (⚫️ = ⚫ + VS16) — พิมพ์มาบ้างไม่มาบ้าง ต้องรับทั้งคู่
 
@@ -106,7 +109,8 @@ def web_emoji_map(webs) -> dict[str, str]:
 
 def all_web_emojis(web_map: dict[str, str]) -> set[str]:
     """สีเว็บทั้งหมดที่อาจอยู่ในชื่อ (รวมตัวเดิมก่อนแทน เช่น 🩷 — เพื่อให้ลบออกจากชื่อเก่าได้)"""
-    return set(web_map.values()) | set(DEFAULT_WEB_EMOJI.values()) | set(NICK_EMOJI_FALLBACK)
+    return (set(web_map.values()) | set(DEFAULT_WEB_EMOJI.values()) | set(NICK_EMOJI_FALLBACK)
+            | set(NICK_EMOJI_FALLBACK.values()) | LEGACY_NICK_WEB_EMOJIS)
 
 
 def work_date(shift: str, now: datetime) -> str:
