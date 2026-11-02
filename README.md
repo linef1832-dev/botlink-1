@@ -23,7 +23,7 @@
 | `TELEGRAM_SESSION` | ✅ | ได้จาก `python bot/auth.py` |
 | `SUPABASE_URL` / `SUPABASE_KEY` | ✅ | ฐานข้อมูล K36 |
 | `DISCORD_STATUS_CHANNEL_ID` | | ห้องแจ้งสถานะบอท + ห้องที่ใช้ `/status` ได้ |
-| `TELEGRAM_TZ_OFFSET` | | โซนเวลาในข้อความ Telegram (ค่าเริ่มต้น `8` = เวลาจีน, ตั้ง `7` ถ้าเป็นเวลาไทย) |
+| `TELEGRAM_TZ_OFFSET` | | โซนเวลาในข้อความ Telegram (ค่าเริ่มต้น `7` = เวลาไทย ไม่แปลง, ตั้ง `8` ถ้าบอทต้นทางเปลี่ยนเป็นเวลาจีน) |
 | `BREAK_MSG_DELETE_AFTER` | | ลบข้อความพักหลังกลับที่นั่งกี่วินาที (ค่าเริ่มต้น `7200` = 2 ชม., `-1` = ไม่ลบ) |
 | `CLEAR_ALLOWED_ROLES` | | role ที่ใช้ `/clear_break_messages` ได้ คั่นด้วย `,` (ค่าเริ่มต้น `PTT`) |
 | `LOG_UNKNOWN_GROUPS` | | `1` = พิมพ์ chat_id ของกลุ่มที่ยังไม่ได้ตั้งค่า (ใช้ตอนหา chat_id กลุ่มใหม่) |

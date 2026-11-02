@@ -251,15 +251,15 @@ def get_break_reason(activity: str) -> str:
 
 
 # โซนเวลา
-#   TG_TZ = โซนของเวลาที่บอทเช็คอินฝั่ง Telegram พิมพ์มาในข้อความ = เวลาจีน (UTC+8)
+#   TG_TZ = โซนของเวลาที่บอทเช็คอินฝั่ง Telegram พิมพ์มาในข้อความ = เวลาไทย (UTC+7)
+#           (ตรวจกับข้อความจริงแล้ว: ข้อความส่ง 23:11 ไทย เวลาในข้อความก็ 23:11 → ไม่ต้องแปลงโซน)
 #   TH_TZ = โซนไทย (UTC+7) ที่ใช้เก็บลง DB และแสดงใน Discord
-# เวลาจากข้อความ Telegram จะถูกอ่านเป็น +8 แล้วแปลงเป็นไทย (ลบ 1 ชั่วโมง) ทุกครั้ง
-# ถ้าวันหนึ่งบอทต้นทางเปลี่ยนโซน ตั้ง env TELEGRAM_TZ_OFFSET ได้เลย (เช่น 7 = ไม่แปลง) ไม่ต้องแก้โค้ด
+# ถ้าวันหนึ่งบอทต้นทางเปลี่ยนไปใช้โซนอื่น ตั้ง env TELEGRAM_TZ_OFFSET ได้เลย (เช่น 8 = เวลาจีน) ไม่ต้องแก้โค้ด
 # (TH_TZ import มาจาก chat_count.py — ประกาศไว้ที่เดียว)
 try:
-    _TG_OFFSET_HOURS = float(os.environ.get("TELEGRAM_TZ_OFFSET", "8"))
+    _TG_OFFSET_HOURS = float(os.environ.get("TELEGRAM_TZ_OFFSET", "7"))
 except ValueError:
-    _TG_OFFSET_HOURS = 8.0
+    _TG_OFFSET_HOURS = 7.0
 TG_TZ = timezone(timedelta(hours=_TG_OFFSET_HOURS))
 
 
@@ -276,7 +276,7 @@ def get_break_date_from_time(dt: datetime) -> str:
 
 
 def parse_telegram_timestamp(ts_str: str | None) -> datetime | None:
-    """แปลง timestamp จากข้อความ Telegram ("dd/mm HH:MM:SS" เวลาจีน UTC+8) เป็น datetime ไทย (UTC+7)
+    """แปลง timestamp จากข้อความ Telegram ("dd/mm HH:MM:SS" ในโซน TG_TZ) เป็น datetime ไทย (UTC+7)
 
     ข้อความไม่มีปีมาด้วย และบางทีเป็น dd/mm บางทีเป็น mm/dd
     → ลองทุกแบบ (ปีที่แล้ว/ปีนี้/ปีหน้า × dd/mm/mm/dd) แล้วเลือกอันที่ใกล้เวลาปัจจุบันที่สุด
@@ -304,7 +304,7 @@ def parse_telegram_timestamp(ts_str: str | None) -> datetime | None:
 
         if best is None:
             return None
-        best = best.astimezone(TH_TZ)                    # จีน +8 → ไทย +7
+        best = best.astimezone(TH_TZ)                    # แปลงเป็นเวลาไทย (ถ้า TG_TZ = +7 อยู่แล้ว ค่าไม่เปลี่ยน)
         logger.info(f"[parse_timestamp] {ts_str!r} (UTC{_TG_OFFSET_HOURS:+g}) → {best.strftime('%Y-%m-%d %H:%M:%S')} ไทย")
         return best
     except Exception as e:
@@ -797,7 +797,7 @@ class ActivityBot(discord.Client):
                                  is_return: bool, group_name: str, timestamp: str | None = None) -> tuple[bool, str | None]:
         emoji = get_emoji(activity, is_return)
         action = f"**{name}** กลับที่นั่งแล้ว" if is_return else f"**{name}** ไป{activity}"
-        # timestamp จาก Telegram เป็นเวลาจีน → แปลงเป็นเวลาไทยก่อนแสดง (ให้ตรงกับที่เก็บลง DB)
+        # อ่านเวลาจากข้อความ Telegram เป็นเวลาไทย (ตัวเดียวกับที่เก็บลง DB)
         th_dt = parse_telegram_timestamp(timestamp) if timestamp else None
         if th_dt is not None:
             time_part = th_dt.strftime("%H:%M")
