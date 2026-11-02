@@ -247,6 +247,7 @@ NICK_STATUS_ENABLED = os.environ.get("NICK_STATUS", "1").strip() != "0"
 STATUS_NICK_EMOJIS = tuple(sorted(set(ACTIVITY_EMOJI.values()) | set(BREAK_REASON_EMOJI.values()) | {"🚶"},
                                   key=len, reverse=True))
 NICK_MAX = 32                     # Discord จำกัดชื่อเล่นไม่เกิน 32 ตัวอักษร
+NICK_RETRY_AFTER = 300            # เปลี่ยนชื่อไม่ได้ → รอกี่วินาทีค่อยลองใหม่
 
 
 def strip_status_prefix(nick: str | None) -> str | None:
@@ -560,7 +561,9 @@ class ActivityBot(discord.Client):
         self._last_work_channel: dict[int, int] = {}
         # ── อีโมจิหน้าชื่อ ── member_id → ชื่อเล่นเดิมก่อนใส่อีโมจิ (None = ไม่ได้ตั้งชื่อเล่น)
         self._orig_nick: dict[int, str | None] = {}
-        self._nick_forbidden: set[int] = set()     # เปลี่ยนชื่อไม่ได้ (เจ้าของเซิร์ฟ / role สูงกว่าบอท) → ไม่ลองซ้ำ
+        # เปลี่ยนชื่อไม่ได้ (role สูงกว่าบอท) → member_id: เวลาที่ลองล่าสุด
+        # พักไว้ 5 นาทีค่อยลองใหม่ (ถ้าแอดมินแก้ลำดับ role แล้ว จะใช้ได้เองโดยไม่ต้องรีสตาร์ทบอท)
+        self._nick_forbidden: dict[int, float] = {}
         # channel_id → เวลาที่แจ้งกลับที่นั่งล่าสุด (ตัวเก็บกวาดตรวจเฉพาะห้องเหล่านี้)
         self._sweep_channels: dict[int, float] = {}
 
@@ -636,11 +639,12 @@ class ActivityBot(discord.Client):
 
     async def set_status_nick(self, member: discord.Member, emoji: str | None) -> None:
         """ใส่อีโมจิสถานะหน้าชื่อ (emoji) หรือคืนชื่อเดิม (emoji=None)"""
-        if not NICK_STATUS_ENABLED or member.id in self._nick_forbidden:
+        if not NICK_STATUS_ENABLED:
             return
         if member.id == getattr(member.guild, "owner_id", None):
-            self._nick_forbidden.add(member.id)
-            logger.info(f"[NICK] {member} เป็นเจ้าของเซิร์ฟเวอร์ — Discord ไม่ให้บอทเปลี่ยนชื่อ")
+            return                                              # Discord ไม่ให้บอทเปลี่ยนชื่อเจ้าของเซิร์ฟเวอร์
+        last_fail = self._nick_forbidden.get(member.id)
+        if last_fail is not None and time_module.time() - last_fail < NICK_RETRY_AFTER:
             return
         current = member.nick
         base_nick = strip_status_prefix(current)              # ชื่อเล่นที่ไม่มีอีโมจิสถานะ
@@ -664,11 +668,17 @@ class ActivityBot(discord.Client):
         try:
             await member.edit(nick=new, reason="สถานะพัก (botlink)")
         except discord.Forbidden:
-            self._nick_forbidden.add(member.id)
-            logger.warning(f"[NICK] เปลี่ยนชื่อ {member} ไม่ได้ — ต้องให้สิทธิ์ Manage Nicknames "
-                           f"และลาก role ของบอทให้สูงกว่า role ของคนนี้")
+            self._nick_forbidden[member.id] = time_module.time()
+            if emoji is not None:
+                self._orig_nick.pop(member.id, None)
+            top = getattr(getattr(member, "top_role", None), "name", "?")
+            logger.warning(f"[NICK] เปลี่ยนชื่อ {member} ไม่ได้ — role สูงสุดของคนนี้คือ '{top}' "
+                           f"ต้องลาก role ของบอทให้อยู่เหนือ role นี้ (และเปิดสิทธิ์ Manage Nicknames)")
+            return
         except discord.HTTPException as e:
             logger.warning(f"[NICK] เปลี่ยนชื่อ {member} ไม่สำเร็จ: {e}")
+            return
+        self._nick_forbidden.pop(member.id, None)
 
     async def cleanup_status_nicks(self) -> int:
         """คืนชื่อให้พนักงานที่ยังมีอีโมจิสถานะค้าง แต่ไม่ได้พักอยู่แล้ว (เช่น บอทรีสตาร์ทตอนเขากดกลับ)"""
@@ -769,6 +779,13 @@ class ActivityBot(discord.Client):
         await self._ready_event.wait()
 
     # ห้อง Discord เพิ่ม/ลบ/เปลี่ยนชื่อ → ส่งรายชื่อห้องใหม่ให้หน้าเว็บนับแชททันที
+    async def on_guild_role_update(self, before, after):
+        self._nick_forbidden.clear()        # แอดมินแก้ role/ลำดับ role → ลองเปลี่ยนชื่อใหม่ได้ทันที
+
+    async def on_member_update(self, before, after):
+        if self.user and after.id == self.user.id and before.roles != after.roles:
+            self._nick_forbidden.clear()    # บอทได้ role ใหม่
+
     async def on_guild_channel_create(self, channel):
         if chat_count is not None:
             chat_count.request_channel_publish()
