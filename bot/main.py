@@ -460,9 +460,13 @@ def parse_message(text: str, group_name: str, chat_id: str = "") -> dict | None:
     }
 
 
-# ข้อความแจ้งพักของบอทใน Discord:  "{emoji} **ชื่อ** ไป...\n> 🕐 HH:MM · 📌 กลุ่ม"
-#                                   "✅ **ชื่อ** กลับที่นั่งแล้ว\n> 🕐 HH:MM · 📌 กลุ่ม"
-_BREAK_MSG_RE = re.compile(r"\*\*(.+?)\*\* (กลับที่นั่งแล้ว|ไป)")
+# ข้อความแจ้งพักของบอทใน Discord:  "{emoji} **ชื่อ** ไป...\n> 🕐 HH:MM"
+#                                   "✅ **ชื่อ** กลับที่นั่งแล้ว\n> 🕐 HH:MM"
+# (ข้อความรุ่นเก่ามี " · 📌 ชื่อกลุ่ม" ต่อท้าย — ยังจับได้ เพื่อให้ลบข้อความเก่าที่ค้างอยู่ได้ด้วย)
+# ต้องตรงทั้งข้อความ ไม่ใช่แค่บางส่วน — กันไปจับข้อความอื่นของบอท (สถานะ / นับแชท)
+_BREAK_MSG_RE = re.compile(
+    r"[^\s*]+ \*\*(.+?)\*\* (กลับที่นั่งแล้ว|ไป)[^\n]*\n> 🕐 \d{1,2}:\d{2}(?: · 📌 [^\n]*)?"
+)
 
 
 def parse_break_message(m, bot_user_id) -> tuple[str, str] | None:
@@ -470,10 +474,7 @@ def parse_break_message(m, bot_user_id) -> tuple[str, str] | None:
     ใช้ร่วมกันทั้งตัวเก็บกวาดอัตโนมัติ และคำสั่ง /clear_break_messages"""
     if bot_user_id is None or m.author.id != bot_user_id:
         return None
-    content = m.content or ""
-    if "\n> 🕐 " not in content or "📌" not in content:
-        return None                                   # ไม่ใช่ข้อความแจ้งพัก (เช่น ข้อความนับแชท/สถานะ)
-    mt = _BREAK_MSG_RE.search(content)
+    mt = _BREAK_MSG_RE.fullmatch((m.content or "").strip())   # ไม่ตรงรูปแบบ = ไม่ใช่ข้อความแจ้งพัก
     return (mt.group(1), mt.group(2)) if mt else None
 
 
@@ -763,7 +764,7 @@ class ActivityBot(discord.Client):
             time_part = timestamp.split(" ")[-1][:5]   # อ่านไม่ออก → แสดงตามข้อความเดิม
         else:
             time_part = get_thai_time().strftime("%H:%M")
-        message = f"{emoji} {action}\n> 🕐 {time_part} · 📌 {group_name}"
+        message = f"{emoji} {action}\n> 🕐 {time_part}"           # (ตัดชื่อกลุ่มออก ให้ข้อความสั้นลง)
 
         guild, member = await self.find_member(discord_user_id)
         if member is None:
