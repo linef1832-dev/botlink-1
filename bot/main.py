@@ -1,6 +1,7 @@
 import asyncio
 import re
 import os
+import sys
 import logging
 import time as time_module
 from collections import defaultdict
@@ -12,11 +13,15 @@ from telethon.errors import AuthKeyDuplicatedError
 import discord
 from supabase import create_client, Client as SupabaseClient
 
-from chat_count import ChatCount, spawn, delete_messages_safely
+from chat_count import ChatCount, spawn, delete_messages_safely, TH_TZ
 
+# เวลาใน log เป็นเวลาไทย (เดิมเป็นเวลา server = UTC) และพิมพ์ออก stdout
+# (Railway ระบายแดงทุกบรรทัดที่ออก stderr ทำให้ INFO ธรรมดาดูเหมือน error)
+logging.Formatter.converter = staticmethod(lambda ts: datetime.fromtimestamp(ts, TH_TZ).timetuple())
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
 )
 logger = logging.getLogger("bot")
 # 🔒 ปิด log ระดับ INFO ของไลบรารีที่พิมพ์ API key ของ Supabase ออกมา (realtime พิมพ์ URL ที่มี apikey เต็มๆ)
@@ -52,11 +57,18 @@ async def sb(fn):
 # EMPLOYEES โหลดจาก Supabase K36 แทน hardcode
 # ---------------------------------------------------------------------------
 EMPLOYEES: dict[str, dict] = {}  # telegram_id → {name, discord_id, allowed_shift}
+# ดัชนีค้นกลับ — สร้างใหม่ทุกครั้งที่โหลดพนักงาน (เดิมสร้าง map ใหม่ซ้ำๆ หลายที่)
+NAME_BY_DISCORD: dict[str, str] = {}   # discord_id → ชื่อ
+TID_BY_NAME: dict[str, str] = {}       # ชื่อ → telegram_id
 _employees_loaded = False
+
+
+def staff_name_by_discord(discord_id) -> str | None:
+    return NAME_BY_DISCORD.get(str(discord_id))
 
 async def load_employees_from_supabase() -> None:
     """โหลดข้อมูลพนักงานจาก Supabase K36 ตาราง users"""
-    global EMPLOYEES, _employees_loaded
+    global EMPLOYEES, NAME_BY_DISCORD, TID_BY_NAME, _employees_loaded
     if not supabase:
         logger.warning("[EMPLOYEES] Supabase ไม่พร้อม — ใช้ข้อมูลเดิม")
         return
@@ -84,6 +96,8 @@ async def load_employees_from_supabase() -> None:
                     "department": dept,
                 }
         EMPLOYEES = new_map
+        NAME_BY_DISCORD = {v["discord_id"]: v["name"] for v in new_map.values()}
+        TID_BY_NAME = {v["name"]: k for k, v in new_map.items()}
         _employees_loaded = True
         logger.info(f"[EMPLOYEES] โหลดสำเร็จ {len(EMPLOYEES)} คน จาก Supabase K36")
     except Exception as e:
@@ -240,12 +254,12 @@ def get_break_reason(activity: str) -> str:
 #   TH_TZ = โซนไทย (UTC+7) ที่ใช้เก็บลง DB และแสดงใน Discord
 # เวลาจากข้อความ Telegram จะถูกอ่านเป็น +8 แล้วแปลงเป็นไทย (ลบ 1 ชั่วโมง) ทุกครั้ง
 # ถ้าวันหนึ่งบอทต้นทางเปลี่ยนโซน ตั้ง env TELEGRAM_TZ_OFFSET ได้เลย (เช่น 7 = ไม่แปลง) ไม่ต้องแก้โค้ด
+# (TH_TZ import มาจาก chat_count.py — ประกาศไว้ที่เดียว)
 try:
     _TG_OFFSET_HOURS = float(os.environ.get("TELEGRAM_TZ_OFFSET", "8"))
 except ValueError:
     _TG_OFFSET_HOURS = 8.0
 TG_TZ = timezone(timedelta(hours=_TG_OFFSET_HOURS))
-TH_TZ = timezone(timedelta(hours=7))
 
 
 def get_thai_time() -> datetime:
@@ -446,6 +460,23 @@ def parse_message(text: str, group_name: str, chat_id: str = "") -> dict | None:
     }
 
 
+# ข้อความแจ้งพักของบอทใน Discord:  "{emoji} **ชื่อ** ไป...\n> 🕐 HH:MM · 📌 กลุ่ม"
+#                                   "✅ **ชื่อ** กลับที่นั่งแล้ว\n> 🕐 HH:MM · 📌 กลุ่ม"
+_BREAK_MSG_RE = re.compile(r"\*\*(.+?)\*\* (กลับที่นั่งแล้ว|ไป)")
+
+
+def parse_break_message(m, bot_user_id) -> tuple[str, str] | None:
+    """ถ้าเป็นข้อความแจ้งพักของบอท คืน (ชื่อ, "กลับที่นั่งแล้ว" หรือ "ไป") ไม่ใช่คืน None
+    ใช้ร่วมกันทั้งตัวเก็บกวาดอัตโนมัติ และคำสั่ง /clear_break_messages"""
+    if bot_user_id is None or m.author.id != bot_user_id:
+        return None
+    content = m.content or ""
+    if "\n> 🕐 " not in content or "📌" not in content:
+        return None                                   # ไม่ใช่ข้อความแจ้งพัก (เช่น ข้อความนับแชท/สถานะ)
+    mt = _BREAK_MSG_RE.search(content)
+    return (mt.group(1), mt.group(2)) if mt else None
+
+
 # ---------------------------------------------------------------------------
 # Discord bot
 # ---------------------------------------------------------------------------
@@ -476,6 +507,8 @@ class ActivityBot(discord.Client):
         self._last_activity_message: dict[int, discord.Message] = {}
         # member_id ที่ถูกย้ายไปห้องปลายทาง (เช่น Dining) — คนเหล่านี้เท่านั้นที่ต้องย้ายกลับ
         self._moved_to_destination: set[int] = set()
+        # channel_id → เวลาที่แจ้งกลับที่นั่งล่าสุด (ตัวเก็บกวาดตรวจเฉพาะห้องเหล่านี้)
+        self._sweep_channels: dict[int, float] = {}
 
     async def setup_hook(self):
         self._commands_synced = False
@@ -519,47 +552,63 @@ class ActivityBot(discord.Client):
             self._sweeper_started = True
             spawn(self._break_sweeper())
 
+    SWEEP_EVERY = 120          # วินาที
+    SWEEP_KEEP = 30 * 60       # ห้องที่มีคนกลับที่นั่ง จะถูกตรวจซ้ำต่ออีก 30 นาที
+
     async def _break_sweeper(self):
         """🧹 เก็บกวาดข้อความ "กลับที่นั่งแล้ว" ที่ค้าง ทุก 2 นาที
         การลบหลัง 60 วิ เป็นงานในความจำ ถ้าบอทรีสตาร์ท/deploy ภายใน 60 วินั้น งานลบจะหาย → ตัวนี้ตามลบให้
-        (ลบทั้งข้อความกลับที่นั่ง + ข้อความ "ไป..." ที่มันรีพลายอยู่)"""
+        (ลบทั้งข้อความกลับที่นั่ง + ข้อความ "ไป..." ที่มันรีพลายอยู่)
+
+        [FIX] เดิมอ่านประวัติทุกห้องทุก 2 นาที เปลือง API มาก
+        ตอนนี้: รอบแรกหลังเปิดบอทตรวจทุกห้อง (เก็บของที่ค้างจากก่อนรีสตาร์ท)
+                รอบต่อไปตรวจเฉพาะห้องที่มีคนกลับที่นั่งใน 30 นาทีล่าสุด (เผื่องานลบหลัง 60 วิ พลาด)"""
         await asyncio.sleep(30)
+        full = True
         while True:
             try:
-                min_age = max(BREAK_MSG_DELETE_AFTER, 0) + 10
-                now = datetime.now(timezone.utc)
-                removed = 0
-                for g in self.guilds:
-                    for ch in [*g.voice_channels, *g.text_channels]:
-                        perms = ch.permissions_for(g.me)
-                        if not (perms.view_channel and perms.read_message_history):
-                            continue
-                        try:
-                            async for m in ch.history(limit=50):
-                                if m.author.id != self.user.id:
-                                    continue
-                                c = m.content or ""
-                                if "** กลับที่นั่งแล้ว" not in c or "📌" not in c:
-                                    continue
-                                if (now - m.created_at).total_seconds() < min_age:
-                                    continue
-                                if m.reference and m.reference.message_id:
-                                    try:
-                                        await ch.get_partial_message(m.reference.message_id).delete()
-                                    except Exception:
-                                        pass
-                                try:
-                                    await m.delete()
-                                    removed += 1
-                                except Exception:
-                                    pass
-                        except Exception:
-                            continue
+                removed = await self._sweep_once(full)
+                full = False
                 if removed:
                     logger.info(f"[SWEEP] ลบข้อความกลับที่นั่งที่ค้าง {removed} ชุด")
             except Exception as e:
                 logger.warning(f"[SWEEP] error: {e}")
-            await asyncio.sleep(120)
+            await asyncio.sleep(self.SWEEP_EVERY)
+
+    async def _sweep_once(self, full: bool) -> int:
+        min_age = max(BREAK_MSG_DELETE_AFTER, 0) + 10
+        now = datetime.now(timezone.utc)
+        cutoff = time_module.time() - self.SWEEP_KEEP
+        self._sweep_channels = {cid: t for cid, t in self._sweep_channels.items() if t >= cutoff}
+        me_id = self.user.id if self.user else None
+        removed = 0
+        for g in self.guilds:
+            for ch in [*g.voice_channels, *g.text_channels]:
+                if not full and ch.id not in self._sweep_channels:
+                    continue
+                perms = ch.permissions_for(g.me)
+                if not (perms.view_channel and perms.read_message_history):
+                    continue
+                try:
+                    async for m in ch.history(limit=50):
+                        parsed = parse_break_message(m, me_id)
+                        if parsed is None or parsed[1] != "กลับที่นั่งแล้ว":
+                            continue
+                        if (now - m.created_at).total_seconds() < min_age:
+                            continue
+                        if m.reference and m.reference.message_id:
+                            try:
+                                await ch.get_partial_message(m.reference.message_id).delete()
+                            except Exception:
+                                pass
+                        try:
+                            await m.delete()
+                            removed += 1
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+        return removed
 
     async def send_status(self, message: str):
         """ส่งข้อความสถานะไปยัง DISCORD_STATUS_CHANNEL_ID ถ้ากำหนดไว้"""
@@ -818,6 +867,7 @@ class ActivityBot(discord.Client):
                         sent_msg = await notify_vc.send(message)
                     self._last_activity_message.pop(member.id, None)
                     self._last_notified_channel.pop(member.id, None)   # จับคู่ไป-กลับครบแล้ว
+                    self._sweep_channels[notify_vc.id] = time_module.time()   # ให้ตัวเก็บกวาดตามดูห้องนี้
                     # 🧹 กลับที่นั่งแล้ว → ลบชุดข้อความ (แจ้งไป + แจ้งกลับ) ออกจากห้อง หลังหน่วงเวลาให้เห็นสักครู่
                     if BREAK_MSG_DELETE_AFTER >= 0:
                         for msg in (ref_msg, sent_msg):
@@ -848,13 +898,12 @@ TG_CLIENT: TelegramClient | None = None
 # 📊 นับแชท — ตั้งค่าในหน้า K36 แท็บ "นับแชท"
 chat_count: ChatCount | None = (
     ChatCount(discord_bot, supabase, lambda: EMPLOYEES, lambda: TG_CLIENT,
-              norm_chat_id, load_employees_from_supabase)
+              norm_chat_id, load_employees_from_supabase, staff_name_by_discord)
     if supabase else None
 )
 
 
 # ── 🧹 ล้างข้อความแจ้งพักเก่า ─────────────────────────────────────────
-_BREAK_MSG_RE = re.compile(r"\*\*(.+?)\*\* (กลับที่นั่งแล้ว|ไป)")
 KEEP_OPEN_BREAK_HOURS = 3   # ข้อความ "ไป..." ที่ยังไม่มีคู่ "กลับที่นั่ง" และใหม่กว่านี้ = อาจยังพักอยู่ → เก็บไว้
 
 
@@ -864,16 +913,12 @@ async def _purge_break_messages(channel, since: datetime) -> int:
     now = datetime.now(timezone.utc)
     returned: set[str] = set()
     to_delete: list[discord.Message] = []
+    me_id = me.id if me else None
     async for m in channel.history(after=since, limit=None, oldest_first=False):   # ใหม่ → เก่า (since=None = ทั้งหมด)
-        if me is None or m.author.id != me.id:
+        parsed = parse_break_message(m, me_id)
+        if parsed is None:
             continue
-        content = m.content or ""
-        if "\n> 🕐 " not in content or "📌" not in content:
-            continue                                   # ไม่ใช่ข้อความแจ้งพัก (เช่น ข้อความนับแชท/สถานะ)
-        mt = _BREAK_MSG_RE.search(content)
-        if not mt:
-            continue
-        name, kind = mt.group(1), mt.group(2)
+        name, kind = parsed
         if kind == "กลับที่นั่งแล้ว":
             to_delete.append(m)
             returned.add(name)
@@ -984,9 +1029,6 @@ async def status_command(interaction: discord.Interaction):
              f"⏱ Hour slot: `{hour:02d}:00 – {(hour+1)%24:02d}:00`",
              ""]
 
-    # สร้าง reverse map: discord_id → name
-    discord_to_name = {v["discord_id"]: v["name"] for v in EMPLOYEES.values()}
-
     # รวบรวมข้อมูลห้องทำงานของทุกคนที่มีสถิติ
     work_info: list[tuple[str, str, float]] = []  # (name, channel_name, seconds)
     # ทุกคนที่มีสถิติชั่วโมงนี้ + คนที่อยู่ในห้องเสียงตอนนี้ (รวม session ที่กำลังอยู่)
@@ -1003,7 +1045,7 @@ async def status_command(interaction: discord.Interaction):
         ch_obj = discord_bot.get_channel(best_ch_id)
         ch_name = f"#{ch_obj.name}" if ch_obj else f"ID:{best_ch_id}"
         disc_id = str(member_id)
-        name = discord_to_name.get(disc_id, disc_id)
+        name = staff_name_by_discord(disc_id) or disc_id
         work_info.append((name, ch_name, best_secs))
 
     if work_info:
@@ -1037,10 +1079,9 @@ async def supabase_restore_open_breaks() -> None:
         if not res.data:
             logger.info("[Supabase] ไม่มี open break sessions ค้างอยู่")
             return
-        name_to_tid = {v["name"]: k for k, v in EMPLOYEES.items()}
         restored = 0
         for r in res.data:
-            tid = name_to_tid.get(r["staff_name"])
+            tid = TID_BY_NAME.get(r["staff_name"])
             if tid and tid not in _currently_out:
                 _currently_out[tid] = ""  # ไม่รู้ group_name เดิม
                 restored += 1

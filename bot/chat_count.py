@@ -31,7 +31,7 @@ import discord
 
 logger = logging.getLogger("bot.chatcount")
 
-TH_TZ = timezone(timedelta(hours=7))
+TH_TZ = timezone(timedelta(hours=7))   # โซนเวลาไทย — main.py import จากที่นี่ (ประกาศที่เดียว)
 SETTINGS_TABLE = "chatcount_settings"
 SCHEDULES_TABLE = "chatcount_schedules"
 ROUNDS_TABLE = "chatcount_rounds"
@@ -289,6 +289,7 @@ class ChatCount:
         get_tg_client: Callable[[], object | None],
         norm_chat_id: Callable[[object], str],
         load_employees: Callable[[], Awaitable[None]] | None = None,
+        find_staff_name: Callable[[object], str | None] | None = None,
     ):
         self.bot = bot
         self.db = supabase
@@ -296,6 +297,7 @@ class ChatCount:
         self.get_tg_client = get_tg_client
         self.norm_chat_id = norm_chat_id
         self.load_employees = load_employees
+        self.find_staff_name = find_staff_name
 
         self.webs: list = []
         self.web_names: list[str] = []
@@ -329,6 +331,8 @@ class ChatCount:
         return ch if isinstance(ch, MessageableChannel) else None
 
     def _staff_name(self, discord_id) -> str | None:
+        if self.find_staff_name is not None:
+            return self.find_staff_name(discord_id)   # ใช้ดัชนีของ main.py (ไม่ต้องวนหาทุกครั้ง)
         did = str(discord_id)
         for emp in (self.get_employees() or {}).values():
             if str(emp.get("discord_id")) == did:
@@ -353,6 +357,27 @@ class ChatCount:
         res = await self._db(lambda: self.db.from_(ANSWERS_TABLE).select("*").eq("round_id", rid)
                              .order("created_at").execute())
         return res.data or []
+
+    async def _reply_chain(self, ch, qid: int, limit: int | None,
+                           accept: Callable[[discord.Message], bool] | None = None,
+                           extra: Callable[[discord.Message, int], bool] | None = None,
+                           out: list | None = None) -> list[discord.Message]:
+        """ไล่ข้อความหลังคำถาม เก็บทุกข้อความที่ "รีพลายต่อกันเป็นสาย" จากคำถาม (ใช้ร่วมกันระหว่าง catch-up กับเก็บกวาด)
+            accept(m)      = เงื่อนไขเพิ่มว่าข้อความในสายนี้นับไหม
+            extra(m, ref)  = เก็บข้อความที่ไม่ได้อยู่ในสายด้วย ถ้าเงื่อนไขนี้จริง
+            out            = ส่ง list มาเอง ถ้าอยากได้ข้อความที่เก็บได้ก่อนเจอ error ด้วย
+        error อ่านห้องไม่ได้ (Forbidden/HTTPException) ส่งต่อให้ผู้เรียกจัดการ"""
+        chain: set[int] = {qid}
+        if out is None:
+            out = []
+        async for m in ch.history(after=discord.Object(id=qid), limit=limit, oldest_first=True):
+            ref = m.reference.message_id if m.reference else None
+            if ref is None:
+                continue
+            if (ref in chain and (accept is None or accept(m))) or (extra is not None and extra(m, ref)):
+                chain.add(m.id)
+                out.append(m)
+        return out
 
     # ---------------- ลูปหลัก ----------------
     async def run(self) -> None:
@@ -484,33 +509,51 @@ class ChatCount:
             logger.error(f"[CHATCOUNT] publish telegram groups error: {e} (รัน chatcount_v2.sql แล้วหรือยัง?)")
 
     # ---------------- ตั้งเวลา ----------------
+    async def _auto_round_exists(self, sid: int, round_date: str) -> bool:
+        """มีรอบอัตโนมัติของตารางนี้ในวันนั้นแล้วหรือยัง (กันสร้างซ้ำหลังบอทรีสตาร์ท โดยไม่ต้องพึ่ง unique index)"""
+        try:
+            res = await self._db(lambda: self.db.from_(ROUNDS_TABLE).select("id")
+                                 .eq("schedule_id", sid).eq("round_date", round_date).eq("trigger", "auto")
+                                 .limit(1).execute())
+            return bool(res.data)
+        except Exception as e:
+            logger.warning(f"[CHATCOUNT] เช็ครอบซ้ำไม่ได้ ({e}) → ให้ unique index ใน DB กันแทน")
+            return False
+
     async def _schedule_tick(self) -> None:
         now = datetime.now(TH_TZ)
-        today = now.date().isoformat()
-        self._fired = {k for k in self._fired if k[1] == today}   # ล้างของวันก่อนๆ ทิ้ง
+        today = now.date()
+        keep = {today.isoformat(), (today - timedelta(days=1)).isoformat()}
+        self._fired = {k for k in self._fired if k[1] in keep}   # ล้างของวันก่อนๆ ทิ้ง
         res = await self._db(lambda: self.db.from_(SCHEDULES_TABLE).select("*").eq("active", True).execute())
         for s in res.data or []:
             sid = int(s["id"])
-            if (sid, today) in self._fired:
-                continue
             try:
                 hh, mm = map(int, str(s.get("time") or "").split(":")[:2])
             except ValueError:
                 continue
             # ส่งทุกวันเสมอ (ไม่ใช้ช่อง days แล้ว)
-            due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-            delta = (now - due).total_seconds()
-            if not (0 <= delta < FIRE_WINDOW):
-                continue
-            self._fired.add((sid, today))
-            row = self.round_from_schedule(s, today, "auto")
-            try:
-                ins = await self._db(lambda: self.db.from_(ROUNDS_TABLE).insert(row).execute())
-                logger.info(f"[CHATCOUNT] เริ่มรอบ '{row['label']}' ({today}) id={(ins.data or [{}])[0].get('id')}")
-            except Exception as e:
-                # ชน unique index = มีรอบของวันนี้แล้ว (เช่น บอทรีสตาร์ท) → ข้าม
-                if "duplicate" not in str(e).lower() and "23505" not in str(e):
-                    logger.error(f"[CHATCOUNT] create round error: {e}")
+            # เช็คทั้งรอบของวันนี้และเมื่อวาน — [FIX] รอบใกล้เที่ยงคืน (เช่น 23:55) ที่บอทรีสตาร์ทข้ามวันพอดี
+            # เดิมจะหลุดไปเลย เพราะเทียบกับเวลาของ "วันนี้" อย่างเดียว
+            for day in (today, today - timedelta(days=1)):
+                round_date = day.isoformat()
+                if (sid, round_date) in self._fired:
+                    continue
+                due = datetime(day.year, day.month, day.day, hh, mm, tzinfo=TH_TZ)
+                delta = (now - due).total_seconds()
+                if not (0 <= delta < FIRE_WINDOW):
+                    continue
+                self._fired.add((sid, round_date))
+                if await self._auto_round_exists(sid, round_date):
+                    continue                          # สร้างไปแล้วก่อนบอทรีสตาร์ท
+                row = self.round_from_schedule(s, round_date, "auto")
+                try:
+                    ins = await self._db(lambda: self.db.from_(ROUNDS_TABLE).insert(row).execute())
+                    logger.info(f"[CHATCOUNT] เริ่มรอบ '{row['label']}' ({round_date}) id={(ins.data or [{}])[0].get('id')}")
+                except Exception as e:
+                    # ชน unique index = มีรอบของวันนี้แล้ว (เช่น บอทรีสตาร์ท) → ข้าม
+                    if "duplicate" not in str(e).lower() and "23505" not in str(e):
+                        logger.error(f"[CHATCOUNT] create round error: {e}")
 
     def round_from_schedule(self, s: dict, round_date: str, trigger: str) -> dict:
         all_webs = web_name_list(self.webs)
@@ -567,26 +610,19 @@ class ChatCount:
                 qid = int(msg["message_id"])
             except (KeyError, TypeError, ValueError):
                 continue
-            chain: set[int] = {qid}
-            candidates: list[discord.Message] = []
-            replied_by_bot: set[int] = set()
+            def is_mine(m) -> bool:
+                return me is not None and m.author.id == me.id
             try:
-                async for m in ch.history(after=discord.Object(id=qid), limit=500, oldest_first=True):
-                    ref = m.reference.message_id if m.reference else None
-                    if ref is None:
-                        continue
-                    if me is not None and m.author.id == me.id:
-                        replied_by_bot.add(ref)
-                        if ref in chain:
-                            chain.add(m.id)
-                            self._remember(m.id, rid)
-                        continue
-                    if ref in chain and not m.author.bot:
-                        chain.add(m.id)
-                        candidates.append(m)
+                # ในสาย = ข้อความของบอทเรา + ข้อความของคน (ไม่นับบอทตัวอื่น)
+                chain_msgs = await self._reply_chain(ch, qid, 500, accept=lambda m: is_mine(m) or not m.author.bot)
             except (discord.Forbidden, discord.HTTPException) as e:
                 logger.warning(f"[CHATCOUNT] catch-up อ่านห้อง #{getattr(ch, 'name', '')} ไม่ได้: {e}")
                 continue
+            replied_by_bot = {m.reference.message_id for m in chain_msgs if is_mine(m)}
+            candidates = [m for m in chain_msgs if not is_mine(m)]
+            for m in chain_msgs:
+                if is_mine(m):
+                    self._remember(m.id, rid)
             for m in candidates:
                 self._remember(m.id, rid)
                 if m.id in replied_by_bot or str(m.id) in done_ids:
@@ -791,26 +827,20 @@ class ChatCount:
             except (KeyError, TypeError, ValueError):
                 continue
             ids = [qid]
-            chain: set[int] = {qid}
+            found: list[discord.Message] = []      # ลบเท่าที่ไล่เจอ แม้อ่านประวัติไม่จบ
+
+            def orphan_bot_reply(m, ref) -> bool:
+                return (me is not None and m.author.id == me.id and ref not in other_ids
+                        and m.id not in other_ids and (m.content or "").startswith(_BOT_REPLY_PREFIXES))
             try:
                 # ไล่ข้อความหลังคำถาม เก็บทุกข้อความที่ "รีพลายต่อกันเป็นสาย" จากคำถาม
                 #   คำถาม ← รีพลายพนักงาน ← บอทตอบ (✅/❌) ← พนักงานตอบบอทต่อ ...
                 # + ข้อความตอบกลับของบอทที่ "ข้อความต้นฉบับถูกลบไปแล้ว" (เช่น พนักงานลบข้อความที่พิมพ์ผิดเอง)
                 #   ดูจากหัวข้อความ เพื่อไม่ไปลบข้อความแจ้งเตือนอื่นของบอทในห้องเดียวกัน
-                async for m in ch.history(after=discord.Object(id=qid), limit=None, oldest_first=True):
-                    ref = m.reference.message_id if m.reference else None
-                    if ref is None:
-                        continue
-                    if ref in chain:
-                        ids.append(m.id)
-                        chain.add(m.id)
-                    elif (me is not None and m.author.id == me.id and ref not in other_ids
-                          and m.id not in other_ids and (m.content or "").startswith(_BOT_REPLY_PREFIXES)):
-                        ids.append(m.id)
-                        chain.add(m.id)
+                await self._reply_chain(ch, qid, None, extra=orphan_bot_reply, out=found)
             except (discord.Forbidden, discord.HTTPException) as e:
                 logger.warning(f"[CHATCOUNT] อ่านประวัติห้อง #{getattr(ch, 'name', '')} ไม่ได้: {e}")
-            total += await self._delete_many(ch, ids)
+            total += await self._delete_many(ch, ids + [m.id for m in found])
         logger.info(f"[CHATCOUNT] รอบ #{rnd.get('id')} ลบข้อความใน Discord แล้ว {total} ข้อความ")
 
     async def _delete_many(self, ch, ids: list[int]) -> int:
