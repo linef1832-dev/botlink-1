@@ -70,6 +70,66 @@ _IGNORE_WORDS = {"chat"}   # คำที่ไม่ใช่ชื่อเว
 
 
 # ----------------------------------------------------------------------
+# ตัวช่วยที่ใช้ร่วมกับ main.py
+# ----------------------------------------------------------------------
+_background_tasks: set[asyncio.Task] = set()
+
+
+def spawn(coro) -> asyncio.Task:
+    """asyncio.create_task แบบเก็บ reference ไว้ กัน task ถูก garbage collect กลางทาง"""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+_BULK_DELETE_MAX_AGE = timedelta(days=13, hours=12)   # Discord ให้ bulk delete ได้เฉพาะข้อความอายุไม่เกิน 14 วัน
+
+
+async def delete_messages_safely(ch, items) -> int:
+    """ลบข้อความหลายอันในห้องเดียว คืนจำนวนที่ลบได้
+
+    items = discord.Message หรือ discord.Object หรือ id (int) ปนกันได้
+    ข้อความใหม่กว่า 14 วัน → bulk delete ครั้งละ 100 / เก่ากว่า หรือไม่มีสิทธิ์ Manage Messages → ลบทีละข้อความ
+    (ข้อความของบอทเองลบได้เสมอ)"""
+    ids: list[int] = []
+    for x in items or []:
+        try:
+            i = int(getattr(x, "id", x))
+        except (TypeError, ValueError):
+            continue
+        if i not in ids:
+            ids.append(i)
+    if not ids:
+        return 0
+
+    cut = datetime.now(timezone.utc) - _BULK_DELETE_MAX_AGE
+    recent = [i for i in ids if discord.utils.snowflake_time(i) > cut]
+    one_by_one = [i for i in ids if discord.utils.snowflake_time(i) <= cut]
+    name = getattr(ch, "name", "")
+
+    deleted = 0
+    for k in range(0, len(recent), 100):                  # bulk delete ได้ครั้งละไม่เกิน 100
+        chunk = recent[k:k + 100]
+        try:
+            await ch.delete_messages([discord.Object(id=i) for i in chunk])
+            deleted += len(chunk)
+            continue
+        except discord.Forbidden:
+            logger.warning(f"บอทไม่มีสิทธิ์ Manage Messages ใน #{name} → ลบได้เฉพาะข้อความของบอท")
+        except discord.HTTPException as e:
+            logger.warning(f"bulk delete ใน #{name} ไม่สำเร็จ ({e}) → ลบทีละข้อความ")
+        one_by_one.extend(chunk)
+    for i in one_by_one:
+        try:
+            await ch.get_partial_message(i).delete()
+            deleted += 1
+        except Exception:
+            pass
+    return deleted
+
+
+# ----------------------------------------------------------------------
 # ฟังก์ชันล้วน (ไม่ยุ่งกับ Discord/DB) — ทดสอบแยกได้
 # ----------------------------------------------------------------------
 def web_name_list(webs: list) -> list[str]:
@@ -240,7 +300,11 @@ class ChatCount:
         self.webs: list = []
         self.web_names: list[str] = []
         self.rounds: dict[int, dict] = {}
-        self.msg_map: dict[int, int] = {}          # message_id คำถาม → round_id
+        self.msg_map: dict[int, int] = {}          # message_id คำถาม + สายรีพลาย → round_id
+        # [FIX] สายรีพลาย (คำตอบพนักงาน / ข้อความ ✅ ของบอท) เก็บแยกไว้ ไม่ให้หายตอนสร้าง msg_map ใหม่ทุก 15 วิ
+        self._chain_map: dict[int, int] = {}
+        # [FIX] รอบที่ส่ง Telegram สำเร็จแล้ว (กันส่งซ้ำ ถ้าบันทึกสถานะลง DB ไม่สำเร็จ)
+        self._sent_rounds: dict[int, str] = {}    # round_id → ข้อความสรุปที่ส่งไปแล้ว
         self._fired: set[tuple[int, str]] = set()  # (schedule_id, วันที่) ที่สร้างรอบแล้ว
         self._send_lock = asyncio.Lock()
         self._caught_up: set[int] = set()          # รอบที่ไล่เก็บรีพลายตกหล่นแล้ว (ทำครั้งเดียวต่อการเปิดบอท)
@@ -271,11 +335,19 @@ class ChatCount:
                 return emp.get("name")
         return None
 
-    async def _update_round(self, rid: int, patch: dict) -> None:
+    async def _update_round(self, rid: int, patch: dict) -> bool:
         try:
             await self._db(lambda: self.db.from_(ROUNDS_TABLE).update(patch).eq("id", rid).execute())
+            return True
         except Exception as e:
             logger.error(f"[CHATCOUNT] update round {rid} error: {e}")
+            return False
+
+    def _remember(self, message_id, rid: int) -> None:
+        """จำว่าข้อความนี้อยู่ในสายรีพลายของรอบไหน (อยู่รอดข้ามการสร้าง msg_map ใหม่)"""
+        mid = int(message_id)
+        self._chain_map[mid] = rid
+        self.msg_map[mid] = rid
 
     async def _fetch_answers(self, rid: int) -> list[dict]:
         res = await self._db(lambda: self.db.from_(ANSWERS_TABLE).select("*").eq("round_id", rid)
@@ -333,7 +405,9 @@ class ChatCount:
                 await self.evaluate_and_send(int(r["id"]))
 
     def _rebuild_msg_map(self) -> None:
-        m: dict[int, int] = {}
+        # ทิ้งสายรีพลายของรอบที่ปิดไปแล้ว (กันหน่วยความจำโต) เก็บของรอบที่ยังเปิด
+        self._chain_map = {mid: rid for mid, rid in self._chain_map.items() if rid in self.rounds}
+        m: dict[int, int] = dict(self._chain_map)
         for rid, r in self.rounds.items():
             for msg in r.get("messages") or []:
                 try:
@@ -344,7 +418,7 @@ class ChatCount:
 
     def request_channel_publish(self) -> None:
         """เรียกจาก event ของ Discord ตอนมีห้องเพิ่ม/ลบ/เปลี่ยนชื่อ → ส่งรายชื่อใหม่ให้เว็บทันที"""
-        asyncio.create_task(self.publish_channels())
+        spawn(self.publish_channels())
 
     async def publish_channels(self) -> None:
         async with self._publish_lock:
@@ -413,6 +487,7 @@ class ChatCount:
     async def _schedule_tick(self) -> None:
         now = datetime.now(TH_TZ)
         today = now.date().isoformat()
+        self._fired = {k for k in self._fired if k[1] == today}   # ล้างของวันก่อนๆ ทิ้ง
         res = await self._db(lambda: self.db.from_(SCHEDULES_TABLE).select("*").eq("active", True).execute())
         for s in res.data or []:
             sid = int(s["id"])
@@ -504,7 +579,7 @@ class ChatCount:
                         replied_by_bot.add(ref)
                         if ref in chain:
                             chain.add(m.id)
-                            self.msg_map.setdefault(int(m.id), rid)
+                            self._remember(m.id, rid)
                         continue
                     if ref in chain and not m.author.bot:
                         chain.add(m.id)
@@ -513,7 +588,7 @@ class ChatCount:
                 logger.warning(f"[CHATCOUNT] catch-up อ่านห้อง #{getattr(ch, 'name', '')} ไม่ได้: {e}")
                 continue
             for m in candidates:
-                self.msg_map.setdefault(int(m.id), rid)
+                self._remember(m.id, rid)
                 if m.id in replied_by_bot or str(m.id) in done_ids:
                     continue
                 await self.handle_message(m)
@@ -557,7 +632,7 @@ class ChatCount:
             rid = await self._round_from_chain(message)
             if not rid:
                 return False
-        self.msg_map[int(message.id)] = rid      # คนอื่นรีพลายต่อข้อความนี้ ก็นับเข้ารอบเดียวกัน
+        self._remember(message.id, rid)          # คนอื่นรีพลายต่อข้อความนี้ ก็นับเข้ารอบเดียวกัน
         rnd = self.rounds.get(rid)
         if not rnd or rnd.get("status") != "open":
             # ข้อความคำถามถูกลบไปแล้วหลังส่งสรุป → แจ้งสั้นๆ แล้วลบตัวเองทิ้งใน 10 วินาที
@@ -640,7 +715,7 @@ class ChatCount:
                 await message.add_reaction("✅")
             ack = await message.reply("\n".join(lines), mention_author=False,
                                       allowed_mentions=discord.AllowedMentions.none())
-            self.msg_map[int(ack.id)] = rid      # รีพลายตอบข้อความ ✅ ของบอทได้เลย ไม่ต้องเลื่อนหาคำถาม
+            self._remember(ack.id, rid)          # รีพลายตอบข้อความ ✅ ของบอทได้เลย ไม่ต้องเลื่อนหาคำถาม
         except Exception as e:
             logger.warning(f"[CHATCOUNT] reply error: {e}")
 
@@ -657,31 +732,43 @@ class ChatCount:
                 return
             rnd = res.data[0]
             self.rounds[rid] = rnd
-            if rnd.get("status") != "open" or not rnd.get("posted"):
+            if rnd.get("status") != "open":
+                self._sent_rounds.pop(rid, None)
+                return
+            if not rnd.get("posted"):
                 return
 
-            answers = await self._fetch_answers(rid)
-            ev = evaluate_round(rnd, answers)
             force = bool(rnd.get("force_send"))
-            if not ev["complete"] and not force:
-                return
+            if rid in self._sent_rounds:
+                # [FIX] ส่ง Telegram ไปแล้ว แต่รอบก่อนบันทึกสถานะลง DB ไม่สำเร็จ → บันทึกอย่างเดียว ไม่ส่งซ้ำ
+                text = self._sent_rounds[rid]
+                logger.warning(f"[CHATCOUNT] รอบ #{rid} ส่ง Telegram ไปแล้ว → ลองบันทึกสถานะ sent ใหม่ (ไม่ส่งซ้ำ)")
+            else:
+                answers = await self._fetch_answers(rid)
+                ev = evaluate_round(rnd, answers)
+                if not ev["complete"] and not force:
+                    return
 
-            text = build_report(rnd, ev, force, web_emoji_map(self.webs))
-            ok, err = await self._send_telegram(rnd.get("telegram_chat_id"), text)
-            if not ok:
-                if rnd.get("send_error") != err:
-                    await self._update_round(rid, {"send_error": err, "report_text": text})
-                    logger.warning(f"[CHATCOUNT] รอบ #{rid} ส่ง Telegram ไม่ได้: {err}")
-                return
+                text = build_report(rnd, ev, force, web_emoji_map(self.webs))
+                ok, err = await self._send_telegram(rnd.get("telegram_chat_id"), text)
+                if not ok:
+                    if rnd.get("send_error") != err:
+                        await self._update_round(rid, {"send_error": err, "report_text": text})
+                        logger.warning(f"[CHATCOUNT] รอบ #{rid} ส่ง Telegram ไม่ได้: {err}")
+                    return
+                self._sent_rounds[rid] = text
+                logger.info(f"[CHATCOUNT] รอบ #{rid} ส่งสรุปเข้า Telegram แล้ว ({'ส่งเท่าที่มี' if force else 'ครบ'})")
 
-            await self._update_round(rid, {
+            patch = {
                 "status": "sent",
                 "report_text": text,
                 "send_error": None,
                 "sent_at": datetime.now(timezone.utc).isoformat(),
-            })
+            }
+            if not await self._update_round(rid, patch):
+                return                            # บันทึกไม่ได้ → รอบหน้า (15 วิ) ลองบันทึกใหม่ โดยไม่ส่ง Telegram ซ้ำ
+            self._sent_rounds.pop(rid, None)
             rnd["status"] = "sent"
-            logger.info(f"[CHATCOUNT] รอบ #{rid} ส่งสรุปเข้า Telegram แล้ว ({'ส่งเท่าที่มี' if force else 'ครบ'})")
 
         try:
             await self._cleanup_discord(rnd)
@@ -692,6 +779,9 @@ class ChatCount:
         """ลบข้อความคำถาม + รีพลายของพนักงาน + ข้อความตอบกลับของบอท ของรอบนี้ออกจากทุกห้อง"""
         me = self.bot.user
         total = 0
+        this_rid = int(rnd.get("id") or 0)
+        # ข้อความที่รู้แน่ว่าเป็นของ "รอบอื่น" ที่ยังเปิดอยู่ → ห้ามลบ (กรณีมี 2 รอบในห้องเดียวกัน)
+        other_ids = {mid for mid, r in self.msg_map.items() if r != this_rid}
         for msg in rnd.get("messages") or []:
             ch = self._resolve_channel(msg.get("channel_id"))
             if not ch:
@@ -714,7 +804,8 @@ class ChatCount:
                     if ref in chain:
                         ids.append(m.id)
                         chain.add(m.id)
-                    elif me is not None and m.author.id == me.id and (m.content or "").startswith(_BOT_REPLY_PREFIXES):
+                    elif (me is not None and m.author.id == me.id and ref not in other_ids
+                          and m.id not in other_ids and (m.content or "").startswith(_BOT_REPLY_PREFIXES)):
                         ids.append(m.id)
                         chain.add(m.id)
             except (discord.Forbidden, discord.HTTPException) as e:
@@ -723,24 +814,7 @@ class ChatCount:
         logger.info(f"[CHATCOUNT] รอบ #{rnd.get('id')} ลบข้อความใน Discord แล้ว {total} ข้อความ")
 
     async def _delete_many(self, ch, ids: list[int]) -> int:
-        deleted = 0
-        for i in range(0, len(ids), 100):                    # bulk delete ได้ครั้งละไม่เกิน 100
-            chunk = ids[i:i + 100]
-            try:
-                await ch.delete_messages([discord.Object(id=x) for x in chunk])
-                deleted += len(chunk)
-                continue
-            except discord.Forbidden:
-                logger.warning(f"[CHATCOUNT] บอทไม่มีสิทธิ์ Manage Messages ใน #{getattr(ch, 'name', '')} → ลบได้เฉพาะข้อความของบอท")
-            except discord.HTTPException as e:
-                logger.warning(f"[CHATCOUNT] bulk delete ไม่สำเร็จ ({e}) → ลบทีละข้อความ")
-            for x in chunk:                                   # สำรอง: ลบทีละข้อความ (ข้อความของบอทเองลบได้เสมอ)
-                try:
-                    await ch.get_partial_message(x).delete()
-                    deleted += 1
-                except Exception:
-                    pass
-        return deleted
+        return await delete_messages_safely(ch, ids)
 
     async def _send_telegram(self, chat_id, text: str) -> tuple[bool, str]:
         client = self.get_tg_client()

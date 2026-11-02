@@ -1,7 +1,6 @@
 import asyncio
 import re
 import os
-import json
 import logging
 import time as time_module
 from collections import defaultdict
@@ -11,11 +10,9 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import AuthKeyDuplicatedError
 import discord
-from discord import ChannelType
-import aiohttp
 from supabase import create_client, Client as SupabaseClient
 
-from chat_count import ChatCount
+from chat_count import ChatCount, spawn, delete_messages_safely
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,6 +41,13 @@ if supabase:
     logger.info("[Supabase] Client initialized")
 else:
     logger.warning("[Supabase] SUPABASE_URL or SUPABASE_KEY not set — break tracking disabled")
+
+
+async def sb(fn):
+    """[FIX] ไลบรารี supabase เป็นแบบ sync → รันใน thread แยก ไม่ให้บล็อก event loop
+    (เดิมเรียกตรงๆ ทำให้ Discord heartbeat / รับข้อความ Telegram / นับแชท ค้างทุกครั้งที่ยิง DB)"""
+    return await asyncio.to_thread(fn)
+
 # ---------------------------------------------------------------------------
 # EMPLOYEES โหลดจาก Supabase K36 แทน hardcode
 # ---------------------------------------------------------------------------
@@ -57,11 +61,11 @@ async def load_employees_from_supabase() -> None:
         logger.warning("[EMPLOYEES] Supabase ไม่พร้อม — ใช้ข้อมูลเดิม")
         return
     try:
-        res = supabase.from_("users") \
-            .select("username, discord_id, telegram_id, allowed_shift, department") \
-            .not_.is_("telegram_id", "null") \
-            .not_.is_("discord_id", "null") \
-            .execute()
+        res = await sb(lambda: supabase.from_("users")
+                       .select("username, discord_id, telegram_id, allowed_shift, department")
+                       .not_.is_("telegram_id", "null")
+                       .not_.is_("discord_id", "null")
+                       .execute())
         if not res.data:
             logger.warning("[EMPLOYEES] ไม่พบข้อมูลพนักงานใน Supabase")
             return
@@ -123,10 +127,10 @@ async def load_target_groups() -> None:
     if not supabase:
         return
     try:
-        res = supabase.from_("telegram_groups") \
-            .select("group_name, group_type, chat_id") \
-            .eq("active", True) \
-            .execute()
+        res = await sb(lambda: supabase.from_("telegram_groups")
+                       .select("group_name, group_type, chat_id")
+                       .eq("active", True)
+                       .execute())
 
         groups: dict[str, dict] = {}
         shifts: set[str] = set()
@@ -185,6 +189,8 @@ async def log_unknown_chat(event, chat_id: str) -> None:
 
 
 RETURN_KEYWORDS = ["กลับที่นั่ง", "กลับที่นัง", "回座"]
+# รหัสผู้ใช้ — รองรับทั้ง "รหัสผู้ใช้：12345" และ "**รหัสผู้ใช้：** `12345`"
+TID_RE = re.compile(r"รหัสผู้ใช้[：:][^\d]*(\d+)")
 
 _currently_out: dict[str, str] = {}   # telegram_id → chat_id ของกลุ่มที่กดเช็คอินมา
 
@@ -229,9 +235,17 @@ def get_break_reason(activity: str) -> str:
     return f"☕ {activity}"
 
 
-# บอท Telegram ส่ง timestamp มาเป็นโซนจีน (UTC+8) ต้องแปลงเป็นไทย (UTC+7) ก่อนเก็บเสมอ
-TG_TZ = timezone(timedelta(hours=7))  # บอท Telegram ส่งเวลาไทยมาอยู่แล้ว   # โซนที่ข้อความจาก Telegram ใช้
-TH_TZ = timezone(timedelta(hours=7))   # โซนไทย ที่เราเก็บลง DB
+# โซนเวลา
+#   TG_TZ = โซนของเวลาที่บอทเช็คอินฝั่ง Telegram พิมพ์มาในข้อความ = เวลาจีน (UTC+8)
+#   TH_TZ = โซนไทย (UTC+7) ที่ใช้เก็บลง DB และแสดงใน Discord
+# เวลาจากข้อความ Telegram จะถูกอ่านเป็น +8 แล้วแปลงเป็นไทย (ลบ 1 ชั่วโมง) ทุกครั้ง
+# ถ้าวันหนึ่งบอทต้นทางเปลี่ยนโซน ตั้ง env TELEGRAM_TZ_OFFSET ได้เลย (เช่น 7 = ไม่แปลง) ไม่ต้องแก้โค้ด
+try:
+    _TG_OFFSET_HOURS = float(os.environ.get("TELEGRAM_TZ_OFFSET", "8"))
+except ValueError:
+    _TG_OFFSET_HOURS = 8.0
+TG_TZ = timezone(timedelta(hours=_TG_OFFSET_HOURS))
+TH_TZ = timezone(timedelta(hours=7))
 
 
 def get_thai_time() -> datetime:
@@ -239,26 +253,19 @@ def get_thai_time() -> datetime:
     return datetime.now(TH_TZ)
 
 
-def get_break_date_str() -> str:
-    """
-    คืนวันที่สำหรับบันทึก break_date
-    ถ้าตอนนี้เป็น 00:00-07:59 ไทย (ยังอยู่ในกะดึกที่เริ่มเมื่อวาน) → คืนวันเมื่อวาน
-    """
-    t = get_thai_time()
-    if t.hour < 8:
-        t = t - timedelta(days=1)
-    return t.strftime("%Y-%m-%d")
+def get_break_date_from_time(dt: datetime) -> str:
+    """คืน break_date จาก datetime — ถ้าก่อน 08:00 ไทย ถือว่าเป็นวันก่อนหน้า (กะดึกที่เริ่มเมื่อวาน)"""
+    if dt.hour < 8:
+        dt = dt - timedelta(days=1)
+    return dt.strftime("%Y-%m-%d")
 
 
 def parse_telegram_timestamp(ts_str: str | None) -> datetime | None:
-    """แปลง timestamp จาก Telegram เป็น datetime ไทย (UTC+7)
+    """แปลง timestamp จากข้อความ Telegram ("dd/mm HH:MM:SS" เวลาจีน UTC+8) เป็น datetime ไทย (UTC+7)
 
-    [FIX] เวลาที่บอท Telegram ส่งมาเป็นโซนจีน (UTC+8) ของเดิมเอาเลขดิบมาแปะป้ายว่า
-    เป็น +7 เลย ทำให้เวลาที่เก็บลง break_sessions เร็วไป 1 ชั่วโมงทุกแถว
-    (ส่วนข้อความที่ส่งเข้า Discord แปลงถูกอยู่แล้ว เลยไม่ตรงกับ DB)
-    ตอนนี้อ่านเป็น +8 ก่อน แล้วค่อยแปลงเป็น +7 ให้ถูกต้อง
-
-    รองรับทั้ง dd/mm และ mm/dd โดยเลือก format ที่ใกล้เคียงวันปัจจุบันมากสุด"""
+    ข้อความไม่มีปีมาด้วย และบางทีเป็น dd/mm บางทีเป็น mm/dd
+    → ลองทุกแบบ (ปีที่แล้ว/ปีนี้/ปีหน้า × dd/mm/mm/dd) แล้วเลือกอันที่ใกล้เวลาปัจจุบันที่สุด
+    [FIX] เดิมใช้ปีปัจจุบันอย่างเดียว ข้อความ 31/12 ที่ประมวลผลหลังเที่ยงคืนปีใหม่จะกลายเป็นปลายปีหน้า"""
     if not ts_str:
         return None
     try:
@@ -266,45 +273,28 @@ def parse_telegram_timestamp(ts_str: str | None) -> datetime | None:
         date_part, time_part = parts[0], parts[1]
         a, b = map(int, date_part.split('/'))
         h, m, s = map(int, time_part.split(':'))
-        year = get_thai_time().year
-        today = get_thai_time()
+        today = datetime.now(TG_TZ)                      # เทียบในโซนเดียวกับข้อความ
 
-        # ลอง dd/mm (วัน/เดือน)
-        try:
-            dt_ddmm = datetime(year, b, a, h, m, s, tzinfo=TG_TZ).astimezone(TH_TZ)
-            diff_ddmm = abs((dt_ddmm - today).total_seconds())
-        except ValueError:
-            dt_ddmm = None
-            diff_ddmm = float("inf")
+        best: datetime | None = None
+        best_diff = float("inf")
+        for year in (today.year - 1, today.year, today.year + 1):
+            for month, day in ((b, a), (a, b)):          # dd/mm ก่อน (ถ้าใกล้เท่ากันใช้ dd/mm)
+                try:
+                    dt = datetime(year, month, day, h, m, s, tzinfo=TG_TZ)
+                except ValueError:
+                    continue
+                diff = abs((dt - today).total_seconds())
+                if diff < best_diff:
+                    best, best_diff = dt, diff
 
-        # ลอง mm/dd (เดือน/วัน)
-        try:
-            dt_mmdd = datetime(year, a, b, h, m, s, tzinfo=TG_TZ).astimezone(TH_TZ)
-            diff_mmdd = abs((dt_mmdd - today).total_seconds())
-        except ValueError:
-            dt_mmdd = None
-            diff_mmdd = float("inf")
-
-        if dt_ddmm is None and dt_mmdd is None:
+        if best is None:
             return None
-        if dt_ddmm is None:
-            return dt_mmdd
-        if dt_mmdd is None:
-            return dt_ddmm
-
-        result = dt_ddmm if diff_ddmm <= diff_mmdd else dt_mmdd
-        logger.info(f"[parse_timestamp] {ts_str!r} → {result.strftime('%Y-%m-%d %H:%M:%S')}")
-        return result
+        best = best.astimezone(TH_TZ)                    # จีน +8 → ไทย +7
+        logger.info(f"[parse_timestamp] {ts_str!r} (UTC{_TG_OFFSET_HOURS:+g}) → {best.strftime('%Y-%m-%d %H:%M:%S')} ไทย")
+        return best
     except Exception as e:
         logger.warning(f"[parse_telegram_timestamp] parse failed: {ts_str!r} — {e}")
         return None
-
-
-def get_break_date_from_time(dt: datetime) -> str:
-    """คืน break_date จาก datetime — ถ้าก่อน 08:00 ไทย ถือว่าเป็นวันก่อนหน้า (กะดึก)"""
-    if dt.hour < 8:
-        dt = dt - timedelta(days=1)
-    return dt.strftime("%Y-%m-%d")
 
 
 # ตารางที่บันทึกการพัก
@@ -313,23 +303,37 @@ def get_break_date_from_time(dt: datetime) -> str:
 BREAK_TABLES = ["break_logs", "break_sessions"]
 
 
-def _open_break_in(table: str, staff_name: str, reason: str, now: datetime) -> None:
+# กันการเขียนตารางพักสลับลำดับกัน (เช่น "ไป" กับ "กลับ" ของคนเดียวกันเข้ามาติดๆ กัน)
+_break_db_lock = asyncio.Lock()
+
+
+def _find_open_break_ids(table: str, staff_name: str, now: datetime) -> list:
+    """id ของ record พักที่ยังไม่ปิดของคนนี้ (วันนี้ + เมื่อวาน)"""
     break_date = get_break_date_from_time(now)
     prev_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-
-    # ถ้ายังมี record ที่ยังไม่ปิดอยู่ → ปิดก่อนแล้วเปิดใหม่ (กรณีบอท Telegram รีเซทข้ามตี 1)
     res = supabase.from_(table) \
         .select("id") \
         .eq("staff_name", staff_name) \
         .in_("break_date", [break_date, prev_date]) \
         .is_("break_end", "null") \
         .execute()
-    if res.data:
-        ids = [r["id"] for r in res.data]
-        supabase.from_(table) \
-            .update({"break_end": now.isoformat()}) \
-            .in_("id", ids) \
-            .execute()
+    return [r["id"] for r in (res.data or [])]
+
+
+def _close_break_ids(table: str, ids: list, now: datetime) -> None:
+    supabase.from_(table) \
+        .update({"break_end": now.isoformat()}) \
+        .in_("id", ids) \
+        .execute()
+
+
+def _open_break_in(table: str, staff_name: str, reason: str, now: datetime) -> None:
+    break_date = get_break_date_from_time(now)
+
+    # ถ้ายังมี record ที่ยังไม่ปิดอยู่ → ปิดก่อนแล้วเปิดใหม่ (กรณีบอท Telegram รีเซทข้ามตี 1)
+    ids = _find_open_break_ids(table, staff_name, now)
+    if ids:
+        _close_break_ids(table, ids, now)
         logger.info(f"[{table}] {staff_name} มี record ค้าง {len(ids)} รายการ → ปิดแล้วเปิดใหม่")
 
     supabase.from_(table).insert({
@@ -342,24 +346,11 @@ def _open_break_in(table: str, staff_name: str, reason: str, now: datetime) -> N
 
 
 def _close_break_in(table: str, staff_name: str, now: datetime) -> None:
-    break_date = get_break_date_from_time(now)
-    prev_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-
-    res = supabase.from_(table) \
-        .select("id") \
-        .eq("staff_name", staff_name) \
-        .in_("break_date", [break_date, prev_date]) \
-        .is_("break_end", "null") \
-        .execute()
-    if not res.data:
+    ids = _find_open_break_ids(table, staff_name, now)
+    if not ids:
         logger.info(f"[{table}] {staff_name} ไม่มี record พักที่เปิดอยู่")
         return
-
-    ids = [r["id"] for r in res.data]
-    supabase.from_(table) \
-        .update({"break_end": now.isoformat()}) \
-        .in_("id", ids) \
-        .execute()
+    _close_break_ids(table, ids, now)
     logger.info(f"[{table}] {staff_name} กลับแล้ว ปิด {len(ids)} record เวลา={now.strftime('%H:%M:%S')}")
 
 
@@ -369,11 +360,12 @@ async def supabase_open_break(staff_name: str, activity: str, timestamp_str: str
         return
     now = parse_telegram_timestamp(timestamp_str) or get_thai_time()
     reason = get_break_reason(activity)
-    for table in BREAK_TABLES:
-        try:
-            _open_break_in(table, staff_name, reason, now)
-        except Exception as e:
-            logger.error(f"[{table}] supabase_open_break error: {e}")
+    async with _break_db_lock:
+        for table in BREAK_TABLES:
+            try:
+                await sb(lambda t=table: _open_break_in(t, staff_name, reason, now))
+            except Exception as e:
+                logger.error(f"[{table}] supabase_open_break error: {e}")
 
 
 async def supabase_close_break(staff_name: str, timestamp_str: str | None = None) -> None:
@@ -381,11 +373,12 @@ async def supabase_close_break(staff_name: str, timestamp_str: str | None = None
     if not supabase:
         return
     now = parse_telegram_timestamp(timestamp_str) or get_thai_time()
-    for table in BREAK_TABLES:
-        try:
-            _close_break_in(table, staff_name, now)
-        except Exception as e:
-            logger.error(f"[{table}] supabase_close_break error: {e}")
+    async with _break_db_lock:
+        for table in BREAK_TABLES:
+            try:
+                await sb(lambda t=table: _close_break_in(t, staff_name, now))
+            except Exception as e:
+                logger.error(f"[{table}] supabase_close_break error: {e}")
 
 
 def parse_message(text: str, group_name: str, chat_id: str = "") -> dict | None:
@@ -398,7 +391,7 @@ def parse_message(text: str, group_name: str, chat_id: str = "") -> dict | None:
 
     # Extract Telegram ID — supports both plain and markdown-wrapped:
     # "รหัสผู้ใช้：12345"  or  "**รหัสผู้ใช้：** `12345`"
-    tid_match = re.search(r"รหัสผู้ใช้[：:][^\d]*(\d+)", text)
+    tid_match = TID_RE.search(text)
     if not tid_match:
         return None
 
@@ -436,7 +429,8 @@ def parse_message(text: str, group_name: str, chat_id: str = "") -> dict | None:
     is_return = any(kw in activity for kw in RETURN_KEYWORDS)
 
     ts_match = re.search(r"(\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})", text)
-    timestamp = ts_match.group(1) if ts_match else get_thai_time().strftime("%d/%m %H:%M:%S")
+    # ไม่มีเวลาในข้อความ → ใช้เวลาปัจจุบัน "ในโซนเดียวกับข้อความ Telegram" (จะถูกแปลงเป็นไทยทีหลังเหมือนกัน)
+    timestamp = ts_match.group(1) if ts_match else datetime.now(TG_TZ).strftime("%d/%m %H:%M:%S")
 
     dur_match = re.search(r"เวลากิจกรรมนี้[：:][^`]*`([^`]+)`", text)
     duration = dur_match.group(1) if dur_match else None
@@ -475,7 +469,7 @@ class ActivityBot(discord.Client):
         # member_id → {channel_id: วินาทีที่อยู่} — สะสมไว้ตลอดชั่วโมงนี้
         self._hour_time: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
         # ชั่วโมงปัจจุบัน (0-23) เพื่อรู้เมื่อขึ้นชั่วโมงใหม่
-        self._current_hour: int = datetime.now().hour
+        self._current_hour: int = get_thai_time().hour
         # member_id → channel_id ห้องที่แจ้งกิจกรรมล่าสุด (ใช้สำหรับ "กลับที่นั่ง")
         self._last_notified_channel: dict[int, int] = {}
         # member_id → discord.Message ของกิจกรรมล่าสุด (ใช้สำหรับ reply ตอนกลับที่นั่ง)
@@ -512,7 +506,10 @@ class ActivityBot(discord.Client):
             for channel in guild.voice_channels:
                 for member in channel.members:
                     if str(channel.id) not in DESTINATION_CHANNEL_IDS:
-                        self._voice_join_time[member.id] = (channel.id, now)
+                        # on_ready เกิดซ้ำได้ตอน Discord reconnect → ถ้ายังอยู่ห้องเดิม ไม่ต้องรีเซ็ตเวลาที่นับไว้
+                        prev = self._voice_join_time.get(member.id)
+                        if prev is None or prev[0] != channel.id:
+                            self._voice_join_time[member.id] = (channel.id, now)
                         count += 1
         if count:
             logger.info(f"Snapshot: found {count} member(s) already in voice channels")
@@ -520,7 +517,7 @@ class ActivityBot(discord.Client):
         await self._sync_commands()
         if BREAK_MSG_DELETE_AFTER >= 0 and not getattr(self, "_sweeper_started", False):
             self._sweeper_started = True
-            asyncio.create_task(self._break_sweeper())
+            spawn(self._break_sweeper())
 
     async def _break_sweeper(self):
         """🧹 เก็บกวาดข้อความ "กลับที่นั่งแล้ว" ที่ค้าง ทุก 2 นาที
@@ -566,20 +563,19 @@ class ActivityBot(discord.Client):
 
     async def send_status(self, message: str):
         """ส่งข้อความสถานะไปยัง DISCORD_STATUS_CHANNEL_ID ถ้ากำหนดไว้"""
-        channel_id = os.environ.get("DISCORD_STATUS_CHANNEL_ID", "")
-        if not channel_id:
+        if not STATUS_CHANNEL_ID:
             return
         try:
-            channel = self.get_channel(int(channel_id))
+            channel = self.get_channel(STATUS_CHANNEL_ID)
             if channel:
-                now = datetime.now().strftime("%d/%m %H:%M")
+                now = get_thai_time().strftime("%d/%m %H:%M")
                 await channel.send(f"{message}\n> 🕐 {now}")
         except Exception as e:
             logger.error(f"Failed to send status message: {e}")
 
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
         now = time_module.time()
-        current_hour = datetime.now().hour
+        current_hour = get_thai_time().hour
 
         # ขึ้นชั่วโมงใหม่ → reset สถิติทั้งหมด
         if current_hour != self._current_hour:
@@ -647,35 +643,24 @@ class ActivityBot(discord.Client):
             logger.error(f"Failed to find channel by ID {channel_id}: {e}")
         return None
 
-    async def find_voice_channel_for_member(self, discord_user_id: str) -> discord.VoiceChannel | None:
-        _, member = await self.find_member(discord_user_id)
-        if member is None:
-            return None
-        voice = member.voice
-        if not voice or not voice.channel:
-            logger.info(f"{discord_user_id} not in any voice channel")
-            return None
-        vc = voice.channel
-        logger.info(f"Found {discord_user_id} in voice channel: '{vc.name}'")
-        return vc
-
-    def get_target_channel_name(self, activity: str) -> str:
+    def get_move_channel_id(self, activity: str) -> str:
         for keyword, channel_name in ACTIVITY_MOVE_CHANNEL.items():
             if keyword in activity:
                 return channel_name
         return ""
 
-    def get_work_channel_id(self, member_id: int) -> int | None:
-        """คืน channel_id ที่อยู่นานสุดในชั่วโมงนี้ (ไม่นับห้องปลายทาง)"""
-        now = time_module.time()
-
-        # รวมเวลาที่สะสมไว้ + session ที่กำลังอยู่ตอนนี้
-        time_by_ch: dict[int, float] = dict(self._hour_time[member_id])
+    def channel_time_this_hour(self, member_id: int) -> dict[int, float]:
+        """{channel_id: วินาที} ที่อยู่ในแต่ละห้องชั่วโมงนี้ = เวลาที่สะสมไว้ + session ที่กำลังอยู่ตอนนี้ (ไม่นับห้องปลายทาง)"""
+        time_by_ch: dict[int, float] = dict(self._hour_time.get(member_id) or {})
         if member_id in self._voice_join_time:
             cur_ch_id, join_ts = self._voice_join_time[member_id]
             if str(cur_ch_id) not in DESTINATION_CHANNEL_IDS:
-                time_by_ch[cur_ch_id] = time_by_ch.get(cur_ch_id, 0) + (now - join_ts)
+                time_by_ch[cur_ch_id] = time_by_ch.get(cur_ch_id, 0) + (time_module.time() - join_ts)
+        return time_by_ch
 
+    def get_work_channel_id(self, member_id: int) -> int | None:
+        """คืน channel_id ที่อยู่นานสุดในชั่วโมงนี้ (ไม่นับห้องปลายทาง)"""
+        time_by_ch = self.channel_time_this_hour(member_id)
         if not time_by_ch:
             return None
         return max(time_by_ch, key=lambda ch: time_by_ch[ch])
@@ -685,14 +670,21 @@ class ActivityBot(discord.Client):
         if guild is None:
             return None
         since = datetime.now(timezone.utc) - timedelta(hours=6)
-        best = None
+        sem = asyncio.Semaphore(5)              # ค้นหลายห้องพร้อมกัน (เดิมทีละห้อง ช้ามากตอนห้องเยอะ)
+
+        async def search(ch):
+            async with sem:
+                return await self._find_last_activity_msg(ch, name, after=since, limit=60)
+
+        chans = []
         for ch in [*guild.voice_channels, *guild.text_channels]:
             if str(ch.id) in DESTINATION_CHANNEL_IDS:
                 continue
             perms = ch.permissions_for(guild.me)
-            if not (perms.view_channel and perms.read_message_history):
-                continue
-            m = await self._find_last_activity_msg(ch, name, after=since, limit=60)
+            if perms.view_channel and perms.read_message_history:
+                chans.append(ch)
+        best = None
+        for m in await asyncio.gather(*(search(ch) for ch in chans)):
             if m is not None and (best is None or m.created_at > best.created_at):
                 best = m
         return best
@@ -714,16 +706,14 @@ class ActivityBot(discord.Client):
                                  is_return: bool, group_name: str, timestamp: str | None = None) -> tuple[bool, str | None]:
         emoji = get_emoji(activity, is_return)
         action = f"**{name}** กลับที่นั่งแล้ว" if is_return else f"**{name}** ไป{activity}"
-        if timestamp:
-            # timestamp format: "dd/mm HH:MM:SS" → extract HH:MM then convert +8 → +7 (Thai time)
-            raw_time = timestamp.split(" ")[-1][:5]
-            try:
-                h, m = map(int, raw_time.split(":"))
-                time_part = f"{h:02d}:{m:02d}"
-            except Exception:
-                time_part = raw_time
+        # timestamp จาก Telegram เป็นเวลาจีน → แปลงเป็นเวลาไทยก่อนแสดง (ให้ตรงกับที่เก็บลง DB)
+        th_dt = parse_telegram_timestamp(timestamp) if timestamp else None
+        if th_dt is not None:
+            time_part = th_dt.strftime("%H:%M")
+        elif timestamp:
+            time_part = timestamp.split(" ")[-1][:5]   # อ่านไม่ออก → แสดงตามข้อความเดิม
         else:
-            time_part = datetime.now().strftime("%H:%M")
+            time_part = get_thai_time().strftime("%H:%M")
         message = f"{emoji} {action}\n> 🕐 {time_part} · 📌 {group_name}"
 
         guild, member = await self.find_member(discord_user_id)
@@ -783,7 +773,7 @@ class ActivityBot(discord.Client):
             notify_vc = last_vc or fallback_vc or current_ch
 
         else:
-            target_channel_id = self.get_target_channel_name(activity)
+            target_channel_id = self.get_move_channel_id(activity)
 
             if target_channel_id:
                 # กินข้าว / ทานข้าว → แจ้งในห้องทำงาน แล้วย้ายไป Dining
@@ -791,7 +781,10 @@ class ActivityBot(discord.Client):
                 target_vc = await self.find_voice_channel_by_id(target_channel_id)
                 if target_vc:
                     mem_vc = member.voice.channel if member.voice else None
-                    if mem_vc and mem_vc.id == target_vc.id:
+                    if mem_vc is None:
+                        # [FIX] ไม่ได้อยู่ห้องเสียง → ย้ายไม่ได้ (เดิมยิง move แล้ว error ทุกครั้ง)
+                        logger.info(f"{name} is not in a voice channel, skipping move")
+                    elif mem_vc.id == target_vc.id:
                         logger.info(f"{name} already in target channel '{target_vc.name}', skipping move")
                     else:
                         try:
@@ -824,6 +817,7 @@ class ActivityBot(discord.Client):
                     else:
                         sent_msg = await notify_vc.send(message)
                     self._last_activity_message.pop(member.id, None)
+                    self._last_notified_channel.pop(member.id, None)   # จับคู่ไป-กลับครบแล้ว
                     # 🧹 กลับที่นั่งแล้ว → ลบชุดข้อความ (แจ้งไป + แจ้งกลับ) ออกจากห้อง หลังหน่วงเวลาให้เห็นสักครู่
                     if BREAK_MSG_DELETE_AFTER >= 0:
                         for msg in (ref_msg, sent_msg):
@@ -890,24 +884,7 @@ async def _purge_break_messages(channel, since: datetime) -> int:
             to_delete.append(m)                        # ค้างนานแล้ว ถือว่าจบไปแล้ว
         # นอกนั้น = อาจยังพักอยู่ → ไม่ลบ
 
-    deleted = 0
-    bulk_cut = now - timedelta(days=13, hours=12)      # bulk delete ได้เฉพาะข้อความอายุไม่เกิน 14 วัน
-    recent = [m for m in to_delete if m.created_at > bulk_cut]
-    old = [m for m in to_delete if m.created_at <= bulk_cut]
-    for i in range(0, len(recent), 100):
-        chunk = recent[i:i + 100]
-        try:
-            await channel.delete_messages(chunk)
-            deleted += len(chunk)
-        except (discord.Forbidden, discord.HTTPException):
-            old.extend(chunk)                          # ไม่มีสิทธิ์ Manage Messages → ลบทีละข้อความ (ข้อความบอทเองลบได้)
-    for m in old:
-        try:
-            await m.delete()
-            deleted += 1
-        except Exception:
-            pass
-    return deleted
+    return await delete_messages_safely(channel, to_delete)
 
 
 _purge_running = False
@@ -942,7 +919,7 @@ async def clear_break_messages_command(interaction: discord.Interaction, days: i
         ephemeral=True,
     )
     _purge_running = True
-    asyncio.create_task(_run_purge(interaction, since, scope))
+    spawn(_run_purge(interaction, since, scope))
 
 
 async def _run_purge(interaction: discord.Interaction, since, scope: str):
@@ -1000,8 +977,9 @@ async def status_command(interaction: discord.Interaction):
         )
         return
 
-    now = datetime.now().strftime("%d/%m %H:%M:%S")
-    hour = datetime.now().hour
+    th_now = get_thai_time()
+    now = th_now.strftime("%d/%m %H:%M:%S")
+    hour = th_now.hour
     lines = [f"🟢 **Bot Status** — `{now}`",
              f"⏱ Hour slot: `{hour:02d}:00 – {(hour+1)%24:02d}:00`",
              ""]
@@ -1011,14 +989,10 @@ async def status_command(interaction: discord.Interaction):
 
     # รวบรวมข้อมูลห้องทำงานของทุกคนที่มีสถิติ
     work_info: list[tuple[str, str, float]] = []  # (name, channel_name, seconds)
-    for member_id, ch_map in discord_bot._hour_time.items():
-        # รวม ongoing session
-        total: dict[int, float] = dict(ch_map)
-        if member_id in discord_bot._voice_join_time:
-            cur_ch_id, join_ts = discord_bot._voice_join_time[member_id]
-            if str(cur_ch_id) not in DESTINATION_CHANNEL_IDS:
-                total[cur_ch_id] = total.get(cur_ch_id, 0) + (time_module.time() - join_ts)
-
+    # ทุกคนที่มีสถิติชั่วโมงนี้ + คนที่อยู่ในห้องเสียงตอนนี้ (รวม session ที่กำลังอยู่)
+    member_ids = set(discord_bot._hour_time) | set(discord_bot._voice_join_time)
+    for member_id in member_ids:
+        total = discord_bot.channel_time_this_hour(member_id)
         if not total:
             continue
 
@@ -1052,13 +1026,14 @@ async def supabase_restore_open_breaks() -> None:
     if not supabase:
         return
     try:
-        break_date = get_break_date_str()
-        prev_date = (get_thai_time() - timedelta(days=1)).strftime("%Y-%m-%d")
-        res = supabase.from_(BREAK_TABLES[0]) \
-            .select("staff_name") \
-            .in_("break_date", [break_date, prev_date]) \
-            .is_("break_end", "null") \
-            .execute()
+        now = get_thai_time()
+        break_date = get_break_date_from_time(now)
+        prev_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        res = await sb(lambda: supabase.from_(BREAK_TABLES[0])
+                       .select("staff_name")
+                       .in_("break_date", [break_date, prev_date])
+                       .is_("break_end", "null")
+                       .execute())
         if not res.data:
             logger.info("[Supabase] ไม่มี open break sessions ค้างอยู่")
             return
@@ -1072,6 +1047,107 @@ async def supabase_restore_open_breaks() -> None:
         logger.info(f"[Supabase] Restored {restored} open break sessions → _currently_out")
     except Exception as e:
         logger.error(f"[Supabase] supabase_restore_open_breaks error: {e}")
+
+
+_bg_started = False
+
+
+def start_background_sync() -> None:
+    """เริ่มงานเบื้องหลังที่ต้องมีแค่ชุดเดียว (เรียกซ้ำได้ จะไม่สร้างซ้ำ)"""
+    global _bg_started
+    if _bg_started or not supabase:
+        return
+    _bg_started = True
+    spawn(watch_realtime_forever())
+    spawn(poll_data_forever())
+
+
+async def reload_all_data() -> None:
+    await load_employees_from_supabase()
+    await load_target_groups()
+
+
+async def poll_data_forever() -> None:
+    """⏱️ กันเหนียว: รีโหลดพนักงาน+กลุ่มทุก 5 นาที "เสมอ" — แม้ Realtime ต่อได้แต่ไม่มี event วิ่งมา
+    (เช่น ตาราง users ยังไม่ถูก add เข้า publication supabase_realtime ฝั่ง K36)
+    ข้อมูลจะตามทันภายใน 5 นาทีโดยไม่ต้องรีสตาร์ทบอท (ถ้า Realtime ทำงาน จะเห็นทันทีเหมือนเดิม)"""
+    while True:
+        await asyncio.sleep(300)  # 5 นาที
+        try:
+            await reload_all_data()
+        except Exception as e:
+            logger.error(f"[Poll] reload error: {e}")
+
+
+REALTIME_DOWN_LIMIT = 60   # หลุดนานเกินกี่วินาที (หลังไลบรารีลองต่อเองแล้ว) ถึงสร้าง connection ใหม่
+
+
+async def watch_realtime_forever() -> None:
+    """ดักการเปลี่ยนแปลงตาราง users และ telegram_groups ผ่าน Supabase Realtime → รีโหลดทันที
+
+    [FIX] เดิมแยกเป็น 2 ฟังก์ชันที่เขียนไม่เหมือนกัน: ตัว users จับไม่ได้ว่าหลุด (วน sleep เฉยๆ)
+    ตัว telegram_groups ไม่มี reconnect เลย — ตอนนี้ใช้ connection เดียว ฟัง 2 ตาราง
+    และเช็คสถานะทุก 5 วิ ถ้าหลุดนานเกินกำหนดจะต่อใหม่ แล้วรีโหลดข้อมูลชดเชย event ที่พลาดไป"""
+    try:
+        from realtime import AsyncRealtimeClient
+    except ImportError:
+        logger.warning("[EMPLOYEES] ไม่มี realtime library → poll ทุก 30 วินาที")
+        while True:
+            await asyncio.sleep(30)
+            await load_employees_from_supabase()
+
+    realtime_url = _supabase_url.replace("https://", "wss://") + "/realtime/v1"
+    loop = asyncio.get_running_loop()
+
+    # callback ต้องเป็นฟังก์ชันธรรมดา ไม่ใช่ async def
+    # ไลบรารี realtime เรียกแบบ binding.callback(payload, ref) เฉยๆ ไม่ได้ await
+    def make_callback(log_msg: str, reload_fn):
+        def callback(*_args, **_kwargs):
+            logger.info(log_msg)
+            asyncio.run_coroutine_threadsafe(reload_fn(), loop)
+        return callback
+
+    first = True
+    while True:
+        rt_client = None
+        try:
+            rt_client = AsyncRealtimeClient(realtime_url, _supabase_key)
+            await rt_client.connect()
+            await rt_client.channel("users-changes").on_postgres_changes(
+                event="*", schema="public", table="users",
+                callback=make_callback("[EMPLOYEES] Realtime: ตรวจพบการเปลี่ยนแปลง → รีโหลด",
+                                       load_employees_from_supabase),
+            ).subscribe()
+            await rt_client.channel("groups-changes").on_postgres_changes(
+                event="*", schema="public", table="telegram_groups",
+                callback=make_callback("[GROUPS] Realtime: ตรวจพบการเปลี่ยนแปลงใน telegram_groups → รีโหลดทันที",
+                                       load_target_groups),
+            ).subscribe()
+            logger.info("[REALTIME] กำลัง watch ตาราง users + telegram_groups...")
+            if not first:
+                await reload_all_data()          # ระหว่างหลุดอาจพลาด event ไป → โหลดใหม่ให้ทันข้อมูลล่าสุด
+            first = False
+
+            down_since = None
+            while True:
+                await asyncio.sleep(5)
+                if rt_client.is_connected:
+                    down_since = None
+                    continue
+                down_since = down_since or time_module.time()
+                if time_module.time() - down_since > REALTIME_DOWN_LIMIT:
+                    raise ConnectionError(f"หลุดเกิน {REALTIME_DOWN_LIMIT} วินาที")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[REALTIME] disconnected: {e} → reconnect in 10s")
+        finally:
+            if rt_client is not None:
+                try:
+                    await rt_client.close()
+                except Exception:
+                    pass
+        await asyncio.sleep(10)
 
 
 async def start_telegram(on_activity):
@@ -1116,81 +1192,9 @@ async def start_telegram(on_activity):
     await supabase_restore_open_breaks()
     await discord_bot.send_status("🟢 **Bot online** — Telegram + Discord connected")
 
-    # ดักการเปลี่ยนแปลงตาราง users ผ่าน Supabase Realtime → รีโหลดทันที
-    async def watch_employees_realtime():
-        try:
-            from realtime import AsyncRealtimeClient
-            realtime_url = _supabase_url.replace("https://", "wss://") + "/realtime/v1"
-            while True:
-                try:
-                    rt_client = AsyncRealtimeClient(realtime_url, _supabase_key)
-                    await rt_client.connect()
-                    channel = rt_client.channel("users-changes")
-                    _loop = asyncio.get_running_loop()
-
-                    # [FIX] callback ต้องเป็นฟังก์ชันธรรมดา ไม่ใช่ async def
-                    # ไลบรารี realtime เรียกแบบ binding.callback(payload, ref) เฉยๆ ไม่ได้ await
-                    # ถ้าเขียนเป็น async def จะได้แค่ coroutine ที่ไม่มีใครรัน (RuntimeWarning: never awaited)
-                    def on_users_change(*_args, **_kwargs):
-                        logger.info("[EMPLOYEES] Realtime: ตรวจพบการเปลี่ยนแปลง → รีโหลด")
-                        asyncio.run_coroutine_threadsafe(load_employees_from_supabase(), _loop)
-                    await channel.on_postgres_changes(
-                        event="*",
-                        schema="public",
-                        table="users",
-                        callback=on_users_change
-                    ).subscribe()
-                    logger.info("[EMPLOYEES] Realtime: watching users...")
-                    while True:
-                        await asyncio.sleep(1)
-                except Exception as e:
-                    logger.error(f"[EMPLOYEES] Realtime disconnected: {e} → reconnect in 10s")
-                    await asyncio.sleep(10)
-        except ImportError:
-            logger.warning("[EMPLOYEES] ไม่มี realtime library → poll ทุก 30 วินาที")
-            while True:
-                await asyncio.sleep(30)
-                await load_employees_from_supabase()
-    asyncio.create_task(watch_employees_realtime())
-
-    # ⏱️ กันเหนียว: รีโหลดพนักงาน+กลุ่มทุก 5 นาที "เสมอ" — แม้ Realtime ต่อได้แต่ไม่มี event วิ่งมา
-    #    (เช่น ตาราง users ยังไม่ถูก add เข้า publication supabase_realtime ฝั่ง K36)
-    #    ข้อมูลจะตามทันภายใน 5 นาทีโดยไม่ต้องรีสตาร์ทบอท (ถ้า Realtime ทำงาน จะเห็นทันทีเหมือนเดิม)
-    async def poll_data_forever():
-        while True:
-            await asyncio.sleep(300)  # 5 นาที
-            try:
-                await load_employees_from_supabase()
-                await load_target_groups()
-            except Exception as e:
-                logger.error(f"[Poll] reload error: {e}")
-    asyncio.create_task(poll_data_forever())
-
-    # ดักการเปลี่ยนแปลงตาราง telegram_groups → รีโหลดรายชื่อกลุ่มทันที
-    async def watch_groups_realtime():
-        try:
-            from realtime import AsyncRealtimeClient
-            realtime_url = _supabase_url.replace("https://", "wss://") + "/realtime/v1"
-            rt_client = AsyncRealtimeClient(realtime_url, _supabase_key)
-            await rt_client.connect()
-            channel = rt_client.channel("groups-changes")
-            _loop = asyncio.get_running_loop()
-
-            # [FIX] เหตุผลเดียวกับ on_users_change ข้างบน — ต้องเป็นฟังก์ชันธรรมดา
-            def on_groups_change(*_args, **_kwargs):
-                logger.info("[GROUPS] Realtime: ตรวจพบการเปลี่ยนแปลงใน telegram_groups → รีโหลดทันที")
-                asyncio.run_coroutine_threadsafe(load_target_groups(), _loop)
-            await channel.on_postgres_changes(
-                event="*",
-                schema="public",
-                table="telegram_groups",
-                callback=on_groups_change
-            ).subscribe()
-            logger.info("[GROUPS] Realtime: กำลัง watch ตาราง telegram_groups...")
-            await rt_client.listen()
-        except Exception as e:
-            logger.error(f"[GROUPS] Realtime error: {e}")
-    asyncio.create_task(watch_groups_realtime())
+    # Realtime + poll สำรอง เริ่มครั้งเดียวตลอดอายุโปรแกรม
+    # [FIX] เดิมสร้างใหม่ทุกครั้งที่ Telegram reconnect โดยไม่ปิดตัวเก่า → connection/poller ซ้อนกันเรื่อยๆ
+    start_background_sync()
 
     @client.on(events.NewMessage())
     async def handler(event):
@@ -1224,7 +1228,7 @@ async def start_telegram(on_activity):
                 # กรณีกลับที่นั่งล้มเหลวเพราะบอทเทเลแกรมรีเซท
                 is_failed_return = any(kw in text for kw in RETURN_KEYWORDS) and "ไม่มีกิจกรรม" in text
                 if is_failed_return:
-                    tid_match = re.search(r"รหัสผู้ใช้[：:][^\d]*(\d+)", text)
+                    tid_match = TID_RE.search(text)
                     if tid_match:
                         tid = tid_match.group(1)
                         emp = EMPLOYEES.get(tid)
@@ -1323,15 +1327,34 @@ async def start_telegram_with_reconnect(on_activity):
         first_run = False
 
 
+def _reset_discord_client() -> None:
+    """[FIX] ทำให้ client ที่ close ไปแล้วกลับมา start() ใหม่ได้
+    เดิมเรียก start() ซ้ำกับ client ที่ปิดแล้ว → จบทันทีโดยไม่ต่อจริง บอทตายถาวรแต่ log วนบอกว่ากำลัง reconnect
+    clear() อย่างเดียวไม่พอ ต้องทิ้ง connector ที่ปิดแล้ว และคืนค่า loop ให้ login() ตั้งค่าใหม่ด้วย"""
+    from discord.utils import MISSING
+    discord_bot.clear()
+    connector = getattr(discord_bot.http, "connector", MISSING)
+    if connector is not MISSING and getattr(connector, "closed", False):
+        discord_bot.http.connector = MISSING
+    if discord_bot.loop is MISSING:
+        discord_bot.loop = discord.client._loop
+
+
 async def start_discord_with_reconnect(token: str):
     """Wrap discord bot start with auto-reconnect on disconnect."""
     backoff = 5
     while True:
         try:
+            if discord_bot.is_closed():
+                _reset_discord_client()
             await discord_bot.start(token)
             logger.warning("Discord disconnected — reconnecting in %ds...", backoff)
         except Exception as e:
             logger.error("Discord error: %s — reconnecting in %ds...", e, backoff)
+            try:
+                await discord_bot.close()       # ปิด session เดิมให้สะอาดก่อนต่อใหม่ (กัน connection รั่ว)
+            except Exception:
+                pass
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 300)
 
@@ -1340,6 +1363,8 @@ async def main():
     discord_token = os.environ.get("DISCORD_BOT_TOKEN", "")
     if not discord_token:
         logger.warning("Missing DISCORD_BOT_TOKEN. Discord bot disabled.")
+        # [FIX] ปลดล็อกให้ Telegram ทำงานต่อได้ (บันทึกพักลง Supabase) — เดิมค้างรอ Discord ตลอดไป
+        discord_bot._ready_event.set()
         discord_task = asyncio.create_task(asyncio.sleep(0))
     else:
         discord_task = asyncio.create_task(start_discord_with_reconnect(discord_token))
