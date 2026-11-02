@@ -14,6 +14,7 @@ import discord
 from supabase import create_client, Client as SupabaseClient
 
 from chat_count import ChatCount, spawn, delete_messages_safely, TH_TZ
+import nick as nickname
 
 # เวลาใน log เป็นเวลาไทย (เดิมเป็นเวลา server = UTC) และพิมพ์ออก stdout
 # (Railway ระบายแดงทุกบรรทัดที่ออก stderr ทำให้ INFO ธรรมดาดูเหมือน error)
@@ -240,35 +241,56 @@ def is_destination(channel_id) -> bool:
     return str(channel_id) in DESTINATION_CHANNEL_IDS
 
 
-# ── 🏷️ อีโมจิหน้าชื่อตอนพัก ── กดไปปวดหนัก → ชื่อเป็น "🚽👑 LAYLA" / กดกลับ → คืนชื่อเดิม
-# ปิดได้ด้วย env NICK_STATUS=0 / บอทต้องมีสิทธิ์ Manage Nicknames และ role สูงกว่าพนักงาน
+# ── 🏷️ ชื่อเล่นพนักงาน = [สีเว็บวันนี้][ชื่อเดิม] [อีโมจิพัก] ── เช่น "🟣👑 LAYLA 🚽" (รายละเอียดใน nick.py)
+# บอทต้องมีสิทธิ์ Manage Nicknames และ role สูงกว่าพนักงาน
+# NICK_STATUS=0 → ปิดอีโมจิพัก / WEB_NICK=0 → ปิดสีเว็บ
 NICK_STATUS_ENABLED = os.environ.get("NICK_STATUS", "1").strip() != "0"
-# (รวมอีโมจิรุ่นเก่า เช่น 🚾 ไว้ด้วย เพื่อให้ยังลบออกจากชื่อที่ค้างอยู่ได้)
-STATUS_NICK_EMOJIS = tuple(sorted(set(ACTIVITY_EMOJI.values()) | set(BREAK_REASON_EMOJI.values()) | {"🚶"},
-                                  key=len, reverse=True))
-NICK_MAX = 32                     # Discord จำกัดชื่อเล่นไม่เกิน 32 ตัวอักษร
+WEB_NICK_ENABLED = os.environ.get("WEB_NICK", "1").strip() != "0"
+WEB_NICK_SYNC_EVERY = 300         # อ่านตารางหน้าที่จาก K36 ใหม่ทุกกี่วินาที (แอดมินแก้หน้าที่ → ชื่อเปลี่ยนตามภายใน 5 นาที)
 NICK_RETRY_AFTER = 300            # เปลี่ยนชื่อไม่ได้ → รอกี่วินาทีค่อยลองใหม่
-# กิจกรรมที่ไม่ต้องใส่อีโมจิหน้าชื่อ — กินข้าวถูกย้ายไปห้องกินข้าวอยู่แล้ว เห็นจากห้องได้เลย
+# กิจกรรมที่ไม่ต้องใส่อีโมจิพัก — กินข้าวถูกย้ายไปห้องกินข้าวอยู่แล้ว เห็นจากห้องได้เลย
 NICK_SKIP_EMOJIS = {"🍚"}
+# อีโมจิพักทั้งหมดที่บอทอาจใส่ (รวมรุ่นเก่า เช่น 🚾 / 🍚 ไว้ด้วย เพื่อให้ยังลบออกจากชื่อที่ค้างอยู่ได้)
+BREAK_NICK_EMOJIS = set(ACTIVITY_EMOJI.values()) | set(BREAK_REASON_EMOJI.values()) | {"🚶"}
+
+WEB_EMOJI: dict[str, str] = nickname.web_emoji_map([])   # ชื่อเว็บ(ตัวเล็ก) → สี
+# discord_id → [เว็บงานหลัก, (เว็บงานรอง — OD)] ([] = วันนี้ไม่ได้ทำเว็บไหน / ไม่มี key = ยังไม่รู้ ไม่แตะ)
+TODAY_WEB: dict[str, list[str]] = {}
 
 
-def strip_status_prefix(nick: str | None) -> str | None:
-    """ตัดอีโมจิสถานะพักที่บอทใส่ไว้หน้าชื่อออก"""
-    changed = True
-    while nick and changed:
-        changed = False
-        for e in STATUS_NICK_EMOJIS:
-            if nick.startswith(e):
-                nick, changed = nick[len(e):], True
-    return nick
+async def load_today_webs() -> None:
+    """อ่านสีเว็บ + ตารางหน้าที่ของวันนี้จาก K36 แล้วคำนวณว่าใครทำเว็บไหน"""
+    global WEB_EMOJI, TODAY_WEB
+    if not supabase or not EMPLOYEES:
+        return
+    try:
+        res = await sb(lambda: supabase.from_("chatcount_settings").select("webs").eq("id", 1).execute())
+        WEB_EMOJI = nickname.web_emoji_map(((res.data or [{}])[0] or {}).get("webs"))
+    except Exception as e:
+        logger.warning(f"[WEB_NICK] โหลดสีเว็บไม่ได้ ใช้ค่าเดิม: {e}")
+    now = get_thai_time()
+    keys = sorted({k for emp in EMPLOYEES.values() for k in nickname.roster_keys(emp, now)})
+    try:
+        res = await sb(lambda: supabase.from_("settings").select("key, value").in_("key", keys).execute())
+    except Exception as e:
+        logger.warning(f"[WEB_NICK] โหลดตารางหน้าที่ไม่ได้: {e}")
+        return
+    rows = {r["key"]: r.get("value") for r in (res.data or [])}
+    TODAY_WEB = nickname.resolve_today_webs(EMPLOYEES, rows, now)
 
 
-def _fit_nick(prefix: str, base: str) -> str:
-    """ต่ออีโมจิหน้าชื่อ ตัดท้ายถ้ายาวเกินที่ Discord รับ (นับแบบ UTF-16 ให้ตรงกับฝั่ง Discord)"""
-    u16 = lambda x: len(x.encode("utf-16-le")) // 2
-    while base and u16(prefix + base) > NICK_MAX:
-        base = base[:-1]
-    return prefix + base
+def web_emoji_for(team: str) -> str:
+    return WEB_EMOJI.get((team or "").strip().lower(), "")
+
+
+def web_prefix_for(teams: list[str]) -> str:
+    """สีหน้าชื่อ เช่น ["PG688", "F168"] → "🟣🟠" (สีซ้ำ/ไม่มีสี ตัดทิ้ง)"""
+    out = []
+    for t in teams or []:
+        e = web_emoji_for(t)
+        if e and e not in out:
+            out.append(e)
+    return "".join(out)
 
 
 def get_emoji(activity: str, is_return: bool) -> str:
@@ -561,8 +583,8 @@ class ActivityBot(discord.Client):
         self._return_channel: dict[int, int] = {}
         # member_id → ห้องทำงานล่าสุดที่อยู่ (ไม่นับห้องกินข้าว) — ไม่ถูกล้างรายชั่วโมง
         self._last_work_channel: dict[int, int] = {}
-        # ── อีโมจิหน้าชื่อ ── member_id → ชื่อเล่นเดิมก่อนใส่อีโมจิ (None = ไม่ได้ตั้งชื่อเล่น)
-        self._orig_nick: dict[int, str | None] = {}
+        # ── ชื่อเล่น ── member_id → อีโมจิพักที่ต้องแสดง (None = ไม่ได้พัก / กลับแล้ว)
+        self._break_emoji: dict[int, str | None] = {}
         # เปลี่ยนชื่อไม่ได้ (role สูงกว่าบอท) → member_id: เวลาที่ลองล่าสุด
         # พักไว้ 5 นาทีค่อยลองใหม่ (ถ้าแอดมินแก้ลำดับ role แล้ว จะใช้ได้เองโดยไม่ต้องรีสตาร์ทบอท)
         self._nick_forbidden: dict[int, float] = {}
@@ -608,6 +630,9 @@ class ActivityBot(discord.Client):
             logger.info(f"Snapshot: found {count} member(s) already in voice channels")
         self._ready_event.set()          # ⚠️ ต้องถึงบรรทัดนี้เสมอ — งาน Telegram/นับแชท รอสัญญาณนี้อยู่
         await self._sync_commands()
+        if (WEB_NICK_ENABLED or NICK_STATUS_ENABLED) and not getattr(self, "_nick_sync_started", False):
+            self._nick_sync_started = True
+            spawn(self._nick_sync_loop())
         if BREAK_MSG_DELETE_AFTER >= 0 and not getattr(self, "_sweeper_started", False):
             self._sweeper_started = True
             spawn(self._break_sweeper())
@@ -630,8 +655,6 @@ class ActivityBot(discord.Client):
         while True:
             try:
                 removed = await self._sweep_once(full)
-                if await self.cleanup_status_nicks():
-                    logger.info("[NICK] คืนชื่อที่มีอีโมจิพักค้างให้แล้ว")
                 full = False
                 if removed:
                     logger.info(f"[SWEEP] ลบข้อความกลับที่นั่งที่ค้าง {removed} ชุด")
@@ -639,65 +662,90 @@ class ActivityBot(discord.Client):
                 logger.warning(f"[SWEEP] error: {e}")
             await asyncio.sleep(self.SWEEP_EVERY)
 
-    async def set_status_nick(self, member: discord.Member, emoji: str | None) -> None:
-        """ใส่อีโมจิสถานะหน้าชื่อ (emoji) หรือคืนชื่อเดิม (emoji=None)"""
+    def desired_nick(self, member: discord.Member) -> str | None:
+        """ชื่อเล่นที่ควรเป็นตอนนี้ (None = ไม่ตั้งชื่อเล่น ใช้ชื่อบัญชี)"""
+        did = str(member.id)
+        web_cur, base, brk_cur = nickname.parse_nick(member.nick, WEB_EMOJI.values(), BREAK_NICK_EMOJIS)
+        base_text = base or member.global_name or member.name
+
+        web = web_cur                                   # ไม่รู้ตารางวันนี้ → คงสีเดิม
+        if WEB_NICK_ENABLED and did in TODAY_WEB:
+            web = web_prefix_for(TODAY_WEB[did])
+
         if not NICK_STATUS_ENABLED:
-            return
+            brk = ""
+        elif member.id in self._break_emoji:
+            brk = self._break_emoji[member.id] or ""
+        elif not _out_restored:
+            brk = brk_cur                               # ยังไม่รู้ว่าใครพักอยู่ (เพิ่งเปิดบอท) → คงไว้ก่อน
+        else:
+            out_ids = {EMPLOYEES[t]["discord_id"] for t in _currently_out if t in EMPLOYEES}
+            brk = brk_cur if did in out_ids else ""     # บอทรีสตาร์ทระหว่างพัก → คงอีโมจิเดิมจนกว่าจะกดกลับ
+        if brk in NICK_SKIP_EMOJIS:
+            brk = ""
+
+        if not web and not brk and (not base or base in (member.global_name, member.name)):
+            return None                                 # ไม่มีอะไรต้องเติม และชื่อเท่าชื่อบัญชี → ไม่ต้องตั้งชื่อเล่น
+        return nickname.build_nick(base_text, web, brk)
+
+    async def apply_nick(self, member: discord.Member) -> bool:
+        """เปลี่ยนชื่อเล่นให้ตรงกับที่ควรเป็น คืน True ถ้ามีการเปลี่ยนจริง"""
         if member.id == getattr(member.guild, "owner_id", None):
-            return                                              # Discord ไม่ให้บอทเปลี่ยนชื่อเจ้าของเซิร์ฟเวอร์
+            return False                                # Discord ไม่ให้บอทเปลี่ยนชื่อเจ้าของเซิร์ฟเวอร์
         last_fail = self._nick_forbidden.get(member.id)
         if last_fail is not None and time_module.time() - last_fail < NICK_RETRY_AFTER:
-            return
-        current = member.nick
-        base_nick = strip_status_prefix(current)              # ชื่อเล่นที่ไม่มีอีโมจิสถานะ
-        if emoji is None:
-            orig = self._orig_nick.pop(member.id, ...)
-            if not current or base_nick == current:
-                return                                          # ไม่มีอีโมจิให้ลบ
-            if orig is not ...:
-                new = orig
-            else:
-                # บอทรีสตาร์ท (ไม่รู้ชื่อเดิม) → ตัดอีโมจิออก ถ้าเหลือเท่าชื่อบัญชี ก็ล้างชื่อเล่นทิ้ง
-                new = base_nick or None
-                if new in (member.global_name, member.name):
-                    new = None
-        else:
-            if member.id not in self._orig_nick:
-                self._orig_nick[member.id] = base_nick or None
-            new = _fit_nick(emoji, base_nick or member.global_name or member.name)
-            if new == current:
-                return
+            return False
+        new = self.desired_nick(member)
+        if (new or None) == (member.nick or None):
+            return False
         try:
-            await member.edit(nick=new, reason="สถานะพัก (botlink)")
+            await member.edit(nick=new, reason="สีเว็บ/สถานะพัก (botlink)")
         except discord.Forbidden:
             self._nick_forbidden[member.id] = time_module.time()
-            if emoji is not None:
-                self._orig_nick.pop(member.id, None)
             top = getattr(getattr(member, "top_role", None), "name", "?")
             logger.warning(f"[NICK] เปลี่ยนชื่อ {member} ไม่ได้ — role สูงสุดของคนนี้คือ '{top}' "
                            f"ต้องลาก role ของบอทให้อยู่เหนือ role นี้ (และเปิดสิทธิ์ Manage Nicknames)")
-            return
+            return False
         except discord.HTTPException as e:
             logger.warning(f"[NICK] เปลี่ยนชื่อ {member} ไม่สำเร็จ: {e}")
-            return
+            return False
         self._nick_forbidden.pop(member.id, None)
+        return True
 
-    async def cleanup_status_nicks(self) -> int:
-        """คืนชื่อให้พนักงานที่ยังมีอีโมจิสถานะค้าง แต่ไม่ได้พักอยู่แล้ว (เช่น บอทรีสตาร์ทตอนเขากดกลับ)"""
-        if not NICK_STATUS_ENABLED or not _out_restored:
-            return 0
-        out_ids = {EMPLOYEES[t]["discord_id"] for t in _currently_out if t in EMPLOYEES}
-        fixed = 0
+    async def set_break_nick(self, member: discord.Member, emoji: str | None) -> None:
+        """ไปพัก → ใส่อีโมจิท้ายชื่อ / กลับ (emoji=None) → เอาออก"""
+        self._break_emoji[member.id] = emoji
+        try:
+            await self.apply_nick(member)
+        finally:
+            if emoji is None:
+                self._break_emoji.pop(member.id, None)
+
+    async def sync_all_nicks(self) -> int:
+        """ปรับชื่อพนักงานทุกคนให้ตรงกับเว็บวันนี้ + สถานะพัก"""
+        changed = 0
         for g in self.guilds:
             for m in g.members:
-                if not m.nick or strip_status_prefix(m.nick) == m.nick:
-                    continue
-                did = str(m.id)
-                if did not in NAME_BY_DISCORD or did in out_ids:
-                    continue                    # ไม่ใช่พนักงานในระบบ (อาจตั้งชื่อเอง) / ยังพักอยู่จริง
-                await self.set_status_nick(m, None)
-                fixed += 1
-        return fixed
+                if str(m.id) not in NAME_BY_DISCORD:
+                    continue                            # ไม่ใช่พนักงานในระบบ → ไม่แตะชื่อ
+                if await self.apply_nick(m):
+                    changed += 1
+                    await asyncio.sleep(0.3)            # เว้นจังหวะ ไม่ยิง Discord รัวเกิน
+        return changed
+
+    async def _nick_sync_loop(self):
+        """ทุก 5 นาที: อ่านตารางหน้าที่ใหม่ แล้วปรับชื่อทุกคน (ข้ามวัน/เปลี่ยนกะ/แอดมินแก้หน้าที่ → ชื่อเปลี่ยนตามเอง)"""
+        await asyncio.sleep(20)                         # รอโหลดพนักงาน + รายชื่อคนที่พักอยู่ก่อน
+        while True:
+            try:
+                if WEB_NICK_ENABLED:
+                    await load_today_webs()
+                n = await self.sync_all_nicks()
+                if n:
+                    logger.info(f"[NICK] ปรับชื่อ {n} คน (สีเว็บวันนี้ {sum(1 for v in TODAY_WEB.values() if v)} คน)")
+            except Exception as e:
+                logger.warning(f"[NICK] sync error: {e}")
+            await asyncio.sleep(WEB_NICK_SYNC_EVERY)
 
     async def _sweep_once(self, full: bool) -> int:
         min_age = max(BREAK_MSG_DELETE_AFTER, 0) + 10
@@ -928,8 +976,8 @@ class ActivityBot(discord.Client):
         # 🏷️ อีโมจิหน้าชื่อ: ไป → ใส่ / กลับ → คืนชื่อเดิม (พังก็ไม่กระทบการแจ้ง/ย้ายห้อง)
         #    กินข้าว → ไม่ใส่ (และล้างอีโมจิเก่าถ้ามีค้าง) เพราะถูกย้ายไปห้องกินข้าวอยู่แล้ว
         try:
-            nick_emoji = None if (is_return or emoji in NICK_SKIP_EMOJIS) else emoji
-            await self.set_status_nick(member, nick_emoji)
+            nick_emoji = None if (is_return or emoji in NICK_SKIP_EMOJIS or not NICK_STATUS_ENABLED) else emoji
+            await self.set_break_nick(member, nick_emoji)
         except Exception as e:
             logger.warning(f"[NICK] {name}: {e}")
 
