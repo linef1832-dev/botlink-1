@@ -97,6 +97,8 @@ async def load_employees_from_supabase() -> None:
                     "allowed_shift": shift,
                     "department": dept,
                 }
+        if new_map != EMPLOYEES:
+            NICK_SYNC_NOW.set()                 # ข้อมูลพนักงานเปลี่ยน (เช่น แก้ Discord ID) → ปรับชื่อทันที ไม่ต้องรอรอบ
         EMPLOYEES = new_map
         NAME_BY_DISCORD = {v["discord_id"]: v["name"] for v in new_map.values()}
         TID_BY_NAME = {v["name"]: k for k, v in new_map.items()}
@@ -246,7 +248,9 @@ def is_destination(channel_id) -> bool:
 # NICK_STATUS=0 → ปิดอีโมจิพัก / WEB_NICK=0 → ปิดสีเว็บ
 NICK_STATUS_ENABLED = os.environ.get("NICK_STATUS", "1").strip() != "0"
 WEB_NICK_ENABLED = os.environ.get("WEB_NICK", "1").strip() != "0"
-WEB_NICK_SYNC_EVERY = 300         # อ่านตารางหน้าที่จาก K36 ใหม่ทุกกี่วินาที (แอดมินแก้หน้าที่ → ชื่อเปลี่ยนตามภายใน 5 นาที)
+WEB_NICK_SYNC_EVERY = 60          # อ่านตารางหน้าที่จาก K36 ใหม่ทุกกี่วินาที (แอดมินแก้หน้าที่ → ชื่อเปลี่ยนตามภายใน 1 นาที)
+# ถูก set เมื่อข้อมูลพนักงานเปลี่ยน → รอบปรับชื่อทำงานทันที (ไม่ต้องรอครบ 1 นาที)
+NICK_SYNC_NOW = asyncio.Event()
 NICK_RETRY_AFTER = 300            # เปลี่ยนชื่อไม่ได้ → รอกี่วินาทีค่อยลองใหม่
 # กิจกรรมที่ไม่ต้องใส่อีโมจิพัก — กินข้าวถูกย้ายไปห้องกินข้าวอยู่แล้ว เห็นจากห้องได้เลย
 NICK_SKIP_EMOJIS = {"🍚"}
@@ -757,6 +761,7 @@ class ActivityBot(discord.Client):
     async def _nick_sync_loop(self):
         """ทุก 5 นาที: อ่านตารางหน้าที่ใหม่ แล้วปรับชื่อทุกคน (ข้ามวัน/เปลี่ยนกะ/แอดมินแก้หน้าที่ → ชื่อเปลี่ยนตามเอง)"""
         await asyncio.sleep(20)                         # รอโหลดพนักงาน + รายชื่อคนที่พักอยู่ก่อน
+        NICK_SYNC_NOW.clear()                           # รอบแรกจะโหลดใหม่อยู่แล้ว
         while True:
             try:
                 if WEB_NICK_ENABLED:
@@ -766,7 +771,11 @@ class ActivityBot(discord.Client):
                     logger.info(f"[NICK] ปรับชื่อ {n} คน (สีเว็บวันนี้ {sum(1 for v in TODAY_WEB.values() if v)} คน)")
             except Exception as e:
                 logger.warning(f"[NICK] sync error: {e}")
-            await asyncio.sleep(WEB_NICK_SYNC_EVERY)
+            try:
+                await asyncio.wait_for(NICK_SYNC_NOW.wait(), timeout=WEB_NICK_SYNC_EVERY)
+            except asyncio.TimeoutError:
+                pass
+            NICK_SYNC_NOW.clear()
 
     async def _sweep_once(self, full: bool) -> int:
         min_age = max(BREAK_MSG_DELETE_AFTER, 0) + 10
@@ -1358,12 +1367,16 @@ async def reload_all_data() -> None:
     await load_target_groups()
 
 
+DATA_POLL_EVERY = 60      # วินาที
+
+
 async def poll_data_forever() -> None:
-    """⏱️ กันเหนียว: รีโหลดพนักงาน+กลุ่มทุก 5 นาที "เสมอ" — แม้ Realtime ต่อได้แต่ไม่มี event วิ่งมา
+    """⏱️ กันเหนียว: รีโหลดพนักงาน+กลุ่มทุก 1 นาที "เสมอ" — แม้ Realtime ต่อได้แต่ไม่มี event วิ่งมา
     (เช่น ตาราง users ยังไม่ถูก add เข้า publication supabase_realtime ฝั่ง K36)
-    ข้อมูลจะตามทันภายใน 5 นาทีโดยไม่ต้องรีสตาร์ทบอท (ถ้า Realtime ทำงาน จะเห็นทันทีเหมือนเดิม)"""
+    ข้อมูลจะตามทันภายใน 1 นาทีโดยไม่ต้องรีสตาร์ทบอท (ถ้า Realtime ทำงาน จะเห็นทันทีเหมือนเดิม)
+    query เล็กมาก (พนักงาน ~150 แถว + กลุ่มไม่กี่แถว) จึงไม่หนักทั้งบอทและฐานข้อมูล"""
     while True:
-        await asyncio.sleep(300)  # 5 นาที
+        await asyncio.sleep(DATA_POLL_EVERY)
         try:
             await reload_all_data()
         except Exception as e:
