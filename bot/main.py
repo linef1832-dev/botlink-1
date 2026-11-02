@@ -248,6 +248,8 @@ STATUS_NICK_EMOJIS = tuple(sorted(set(ACTIVITY_EMOJI.values()) | set(BREAK_REASO
                                   key=len, reverse=True))
 NICK_MAX = 32                     # Discord จำกัดชื่อเล่นไม่เกิน 32 ตัวอักษร
 NICK_RETRY_AFTER = 300            # เปลี่ยนชื่อไม่ได้ → รอกี่วินาทีค่อยลองใหม่
+# กิจกรรมที่ไม่ต้องใส่อีโมจิหน้าชื่อ — กินข้าวถูกย้ายไปห้องกินข้าวอยู่แล้ว เห็นจากห้องได้เลย
+NICK_SKIP_EMOJIS = {"🍚"}
 
 
 def strip_status_prefix(nick: str | None) -> str | None:
@@ -924,8 +926,10 @@ class ActivityBot(discord.Client):
             return False, None
 
         # 🏷️ อีโมจิหน้าชื่อ: ไป → ใส่ / กลับ → คืนชื่อเดิม (พังก็ไม่กระทบการแจ้ง/ย้ายห้อง)
+        #    กินข้าว → ไม่ใส่ (และล้างอีโมจิเก่าถ้ามีค้าง) เพราะถูกย้ายไปห้องกินข้าวอยู่แล้ว
         try:
-            await self.set_status_nick(member, None if is_return else emoji)
+            nick_emoji = None if (is_return or emoji in NICK_SKIP_EMOJIS) else emoji
+            await self.set_status_nick(member, nick_emoji)
         except Exception as e:
             logger.warning(f"[NICK] {name}: {e}")
 
