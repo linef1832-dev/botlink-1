@@ -26,6 +26,10 @@ DEFAULT_WEB_EMOJI = {
     "NM9": "🔴", "VV72": "🔘", "TH26": "🟤", "K188": "🩷", "BT678": "⚪️",
 }
 
+# อีโมจิที่ Discord บน Windows แสดงในชื่อไม่ได้ (ขึ้นเป็นกล่อง □) → ใช้ตัวที่หน้าตาใกล้กันแทน เฉพาะในชื่อ
+# (🩷 เป็นอีโมจิใหม่ Unicode 15 — ในข้อความ Telegram ยังใช้ 🩷 ตามที่ตั้งในเว็บได้ปกติ)
+NICK_EMOJI_FALLBACK = {"🩷": "💗", "🩵": "💙", "🩶": "🤍"}
+
 VS16 = "\ufe0f"                    # ตัวแปรรูปอีโมจิ (⚫️ = ⚫ + VS16) — พิมพ์มาบ้างไม่มาบ้าง ต้องรับทั้งคู่
 
 
@@ -97,7 +101,12 @@ def web_emoji_map(webs) -> dict[str, str]:
     for w in webs or []:
         if isinstance(w, dict) and w.get("name") and str(w.get("emoji") or "").strip():
             out[str(w["name"]).strip().lower()] = str(w["emoji"]).strip()
-    return out
+    return {k: NICK_EMOJI_FALLBACK.get(v, v) for k, v in out.items()}
+
+
+def all_web_emojis(web_map: dict[str, str]) -> set[str]:
+    """สีเว็บทั้งหมดที่อาจอยู่ในชื่อ (รวมตัวเดิมก่อนแทน เช่น 🩷 — เพื่อให้ลบออกจากชื่อเก่าได้)"""
+    return set(web_map.values()) | set(DEFAULT_WEB_EMOJI.values()) | set(NICK_EMOJI_FALLBACK)
 
 
 def work_date(shift: str, now: datetime) -> str:
@@ -114,11 +123,18 @@ def duty_dept(dept: str) -> str:
 
 
 def roster_keys(emp: dict, now: datetime) -> list[str]:
-    """key ในตาราง settings ของตารางหน้าที่ที่คนนี้อาจอยู่"""
+    """key ในตาราง settings ของตารางหน้าที่ที่คนนี้อาจอยู่ — กะของตัวเองก่อน แล้วค่อยกะอื่น
+    (ค้นทุกกะ เพราะมีสลับกะ/ย้ายกะชั่วคราว — คนที่ allowed_shift เป็นกะกลางแต่วันนี้ไปอยู่กะดึกก็ต้องเจอ)"""
     dept = duty_dept(emp.get("department", ""))
     shift = (emp.get("allowed_shift") or "").strip()
-    shifts = [shift] if shift in DUTY_SHIFTS else list(DUTY_SHIFTS)
+    shifts = ([shift] if shift in DUTY_SHIFTS else []) + [s for s in DUTY_SHIFTS if s != shift]
     return [f"duty_roster_{dept}_{work_date(s, now)}_{s}" for s in shifts]
+
+
+def own_roster_keys(emp: dict, now: datetime) -> list[str]:
+    """key ที่ "ต้องมี" ก่อนจะสรุปได้ว่าวันนี้คนนี้ไม่ได้ทำเว็บไหน (กะตัวเอง / ไม่รู้กะ = ทุกกะ)"""
+    keys = roster_keys(emp, now)
+    return keys[:1] if (emp.get("allowed_shift") or "").strip() in DUTY_SHIFTS else keys
 
 
 def find_teams(roster: dict, username: str, with_secondary: bool = False) -> list[str]:
@@ -159,6 +175,6 @@ def resolve_today_webs(employees: dict, rows: dict[str, str], now: datetime) -> 
         teams = next((t for r in rosters if (t := find_teams(r, emp.get("name", ""), with_sec))), [])
         if teams:
             out[did] = teams
-        elif rosters and len(rosters) == len(keys):
-            out[did] = []                       # มีตารางครบแล้ว แต่ไม่มีชื่อ → วันนี้ไม่ได้ทำเว็บไหน
+        elif all(isinstance(parsed.get(k), dict) for k in own_roster_keys(emp, now)):
+            out[did] = []                       # ตารางกะตัวเองมีแล้ว แต่ไม่มีชื่อ (และไม่อยู่กะอื่น) → วันนี้ไม่ได้ทำเว็บไหน
     return out

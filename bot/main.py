@@ -665,7 +665,8 @@ class ActivityBot(discord.Client):
     def desired_nick(self, member: discord.Member) -> str | None:
         """ชื่อเล่นที่ควรเป็นตอนนี้ (None = ไม่ตั้งชื่อเล่น ใช้ชื่อบัญชี)"""
         did = str(member.id)
-        web_cur, base, brk_cur = nickname.parse_nick(member.nick, WEB_EMOJI.values(), BREAK_NICK_EMOJIS)
+        web_cur, base, brk_cur = nickname.parse_nick(member.nick, nickname.all_web_emojis(WEB_EMOJI),
+                                                     BREAK_NICK_EMOJIS)
         base_text = base or member.global_name or member.name
 
         web = web_cur                                   # ไม่รู้ตารางวันนี้ → คงสีเดิม
@@ -724,13 +725,33 @@ class ActivityBot(discord.Client):
     async def sync_all_nicks(self) -> int:
         """ปรับชื่อพนักงานทุกคนให้ตรงกับเว็บวันนี้ + สถานะพัก"""
         changed = 0
+        no_color: list[str] = []                        # คนที่อยู่ห้องเสียงแต่ไม่ได้สี + เหตุผล (ไว้ดูใน log)
+        info_by_did = {e["discord_id"]: e for e in EMPLOYEES.values()}
         for g in self.guilds:
             for m in g.members:
-                if str(m.id) not in NAME_BY_DISCORD:
+                did = str(m.id)
+                if did not in NAME_BY_DISCORD:
                     continue                            # ไม่ใช่พนักงานในระบบ → ไม่แตะชื่อ
                 if await self.apply_nick(m):
                     changed += 1
                     await asyncio.sleep(0.3)            # เว้นจังหวะ ไม่ยิง Discord รัวเกิน
+                if WEB_NICK_ENABLED and m.voice and m.voice.channel and not is_destination(m.voice.channel.id):
+                    e = info_by_did.get(did, {})
+                    who = f"{NAME_BY_DISCORD[did]}({e.get('department') or '-'}/{e.get('allowed_shift') or '-'})"
+                    if m.id == getattr(g, "owner_id", None):
+                        no_color.append(f"{who}=เจ้าของเซิร์ฟ")
+                    elif m.id in self._nick_forbidden:
+                        no_color.append(f"{who}=role สูงกว่าบอท")
+                    elif did not in TODAY_WEB:
+                        no_color.append(f"{who}=ไม่เจอตารางหน้าที่")
+                    elif not web_prefix_for(TODAY_WEB[did]):
+                        no_color.append(f"{who}=ไม่มีชื่อในตาราง" if not TODAY_WEB[did]
+                                        else f"{who}=เว็บ {'/'.join(TODAY_WEB[did])} ไม่มีสี")
+        summary = ", ".join(sorted(no_color))
+        if summary != getattr(self, "_last_no_color", None):
+            self._last_no_color = summary
+            if no_color:
+                logger.info(f"[NICK] อยู่ห้องเสียงแต่ไม่มีสีเว็บ {len(no_color)} คน: {summary[:1500]}")
         return changed
 
     async def _nick_sync_loop(self):
