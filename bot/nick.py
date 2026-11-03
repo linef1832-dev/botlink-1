@@ -1,11 +1,11 @@
-"""ชื่อเล่น Discord ของพนักงาน = [สีเว็บวันนี้][ชื่อเดิม] [อีโมจิพัก]
+"""ชื่อเล่น Discord ของพนักงาน = [อีโมจิพัก][สีเว็บวันนี้][ชื่อเดิม]
 
     🟣👑 LAYLA        ← วันนี้ทำเว็บ PG688 (สีม่วง)
-    🟣👑 LAYLA 🚽     ← กำลังไปห้องน้ำ
+    🚽🟣👑 LAYLA      ← กำลังไปห้องน้ำ
     🟣🟠👑 KAI        ← OD: งานหลัก PG688 + งานรอง F168 (แผนกอื่นใช้สีงานหลักสีเดียว)
 
-- สีเว็บอยู่ "หน้าสุด" → Discord เรียงรายชื่อตามตัวอักษร คนเว็บเดียวกันเลยอยู่ติดกัน
-- อีโมจิพักอยู่ "ท้ายสุด" → ไปพักแล้วไม่หลุดออกจากกลุ่ม ตำแหน่งในลิสต์ไม่ขยับ
+- สีเว็บอยู่หน้าชื่อ → Discord เรียงรายชื่อตามตัวอักษร คนเว็บเดียวกันเลยอยู่ติดกัน
+- อีโมจิพักอยู่ "หน้าสุด" → เห็นทันทีแม้ชื่อยาวจนถูกตัดเป็น "..." (ถ้าไว้ท้ายชื่อจะโดนตัดหาย)
 - "ชื่อเดิม" คือทุกอย่างที่เหลือ (รวม 👑 🍀 ที่ตั้งกันเอง) บอทไม่แตะ
 
 ไฟล์นี้มีแต่ฟังก์ชันล้วน (ไม่ยุ่งกับ Discord/DB) — ทดสอบแยกได้
@@ -18,6 +18,8 @@ from datetime import datetime, timedelta
 NICK_MAX = 32                      # Discord จำกัดชื่อเล่นไม่เกิน 32 ตัวอักษร (นับแบบ UTF-16)
 DUTY_SHIFTS = ("กะเช้า", "กะกลาง", "กะดึก")
 DAY_SHIFTS = ("กะเช้า", "กะกลาง")  # กะกลางวัน — ใช้วันที่ตามปฏิทิน (เหมือนเว็บ K36)
+# เวลาทำงานของแต่ละกะ (ชั่วโมงเริ่ม, ชั่วโมงจบ) — ตรงกับชื่อกลุ่ม Telegram / เว็บ K36
+SHIFT_HOURS = {"กะเช้า": (8, 20), "กะกลาง": (12, 24), "กะดึก": (20, 8)}
 MULTI_WEB_DEPTS = {"OD"}            # แผนกที่แสดงสีงานรองต่อจากงานหลัก (แผนกอื่นใช้สีงานหลักอย่างเดียว)
 
 # สีประจำเว็บ (ค่าเริ่มต้นเดียวกับหน้าเว็บ K36) — ถ้าตั้งไว้ในเว็บ K36 หน้านับแชท จะใช้ค่าจากเว็บแทน
@@ -56,12 +58,12 @@ def _variants(emojis) -> list[tuple[str, str]]:
 def parse_nick(nick: str | None, web_emojis, break_emojis) -> tuple[str, str, str]:
     """แยกชื่อเล่นเป็น (สีเว็บทั้งหมดที่อยู่หน้าชื่อ, ชื่อเดิม, อีโมจิพัก)
 
-    รับได้ทั้งแบบใหม่ (พักอยู่ท้าย) และแบบเก่า (พักอยู่หน้า เช่น "🚽👑 LAYLA") แล้วจัดใหม่ให้"""
+    รับได้ทั้งอีโมจิพักที่อยู่หน้าชื่อ (แบบปัจจุบัน) และท้ายชื่อ (แบบรุ่นก่อน) แล้วจัดใหม่ให้"""
     s = nick or ""
     web_v, brk_v = _variants(web_emojis), _variants(break_emojis)
     web = brk = ""
     changed = True
-    while s and changed:                                   # ตัดหัว: สีเว็บ / อีโมจิพักแบบเก่า
+    while s and changed:                                   # ตัดหัว: อีโมจิพัก / สีเว็บ (ลำดับไหนก็ได้)
         changed = False
         if s.startswith(VS16):
             s, changed = s[len(VS16):], True
@@ -78,7 +80,7 @@ def parse_nick(nick: str | None, web_emojis, break_emojis) -> tuple[str, str, st
                     s, changed = s[len(v):], True
                     break
     changed = True
-    while s and changed:                                   # ตัดท้าย: อีโมจิพัก
+    while s and changed:                                   # ตัดท้าย: อีโมจิพัก (แบบรุ่นก่อน)
         changed = False
         t = s.rstrip()
         for v, canon in brk_v:
@@ -90,12 +92,12 @@ def parse_nick(nick: str | None, web_emojis, break_emojis) -> tuple[str, str, st
 
 
 def build_nick(base: str, web: str = "", brk: str = "") -> str:
-    """ประกอบชื่อ (ตัดท้ายชื่อเดิมถ้ายาวเกินที่ Discord รับ — สีเว็บ/อีโมจิพักไม่โดนตัด)"""
-    suffix = f" {brk}" if brk else ""
+    """ประกอบชื่อ [พัก][สีเว็บ][ชื่อเดิม] (ตัดท้ายชื่อเดิมถ้ายาวเกินที่ Discord รับ — อีโมจิไม่โดนตัด)"""
+    head = f"{brk or ''}{web or ''}"
     base = base or ""
-    while base and u16len(web + base + suffix) > NICK_MAX:
+    while base and u16len(head + base) > NICK_MAX:
         base = base[:-1]
-    return f"{web}{base}{suffix}"
+    return f"{head}{base}"
 
 
 def web_emoji_map(webs) -> dict[str, str]:
@@ -126,19 +128,33 @@ def duty_dept(dept: str) -> str:
     return "AMQL" if d == "TRAINER" else d
 
 
+def shift_active(shift: str, now: datetime) -> bool:
+    """ตอนนี้อยู่ในเวลาทำงานของกะนี้ไหม"""
+    start, end = SHIFT_HOURS.get(shift, (0, 24))
+    h = now.hour
+    return start <= h < end if start < end else (h >= start or h < end)
+
+
+def _roster_key(emp: dict, shift: str, now: datetime) -> str:
+    return f"duty_roster_{duty_dept(emp.get('department', ''))}_{work_date(shift, now)}_{shift}"
+
+
 def roster_keys(emp: dict, now: datetime) -> list[str]:
-    """key ในตาราง settings ของตารางหน้าที่ที่คนนี้อาจอยู่ — กะของตัวเองก่อน แล้วค่อยกะอื่น
-    (ค้นทุกกะ เพราะมีสลับกะ/ย้ายกะชั่วคราว — คนที่ allowed_shift เป็นกะกลางแต่วันนี้ไปอยู่กะดึกก็ต้องเจอ)"""
-    dept = duty_dept(emp.get("department", ""))
-    shift = (emp.get("allowed_shift") or "").strip()
-    shifts = ([shift] if shift in DUTY_SHIFTS else []) + [s for s in DUTY_SHIFTS if s != shift]
-    return [f"duty_roster_{dept}_{work_date(s, now)}_{s}" for s in shifts]
+    """key ในตาราง settings ของตารางหน้าที่ที่คนนี้อาจอยู่ เรียงตามลำดับที่ควรเชื่อ:
+        1) กะที่ "กำลังทำงานอยู่ตอนนี้" ก่อน (กะที่เลิกไปแล้ว/ยังไม่เริ่ม ไว้ทีหลัง)
+        2) ในกลุ่มเดียวกัน กะประจำของตัวเองก่อน
+    (ค้นทุกกะ เพราะมีสลับกะ/ดึงคนข้ามกะ — คนที่กะประจำเป็นกะกลางแต่วันนี้ไปอยู่กะดึกก็ต้องเจอ)"""
+    own = (emp.get("allowed_shift") or "").strip()
+    shifts = sorted(DUTY_SHIFTS, key=lambda s: (not shift_active(s, now), s != own))
+    return [_roster_key(emp, s, now) for s in shifts]
 
 
 def own_roster_keys(emp: dict, now: datetime) -> list[str]:
     """key ที่ "ต้องมี" ก่อนจะสรุปได้ว่าวันนี้คนนี้ไม่ได้ทำเว็บไหน (กะตัวเอง / ไม่รู้กะ = ทุกกะ)"""
-    keys = roster_keys(emp, now)
-    return keys[:1] if (emp.get("allowed_shift") or "").strip() in DUTY_SHIFTS else keys
+    own = (emp.get("allowed_shift") or "").strip()
+    if own in DUTY_SHIFTS:
+        return [_roster_key(emp, own, now)]
+    return roster_keys(emp, now)
 
 
 def find_teams(roster: dict, username: str, with_secondary: bool = False) -> list[str]:
@@ -157,11 +173,13 @@ def find_teams(roster: dict, username: str, with_secondary: bool = False) -> lis
     return []
 
 
-def resolve_today_webs(employees: dict, rows: dict[str, str], now: datetime) -> dict[str, list[str]]:
+def resolve_today_webs(employees: dict, rows: dict[str, str], now: datetime,
+                       sources: dict[str, str] | None = None) -> dict[str, list[str]]:
     """{discord_id: [เว็บงานหลัก, (เว็บงานรอง — เฉพาะ OD)] หรือ [] (มีตารางแล้วแต่ไม่มีชื่อ = หยุด/ลา)}
 
     คนที่ "ยังไม่มีตารางของวันนี้" จะไม่อยู่ในผลลัพธ์ → บอทไม่แตะสีเดิม (กันสีหายตอนแอดมินยังไม่จัดหน้าที่)
-    employees = EMPLOYEES จาก main.py / rows = {key: value(JSON)} จากตาราง settings"""
+    employees = EMPLOYEES จาก main.py / rows = {key: value(JSON)} จากตาราง settings
+    sources = (ถ้าส่ง dict มา) จะใส่ {discord_id: key ของตารางที่เจอชื่อ} ไว้ดูใน log ว่าเอาสีมาจากตารางไหน"""
     parsed: dict[str, dict | None] = {}
     for k, v in (rows or {}).items():
         try:
@@ -175,10 +193,18 @@ def resolve_today_webs(employees: dict, rows: dict[str, str], now: datetime) -> 
             continue
         keys = roster_keys(emp, now)
         with_sec = duty_dept(emp.get("department", "")) in MULTI_WEB_DEPTS
-        rosters = [parsed[k] for k in keys if isinstance(parsed.get(k), dict)]
-        teams = next((t for r in rosters if (t := find_teams(r, emp.get("name", ""), with_sec))), [])
+        teams, src = [], ""
+        for k in keys:
+            r = parsed.get(k)
+            if isinstance(r, dict) and (t := find_teams(r, emp.get("name", ""), with_sec)):
+                teams, src = t, k
+                break
+        if out.get(did):
+            continue                            # Discord ID ซ้ำกับคนก่อนหน้าที่เจอเว็บแล้ว → ไม่ทับ (main.py เตือนใน log)
         if teams:
             out[did] = teams
+            if sources is not None:
+                sources[did] = src
         elif all(isinstance(parsed.get(k), dict) for k in own_roster_keys(emp, now)):
             out[did] = []                       # ตารางกะตัวเองมีแล้ว แต่ไม่มีชื่อ (และไม่อยู่กะอื่น) → วันนี้ไม่ได้ทำเว็บไหน
     return out

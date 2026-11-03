@@ -104,6 +104,14 @@ async def load_employees_from_supabase() -> None:
         NAME_BY_DISCORD = {v["discord_id"]: v["name"] for v in new_map.values()}
         TID_BY_NAME = {v["name"]: k for k, v in new_map.items()}
         logger.info(f"[EMPLOYEES] โหลดสำเร็จ {len(EMPLOYEES)} คน จาก Supabase K36")
+        # Discord ID ซ้ำกันหลายคน → บอทแยกไม่ออกว่าใครเป็นใคร (สี/การแจ้งพักจะไปผิดคน)
+        by_did: dict[str, list[str]] = {}
+        for v in new_map.values():
+            by_did.setdefault(v["discord_id"], []).append(v["name"])
+        dups = {d: n for d, n in by_did.items() if len(n) > 1}
+        for d, names in dups.items():
+            logger.warning(f"[EMPLOYEES] ⚠️ Discord ID {d} ซ้ำกัน {len(names)} คน: {', '.join(names)} "
+                           f"— แก้ใน K36 ให้แต่ละคนเป็น ID ของตัวเอง")
     except Exception as e:
         logger.error(f"[EMPLOYEES] load error: {e}")
 
@@ -247,7 +255,7 @@ def is_destination(channel_id) -> bool:
     return str(channel_id) in DESTINATION_CHANNEL_IDS
 
 
-# ── 🏷️ ชื่อเล่นพนักงาน = [สีเว็บวันนี้][ชื่อเดิม] [อีโมจิพัก] ── เช่น "🟣👑 LAYLA 🚽" (รายละเอียดใน nick.py)
+# ── 🏷️ ชื่อเล่นพนักงาน = [อีโมจิพัก][สีเว็บวันนี้][ชื่อเดิม] ── เช่น "🚽🟣👑 LAYLA" (รายละเอียดใน nick.py)
 # บอทต้องมีสิทธิ์ Manage Nicknames และ role สูงกว่าพนักงาน
 # NICK_STATUS=0 → ปิดอีโมจิพัก / WEB_NICK=0 → ปิดสีเว็บ
 NICK_STATUS_ENABLED = os.environ.get("NICK_STATUS", "1").strip() != "0"
@@ -288,7 +296,18 @@ async def load_today_webs() -> None:
         logger.warning(f"[WEB_NICK] โหลดตารางหน้าที่ไม่ได้: {e}")
         return
     rows = {r["key"]: r.get("value") for r in (res.data or [])}
-    TODAY_WEB = nickname.resolve_today_webs(EMPLOYEES, rows, now)
+    sources: dict[str, str] = {}
+    new = nickname.resolve_today_webs(EMPLOYEES, rows, now, sources)
+    # log เฉพาะคนที่เว็บเปลี่ยน (บอกด้วยว่าเอามาจากตารางไหน — ไว้ตรวจเวลาสีไม่ตรง)
+    if TODAY_WEB:
+        for did in sorted(set(new) | set(TODAY_WEB), key=lambda d: NAME_BY_DISCORD.get(d, d)):
+            if new.get(did) != TODAY_WEB.get(did) and did in new:
+                webs = "+".join(new[did]) or "ไม่มีเว็บ"
+                logger.info(f"[WEB_NICK] {NAME_BY_DISCORD.get(did, did)}: {webs}"
+                            + (f" (จาก {sources[did]})" if did in sources else ""))
+    elif new:
+        logger.info(f"[WEB_NICK] โหลดหน้าที่วันนี้แล้ว: มีเว็บ {sum(1 for v in new.values() if v)} คน")
+    TODAY_WEB = new
 
 
 def web_emoji_for(team: str) -> str:
@@ -726,7 +745,7 @@ class ActivityBot(discord.Client):
         return True
 
     async def set_break_nick(self, member: discord.Member, emoji: str | None) -> None:
-        """ไปพัก → ใส่อีโมจิท้ายชื่อ / กลับ (emoji=None) → เอาออก"""
+        """ไปพัก → ใส่อีโมจิหน้าชื่อ / กลับ (emoji=None) → เอาออก"""
         self._break_emoji[member.id] = emoji
         try:
             await self.apply_nick(member)
