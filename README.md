@@ -11,7 +11,7 @@
 |---|---|
 | `bot/main.py` | ตัวหลัก: Telegram + Discord + บันทึกพัก + คำสั่ง `/status`, `/clear_break_messages` |
 | `bot/chat_count.py` | ระบบนับแชท |
-| `bot/nick.py` | ชื่อเล่นพนักงาน: สีเว็บวันนี้ (จากตารางหน้าที่ K36 — OD แสดงงานหลัก+งานรอง) + อีโมจิพัก |
+| `bot/nick.py` | ชื่อเล่นพนักงาน: สีเว็บวันนี้ (จากตารางหน้าที่ K36 — OD แสดงงานหลัก+งานรอง, ผู้สอนไม่มีสี) + อีโมจิพัก |
 | `bot/auth.py` | รันครั้งเดียวเพื่อสร้าง `TELEGRAM_SESSION` (`python bot/auth.py`) |
 | `Dockerfile` + `railway.json` | deploy บน Railway |
 

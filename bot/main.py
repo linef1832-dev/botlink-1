@@ -272,11 +272,12 @@ BREAK_NICK_EMOJIS = set(ACTIVITY_EMOJI.values()) | set(BREAK_REASON_EMOJI.values
 WEB_EMOJI: dict[str, str] = nickname.web_emoji_map([])   # ชื่อเว็บ(ตัวเล็ก) → สี
 # discord_id → [เว็บงานหลัก, (เว็บงานรอง — OD)] ([] = วันนี้ไม่ได้ทำเว็บไหน / ไม่มี key = ยังไม่รู้ ไม่แตะ)
 TODAY_WEB: dict[str, list[str]] = {}
+TODAY_WEB_SRC: dict[str, str] = {}   # discord_id → key ของตารางที่ให้สี (ไว้รู้ว่าตารางนั้นถูกลบ/ล้างหรือยัง)
 
 
 async def load_today_webs() -> None:
     """อ่านสีเว็บ + ตารางหน้าที่ของวันนี้จาก K36 แล้วคำนวณว่าใครทำเว็บไหน"""
-    global WEB_EMOJI, TODAY_WEB
+    global WEB_EMOJI, TODAY_WEB, TODAY_WEB_SRC
     if not supabase or not EMPLOYEES:
         return
     try:
@@ -297,7 +298,7 @@ async def load_today_webs() -> None:
         return
     rows = {r["key"]: r.get("value") for r in (res.data or [])}
     sources: dict[str, str] = {}
-    new = nickname.resolve_today_webs(EMPLOYEES, rows, now, sources)
+    new = nickname.resolve_today_webs(EMPLOYEES, rows, now, sources, TODAY_WEB_SRC)
     # log เฉพาะคนที่เว็บเปลี่ยน (บอกด้วยว่าเอามาจากตารางไหน — ไว้ตรวจเวลาสีไม่ตรง)
     if TODAY_WEB:
         for did in sorted(set(new) | set(TODAY_WEB), key=lambda d: NAME_BY_DISCORD.get(d, d)):
@@ -308,6 +309,7 @@ async def load_today_webs() -> None:
     elif new:
         logger.info(f"[WEB_NICK] โหลดหน้าที่วันนี้แล้ว: มีเว็บ {sum(1 for v in new.values() if v)} คน")
     TODAY_WEB = new
+    TODAY_WEB_SRC = sources
 
 
 def web_emoji_for(team: str) -> str:
@@ -768,6 +770,8 @@ class ActivityBot(discord.Client):
                     await asyncio.sleep(0.3)            # เว้นจังหวะ ไม่ยิง Discord รัวเกิน
                 if WEB_NICK_ENABLED and m.voice and m.voice.channel and not is_destination(m.voice.channel.id):
                     e = info_by_did.get(did, {})
+                    if nickname.is_trainer_dept(e.get("department", "")):
+                        continue                        # ผู้สอนไม่มีสีอยู่แล้ว (ปกติ) → ไม่ต้องรายงาน
                     who = f"{NAME_BY_DISCORD[did]}({e.get('department') or '-'}/{e.get('allowed_shift') or '-'})"
                     if m.id == getattr(g, "owner_id", None):
                         no_color.append(f"{who}=เจ้าของเซิร์ฟ")

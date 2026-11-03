@@ -128,6 +128,12 @@ def duty_dept(dept: str) -> str:
     return "AMQL" if d == "TRAINER" else d
 
 
+def is_trainer_dept(dept: str) -> bool:
+    """ผู้สอน (AMQL / ODQL / TRAINER...) — ไม่ได้ทำเว็บ จึงไม่ใส่สีเว็บ (กฎเดียวกับเว็บ K36)"""
+    d = duty_dept(dept)
+    return d in ("AMQL", "ODQL") or d.startswith("TRAINER")
+
+
 def shift_active(shift: str, now: datetime) -> bool:
     """ตอนนี้อยู่ในเวลาทำงานของกะนี้ไหม"""
     start, end = SHIFT_HOURS.get(shift, (0, 24))
@@ -141,16 +147,19 @@ def _roster_key(emp: dict, shift: str, now: datetime) -> str:
 
 def roster_keys(emp: dict, now: datetime) -> list[str]:
     """key ในตาราง settings ของตารางหน้าที่ที่คนนี้อาจอยู่ เรียงตามลำดับที่ควรเชื่อ:
-        1) กะที่ "กำลังทำงานอยู่ตอนนี้" ก่อน (กะที่เลิกไปแล้ว/ยังไม่เริ่ม ไว้ทีหลัง)
-        2) ในกลุ่มเดียวกัน กะประจำของตัวเองก่อน
-    (ค้นทุกกะ เพราะมีสลับกะ/ดึงคนข้ามกะ — คนที่กะประจำเป็นกะกลางแต่วันนี้ไปอยู่กะดึกก็ต้องเจอ)"""
+        1) กะที่ "กำลังทำงานอยู่ตอนนี้" (คนสลับกะ/ถูกดึงข้ามกะก็เจอ)
+        2) กะประจำของตัวเอง (เผื่อเข้าห้องก่อนเวลากะเริ่ม)
+    [FIX] ไม่ดูกะที่เลิกไปแล้ว/ยังไม่เริ่มของคนอื่น — เดิมไปเจอตารางของกะ/วันอื่นแล้วใส่สีผิด"""
     own = (emp.get("allowed_shift") or "").strip()
-    shifts = sorted(DUTY_SHIFTS, key=lambda s: (not shift_active(s, now), s != own))
+    shifts = [s for s in DUTY_SHIFTS if shift_active(s, now) or s == own]
+    if not shifts:
+        shifts = list(DUTY_SHIFTS)
+    shifts.sort(key=lambda s: (not shift_active(s, now), s != own))
     return [_roster_key(emp, s, now) for s in shifts]
 
 
 def own_roster_keys(emp: dict, now: datetime) -> list[str]:
-    """key ที่ "ต้องมี" ก่อนจะสรุปได้ว่าวันนี้คนนี้ไม่ได้ทำเว็บไหน (กะตัวเอง / ไม่รู้กะ = ทุกกะ)"""
+    """key ที่ "ต้องมี" ก่อนจะสรุปได้ว่าวันนี้คนนี้ไม่ได้ทำเว็บไหน (กะตัวเอง / ไม่รู้กะ = กะที่กำลังทำงาน)"""
     own = (emp.get("allowed_shift") or "").strip()
     if own in DUTY_SHIFTS:
         return [_roster_key(emp, own, now)]
@@ -174,12 +183,15 @@ def find_teams(roster: dict, username: str, with_secondary: bool = False) -> lis
 
 
 def resolve_today_webs(employees: dict, rows: dict[str, str], now: datetime,
-                       sources: dict[str, str] | None = None) -> dict[str, list[str]]:
+                       sources: dict[str, str] | None = None,
+                       prev_sources: dict[str, str] | None = None) -> dict[str, list[str]]:
     """{discord_id: [เว็บงานหลัก, (เว็บงานรอง — เฉพาะ OD)] หรือ [] (มีตารางแล้วแต่ไม่มีชื่อ = หยุด/ลา)}
 
     คนที่ "ยังไม่มีตารางของวันนี้" จะไม่อยู่ในผลลัพธ์ → บอทไม่แตะสีเดิม (กันสีหายตอนแอดมินยังไม่จัดหน้าที่)
     employees = EMPLOYEES จาก main.py / rows = {key: value(JSON)} จากตาราง settings
-    sources = (ถ้าส่ง dict มา) จะใส่ {discord_id: key ของตารางที่เจอชื่อ} ไว้ดูใน log ว่าเอาสีมาจากตารางไหน"""
+    sources = (ถ้าส่ง dict มา) จะใส่ {discord_id: key ของตารางที่เจอชื่อ} ไว้ดูใน log ว่าเอาสีมาจากตารางไหน
+    prev_sources = sources ของรอบก่อน — ถ้าตารางที่เคยให้สีคนนี้ถูกลบ/ล้าง หรือเอาชื่อออก → เอาสีออก
+                   (ต่างจากกรณี "ยังไม่มีตาราง" ตอนข้ามวัน/เปลี่ยนกะ ที่ key เปลี่ยนไปแล้ว → ไม่แตะ)"""
     parsed: dict[str, dict | None] = {}
     for k, v in (rows or {}).items():
         try:
@@ -190,6 +202,9 @@ def resolve_today_webs(employees: dict, rows: dict[str, str], now: datetime,
     for emp in (employees or {}).values():
         did = str(emp.get("discord_id") or "")
         if not did:
+            continue
+        if is_trainer_dept(emp.get("department", "")):
+            out.setdefault(did, [])             # ผู้สอนไม่ทำเว็บ → ไม่มีสีเว็บ (เอาสีที่ค้างอยู่ออกด้วย)
             continue
         keys = roster_keys(emp, now)
         with_sec = duty_dept(emp.get("department", "")) in MULTI_WEB_DEPTS
@@ -207,4 +222,6 @@ def resolve_today_webs(employees: dict, rows: dict[str, str], now: datetime,
                 sources[did] = src
         elif all(isinstance(parsed.get(k), dict) for k in own_roster_keys(emp, now)):
             out[did] = []                       # ตารางกะตัวเองมีแล้ว แต่ไม่มีชื่อ (และไม่อยู่กะอื่น) → วันนี้ไม่ได้ทำเว็บไหน
+        elif prev_sources and prev_sources.get(did) in keys:
+            out[did] = []                       # [FIX] ตารางที่เคยให้สีถูกลบ/ล้าง หรือเอาชื่อออกแล้ว → เอาสีออก
     return out
