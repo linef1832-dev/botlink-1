@@ -97,8 +97,9 @@ async def load_employees_from_supabase() -> None:
                     "allowed_shift": shift,
                     "department": dept,
                 }
-        if new_map != EMPLOYEES:
-            NICK_SYNC_NOW.set()                 # ข้อมูลพนักงานเปลี่ยน (เช่น แก้ Discord ID) → ปรับชื่อทันที ไม่ต้องรอรอบ
+        if new_map == EMPLOYEES:
+            return                              # เหมือนเดิม → ไม่ต้องทำอะไร (ไม่เขียน log ซ้ำทุกนาที)
+        NICK_SYNC_NOW.set()                     # ข้อมูลพนักงานเปลี่ยน (เช่น แก้ Discord ID) → ปรับชื่อทันที ไม่ต้องรอรอบ
         EMPLOYEES = new_map
         NAME_BY_DISCORD = {v["discord_id"]: v["name"] for v in new_map.values()}
         TID_BY_NAME = {v["name"]: k for k, v in new_map.items()}
@@ -166,8 +167,11 @@ async def load_target_groups() -> None:
             if groups[cid]["type"] == "shift":
                 shifts.add(cid)
 
+        changed = groups != GROUPS_BY_CHAT or shifts != SHIFT_CHAT_IDS
         GROUPS_BY_CHAT = groups
         SHIFT_CHAT_IDS = shifts
+        if not changed:
+            return                              # เหมือนเดิม → ไม่ต้องเขียน log ซ้ำทุกนาที
         _seen_unknown_chats.clear()
 
         logger.info(f"[GROUPS] โหลดแล้ว {len(groups)} กลุ่ม (กะ {len(shifts)} กลุ่ม)")
@@ -268,8 +272,12 @@ async def load_today_webs() -> None:
     if not supabase or not EMPLOYEES:
         return
     try:
-        res = await sb(lambda: supabase.from_("chatcount_settings").select("webs").eq("id", 1).execute())
-        WEB_EMOJI = nickname.web_emoji_map(((res.data or [{}])[0] or {}).get("webs"))
+        if chat_count is not None and chat_count.webs:
+            webs = chat_count.webs              # ระบบนับแชทโหลดไว้แล้ว (ทุก 15 วิ) → ใช้ร่วมกัน ไม่ต้อง query ซ้ำ
+        else:
+            res = await sb(lambda: supabase.from_("chatcount_settings").select("webs").eq("id", 1).execute())
+            webs = ((res.data or [{}])[0] or {}).get("webs")
+        WEB_EMOJI = nickname.web_emoji_map(webs)
     except Exception as e:
         logger.warning(f"[WEB_NICK] โหลดสีเว็บไม่ได้ ใช้ค่าเดิม: {e}")
     now = get_thai_time()
