@@ -226,7 +226,7 @@ OUT_INFO: dict[str, dict] = {}
 # ── ⏰ แจ้งเตือนพักเกินเวลา ── (เวลากำหนดเดียวกับหน้า "ติดตามการพัก" ในเว็บ K36)
 # ตั้งใหม่ได้ด้วย env BREAK_LIMITS เช่น "กินข้าว=30,ปวดหนัก=20,ปวดน้อย=6" / ปิดด้วย OVERDUE_ALERT=0
 OVERDUE_ALERT_ENABLED = os.environ.get("OVERDUE_ALERT", "1").strip() != "0"
-OVERDUE_CHECK_EVERY = 30          # เช็คทุกกี่วินาที
+OVERDUE_CHECK_EVERY = 5           # เช็คทุกกี่วินาที (ดูแค่รายชื่อคนที่พักอยู่ในหน่วยความจำ ไม่หนัก)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -275,7 +275,7 @@ def activity_label(activity: str) -> str:
 def overdue_minutes(info: dict, end: datetime) -> tuple[int, int, int] | None:
     """(ใช้ไปกี่นาที, กำหนดกี่นาที, เกินกี่นาที) — ยังไม่เกิน/ไม่มีกำหนด คืน None
     นับเป็นวินาที: เกินไม่ถึงนาทีก็นับเป็น "เกิน 1 นาที" (นอกนั้นนับเต็มนาที)"""
-    limit = break_limit_minutes(info.get("activity", ""))
+    limit = info.get("limit") or break_limit_minutes(info.get("activity", ""))
     if limit is None or not info.get("start"):
         return None
     over_sec = (end - info["start"]).total_seconds() - limit * 60
@@ -616,12 +616,17 @@ def parse_message(text: str, group_name: str, chat_id: str = "") -> dict | None:
     dur_match = re.search(r"เวลากิจกรรมนี้[：:][^`]*`([^`]+)`", text)
     duration = dur_match.group(1) if dur_match else None
 
+    # เวลาจำกัดที่บอทเช็คอินบอกมาในข้อความ เช่น "เวลาจำกัดสำหรับกิจกรรมครั้งนี้：6 นาที" (ใช้แทนค่าในโค้ดถ้ามี)
+    lim_match = re.search(r"เวลาจำกัด[^：:\n]*[：:]\s*(\d+)\s*นาที", text)
+    limit = int(lim_match.group(1)) if lim_match else None
+
     return {
         "telegram_id": tid_match.group(1),
         "activity": "กลับที่นั่ง" if is_return else activity,
         "is_return": is_return,
         "timestamp": timestamp,
         "duration": duration,
+        "limit": limit,
         "group_name": group_name,
         "chat_id": chat_id,
     }
@@ -904,7 +909,7 @@ class ActivityBot(discord.Client):
             if OVERDUE_MAX_ALERTS > 0 and n >= OVERDUE_MAX_ALERTS:
                 continue                                # เตือนครบตามที่กำหนดแล้ว
             if n == 0 and not info.get("prewarned") and OVERDUE_PREWARN_MINUTES > 0:
-                limit = break_limit_minutes(info.get("activity", ""))
+                limit = info.get("limit") or break_limit_minutes(info.get("activity", ""))
                 if limit is not None and limit > OVERDUE_PREWARN_MINUTES and info.get("start"):
                     used_sec = (now - info["start"]).total_seconds()
                     if (limit - OVERDUE_PREWARN_MINUTES) * 60 <= used_sec < limit * 60:
@@ -1812,6 +1817,12 @@ async def start_telegram(on_activity):
                 return
             # กลุ่มเช็คอินปกติ → parse และแจ้ง Discord
             parsed = parse_message(text, group_name, chat_id)
+            if parsed is None and is_telegram_prewarn(text):
+                # บอทเช็คอินเตือน "เหลือเวลาไม่ถึง 1 นาที" → เตือนใน Discord พร้อมกันทันที
+                tid_match = TID_RE.search(text)
+                if tid_match:
+                    await telegram_prewarn(tid_match.group(1))
+                return
             if parsed:
                 logger.info(f"[PARSE OK] id={parsed['telegram_id']} activity={parsed['activity']}")
                 await on_activity(parsed)
@@ -1876,6 +1887,7 @@ async def _handle_activity(emp: dict, parsed: dict) -> None:
             "name": emp["name"], "discord_id": emp["discord_id"], "activity": parsed["activity"],
             "start": parse_telegram_timestamp(parsed.get("timestamp")) or get_thai_time(),
             "alerts": 0, "last_alert": None, "prewarned": False,
+            "limit": parsed.get("limit"),           # เวลาจำกัดจากข้อความ Telegram (ไม่มี → ใช้ค่าในโค้ด)
         }
         # เปิด break session ใน Supabase ด้วยเวลาจาก Telegram
         await supabase_open_break(emp["name"], parsed["activity"], parsed.get("timestamp"))
@@ -1892,6 +1904,25 @@ async def _handle_activity(emp: dict, parsed: dict) -> None:
     )
     status = f"sent to #{channel}" if sent else "not sent (not in voice channel)"
     logger.info(f"{emp['name']} [{parsed['activity']}] → Discord {status}")
+
+
+def is_telegram_prewarn(text: str) -> bool:
+    """ข้อความเตือนจากบอทเช็คอิน: "⚠️ คำเตือน：คุณเหลือเวลาไม่ถึง 1 นาที..." / "还有不到 1 分钟超时" """
+    return ("คำเตือน" in text and "เหลือเวลาไม่ถึง" in text) or "还有不到" in text
+
+
+async def telegram_prewarn(tid: str) -> None:
+    """เตือนล่วงหน้าใน Discord ตามจังหวะเดียวกับ Telegram (ถ้ายังไม่ได้เตือน)"""
+    info = OUT_INFO.get(tid)
+    if not info or info.get("prewarned") or info.get("alerts", 0) or not OVERDUE_ALERT_ENABLED:
+        return
+    limit = info.get("limit") or break_limit_minutes(info.get("activity", ""))
+    if limit is None:
+        return
+    info["prewarned"] = True
+    used = int((get_thai_time() - info["start"]).total_seconds() // 60) if info.get("start") else limit - 1
+    await discord_bot.wait_until_ready_event()
+    await discord_bot.send_prewarn(info, used, limit)
 
 
 async def _handle_failed_return(tid: str, emp: dict, group_name: str) -> None:
