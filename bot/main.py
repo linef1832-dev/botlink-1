@@ -341,14 +341,14 @@ NICK_SKIP_EMOJIS = {"🍚"}
 BREAK_NICK_EMOJIS = set(ACTIVITY_EMOJI.values()) | set(BREAK_REASON_EMOJI.values()) | {"🚶"}
 
 WEB_EMOJI: dict[str, str] = nickname.web_emoji_map([])   # ชื่อเว็บ(ตัวเล็ก) → สี
-# discord_id → [เว็บงานหลัก, (เว็บงานรอง — OD)] ([] = วันนี้ไม่ได้ทำเว็บไหน / ไม่มี key = ยังไม่รู้ ไม่แตะ)
+# discord_id → [เว็บงานหลัก, (เว็บงานรอง — OD)] ([] = ไม่มีสี: ไม่ได้จัดหน้าที่ / ไม่มีชื่อ / ผู้สอน)
+# ไม่มี key = ยังโหลดตารางไม่ได้ (เช่น เพิ่งเปิดบอท / ฐานข้อมูลล่ม) → ไม่แตะสีเดิม
 TODAY_WEB: dict[str, list[str]] = {}
-TODAY_WEB_SRC: dict[str, str] = {}   # discord_id → key ของตารางที่ให้สี (ไว้รู้ว่าตารางนั้นถูกลบ/ล้างหรือยัง)
 
 
 async def load_today_webs() -> None:
     """อ่านสีเว็บ + ตารางหน้าที่ของวันนี้จาก K36 แล้วคำนวณว่าใครทำเว็บไหน"""
-    global WEB_EMOJI, TODAY_WEB, TODAY_WEB_SRC
+    global WEB_EMOJI, TODAY_WEB
     if not supabase or not EMPLOYEES:
         return
     try:
@@ -369,7 +369,7 @@ async def load_today_webs() -> None:
         return
     rows = {r["key"]: r.get("value") for r in (res.data or [])}
     sources: dict[str, str] = {}
-    new = nickname.resolve_today_webs(EMPLOYEES, rows, now, sources, TODAY_WEB_SRC)
+    new = nickname.resolve_today_webs(EMPLOYEES, rows, now, sources)
     # log เฉพาะคนที่เว็บเปลี่ยน (บอกด้วยว่าเอามาจากตารางไหน — ไว้ตรวจเวลาสีไม่ตรง)
     if TODAY_WEB:
         for did in sorted(set(new) | set(TODAY_WEB), key=lambda d: NAME_BY_DISCORD.get(d, d)):
@@ -380,7 +380,6 @@ async def load_today_webs() -> None:
     elif new:
         logger.info(f"[WEB_NICK] โหลดหน้าที่วันนี้แล้ว: มีเว็บ {sum(1 for v in new.values() if v)} คน")
     TODAY_WEB = new
-    TODAY_WEB_SRC = sources
 
 
 def web_emoji_for(team: str) -> str:

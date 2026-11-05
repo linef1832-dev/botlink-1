@@ -158,13 +158,6 @@ def roster_keys(emp: dict, now: datetime) -> list[str]:
     return [_roster_key(emp, s, now) for s in shifts]
 
 
-def own_roster_keys(emp: dict, now: datetime) -> list[str]:
-    """key ที่ "ต้องมี" ก่อนจะสรุปได้ว่าวันนี้คนนี้ไม่ได้ทำเว็บไหน (กะตัวเอง / ไม่รู้กะ = กะที่กำลังทำงาน)"""
-    own = (emp.get("allowed_shift") or "").strip()
-    if own in DUTY_SHIFTS:
-        return [_roster_key(emp, own, now)]
-    return roster_keys(emp, now)
-
 
 def find_teams(roster: dict, username: str, with_secondary: bool = False) -> list[str]:
     """หาว่าคนนี้อยู่เว็บไหน → [งานหลัก] หรือ [งานหลัก, งานรอง] (ถ้า with_secondary และงานรองเป็นคนละเว็บ)
@@ -183,15 +176,13 @@ def find_teams(roster: dict, username: str, with_secondary: bool = False) -> lis
 
 
 def resolve_today_webs(employees: dict, rows: dict[str, str], now: datetime,
-                       sources: dict[str, str] | None = None,
-                       prev_sources: dict[str, str] | None = None) -> dict[str, list[str]]:
-    """{discord_id: [เว็บงานหลัก, (เว็บงานรอง — เฉพาะ OD)] หรือ [] (มีตารางแล้วแต่ไม่มีชื่อ = หยุด/ลา)}
+                       sources: dict[str, str] | None = None) -> dict[str, list[str]]:
+    """{discord_id: [เว็บงานหลัก, (เว็บงานรอง — เฉพาะ OD)] หรือ [] = ไม่มีสี}
 
-    คนที่ "ยังไม่มีตารางของวันนี้" จะไม่อยู่ในผลลัพธ์ → บอทไม่แตะสีเดิม (กันสีหายตอนแอดมินยังไม่จัดหน้าที่)
+    กฎ: มีชื่อในตารางหน้าที่ของกะที่กำลังทำงาน (หรือกะประจำ) → ใส่สีเว็บนั้น
+        ไม่มีชื่อ / ยังไม่ได้จัดหน้าที่ / ตารางถูกลบ / เป็นผู้สอน → ไม่มีสี
     employees = EMPLOYEES จาก main.py / rows = {key: value(JSON)} จากตาราง settings
-    sources = (ถ้าส่ง dict มา) จะใส่ {discord_id: key ของตารางที่เจอชื่อ} ไว้ดูใน log ว่าเอาสีมาจากตารางไหน
-    prev_sources = sources ของรอบก่อน — ถ้าตารางที่เคยให้สีคนนี้ถูกลบ/ล้าง หรือเอาชื่อออก → เอาสีออก
-                   (ต่างจากกรณี "ยังไม่มีตาราง" ตอนข้ามวัน/เปลี่ยนกะ ที่ key เปลี่ยนไปแล้ว → ไม่แตะ)"""
+    sources = (ถ้าส่ง dict มา) จะใส่ {discord_id: key ของตารางที่เจอชื่อ} ไว้ดูใน log ว่าเอาสีมาจากตารางไหน"""
     parsed: dict[str, dict | None] = {}
     for k, v in (rows or {}).items():
         try:
@@ -201,27 +192,19 @@ def resolve_today_webs(employees: dict, rows: dict[str, str], now: datetime,
     out: dict[str, list[str]] = {}
     for emp in (employees or {}).values():
         did = str(emp.get("discord_id") or "")
-        if not did:
-            continue
+        if not did or out.get(did):
+            continue                            # Discord ID ซ้ำกับคนก่อนหน้าที่เจอเว็บแล้ว → ไม่ทับ (main.py เตือนใน log)
         if is_trainer_dept(emp.get("department", "")):
-            out.setdefault(did, [])             # ผู้สอนไม่ทำเว็บ → ไม่มีสีเว็บ (เอาสีที่ค้างอยู่ออกด้วย)
+            out[did] = []                       # ผู้สอนไม่ทำเว็บ → ไม่มีสีเว็บ
             continue
-        keys = roster_keys(emp, now)
         with_sec = duty_dept(emp.get("department", "")) in MULTI_WEB_DEPTS
         teams, src = [], ""
-        for k in keys:
+        for k in roster_keys(emp, now):
             r = parsed.get(k)
             if isinstance(r, dict) and (t := find_teams(r, emp.get("name", ""), with_sec)):
                 teams, src = t, k
                 break
-        if out.get(did):
-            continue                            # Discord ID ซ้ำกับคนก่อนหน้าที่เจอเว็บแล้ว → ไม่ทับ (main.py เตือนใน log)
-        if teams:
-            out[did] = teams
-            if sources is not None:
-                sources[did] = src
-        elif all(isinstance(parsed.get(k), dict) for k in own_roster_keys(emp, now)):
-            out[did] = []                       # ตารางกะตัวเองมีแล้ว แต่ไม่มีชื่อ (และไม่อยู่กะอื่น) → วันนี้ไม่ได้ทำเว็บไหน
-        elif prev_sources and prev_sources.get(did) in keys:
-            out[did] = []                       # [FIX] ตารางที่เคยให้สีถูกลบ/ล้าง หรือเอาชื่อออกแล้ว → เอาสีออก
+        out[did] = teams                        # ไม่เจอ (ยังไม่จัด/ไม่มีชื่อ/ถูกลบ) → [] = ไม่มีสี
+        if teams and sources is not None:
+            sources[did] = src
     return out
