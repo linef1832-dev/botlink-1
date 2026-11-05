@@ -261,6 +261,11 @@ def break_limit_minutes(activity: str) -> int | None:
     return None
 
 
+def info_limit(info: dict) -> int | None:
+    """เวลาจำกัด (นาที) ของการพักครั้งนี้: ใช้ตัวเลขจากข้อความ Telegram ก่อน ไม่มีค่อยใช้ค่าในโค้ด"""
+    return info.get("limit") or break_limit_minutes(info.get("activity", ""))
+
+
 def _overdue_names() -> set[str]:
     return {i["name"] for i in OUT_INFO.values()}
 
@@ -275,7 +280,7 @@ def activity_label(activity: str) -> str:
 def overdue_minutes(info: dict, end: datetime) -> tuple[int, int, int] | None:
     """(ใช้ไปกี่นาที, กำหนดกี่นาที, เกินกี่นาที) — ยังไม่เกิน/ไม่มีกำหนด คืน None
     นับเป็นวินาที: เกินไม่ถึงนาทีก็นับเป็น "เกิน 1 นาที" (นอกนั้นนับเต็มนาที)"""
-    limit = info.get("limit") or break_limit_minutes(info.get("activity", ""))
+    limit = info_limit(info)
     if limit is None or not info.get("start"):
         return None
     over_sec = (end - info["start"]).total_seconds() - limit * 60
@@ -909,7 +914,7 @@ class ActivityBot(discord.Client):
             if OVERDUE_MAX_ALERTS > 0 and n >= OVERDUE_MAX_ALERTS:
                 continue                                # เตือนครบตามที่กำหนดแล้ว
             if n == 0 and not info.get("prewarned") and OVERDUE_PREWARN_MINUTES > 0:
-                limit = info.get("limit") or break_limit_minutes(info.get("activity", ""))
+                limit = info_limit(info)
                 if limit is not None and limit > OVERDUE_PREWARN_MINUTES and info.get("start"):
                     used_sec = (now - info["start"]).total_seconds()
                     if (limit - OVERDUE_PREWARN_MINUTES) * 60 <= used_sec < limit * 60:
@@ -1392,6 +1397,12 @@ class ActivityBot(discord.Client):
                                 except Exception as e:
                                     logger.warning(f"ลบข้อความแจ้งพักไม่สำเร็จ: {e}")
                 else:
+                    stale = self._overdue_msg.pop(member.id, None)     # กดไปรอบใหม่โดยไม่กดกลับ → เตือนของรอบก่อนไม่เกี่ยวแล้ว
+                    if stale is not None:
+                        try:
+                            await stale.delete()
+                        except Exception:
+                            pass
                     sent_msg = await notify_vc.send(message)
                     self._last_notified_channel[member.id] = notify_vc.id
                     self._last_activity_message[member.id] = sent_msg
@@ -1821,7 +1832,7 @@ async def start_telegram(on_activity):
                 # บอทเช็คอินเตือน "เหลือเวลาไม่ถึง 1 นาที" → เตือนใน Discord พร้อมกันทันที
                 tid_match = TID_RE.search(text)
                 if tid_match:
-                    await telegram_prewarn(tid_match.group(1))
+                    await telegram_prewarn(tid_match.group(1), text)
                 return
             if parsed:
                 logger.info(f"[PARSE OK] id={parsed['telegram_id']} activity={parsed['activity']}")
@@ -1911,18 +1922,30 @@ def is_telegram_prewarn(text: str) -> bool:
     return ("คำเตือน" in text and "เหลือเวลาไม่ถึง" in text) or "还有不到" in text
 
 
-async def telegram_prewarn(tid: str) -> None:
-    """เตือนล่วงหน้าใน Discord ตามจังหวะเดียวกับ Telegram (ถ้ายังไม่ได้เตือน)"""
+async def telegram_prewarn(tid: str, text: str = "") -> None:
+    """เตือนล่วงหน้าใน Discord ตามจังหวะเดียวกับ Telegram (ถ้ายังไม่ได้เตือน)
+    Telegram คือตัวจริง → ถึงบอทจะไม่มีข้อมูลการพักของคนนี้ (เช่น รีสตาร์ทแล้วโหลดไม่ทัน) ก็ยังเตือนให้"""
+    if not OVERDUE_ALERT_ENABLED:
+        return
+    emp = EMPLOYEES.get(tid)
     info = OUT_INFO.get(tid)
-    if not info or info.get("prewarned") or info.get("alerts", 0) or not OVERDUE_ALERT_ENABLED:
-        return
-    limit = info.get("limit") or break_limit_minutes(info.get("activity", ""))
-    if limit is None:
-        return
+    if info is None:
+        if not emp:
+            logger.warning(f"[OVERDUE] Telegram เตือนรหัส {tid} แต่ไม่รู้จักพนักงานคนนี้ใน K36")
+            return
+        m = re.search(r"เวลาจำกัดสำหรับ\s*([^\s.]+)", text)
+        info = OUT_INFO[tid] = {
+            "name": emp["name"], "discord_id": emp["discord_id"], "activity": m.group(1) if m else "พัก",
+            "start": None, "alerts": 0, "last_alert": None, "prewarned": False, "limit": None,
+        }
+    if info.get("prewarned") or info.get("alerts", 0):
+        return                                          # ตัวนับเวลาของบอทเตือนไปก่อนแล้ว
     info["prewarned"] = True
-    used = int((get_thai_time() - info["start"]).total_seconds() // 60) if info.get("start") else limit - 1
+    limit = info_limit(info)
+    used = int((get_thai_time() - info["start"]).total_seconds() // 60) if info.get("start") else None
+    logger.info(f"[OVERDUE] Telegram เตือน {info['name']} ใกล้ครบเวลา → เตือนใน Discord")
     await discord_bot.wait_until_ready_event()
-    await discord_bot.send_prewarn(info, used, limit)
+    await discord_bot.send_prewarn(info, used if used is not None else (limit or 1) - 1, limit or 1)
 
 
 async def _handle_failed_return(tid: str, emp: dict, group_name: str) -> None:
