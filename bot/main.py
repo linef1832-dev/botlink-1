@@ -218,7 +218,8 @@ RETURN_KEYWORDS = ["กลับที่นั่ง", "กลับที่�
 TID_RE = re.compile(r"รหัสผู้ใช้[：:][^\d]*(\d+)")
 
 _currently_out: dict[str, str] = {}   # telegram_id → chat_id ของกลุ่มที่กดเช็คอินมา
-# telegram_id → {"name", "discord_id", "activity", "start": datetime ไทย, "alerted": bool}
+# telegram_id → {"name", "discord_id", "activity", "start": datetime ไทย,
+#                "alerts": เตือนไปแล้วกี่ครั้ง, "last_alert": เวลาเตือนล่าสุด}
 # ใช้แจ้งเตือนพักเกินเวลา (ข้อมูลชุดเดียวกับ _currently_out แต่มีเวลาเริ่มพักด้วย)
 OUT_INFO: dict[str, dict] = {}
 
@@ -226,6 +227,17 @@ OUT_INFO: dict[str, dict] = {}
 # ตั้งใหม่ได้ด้วย env BREAK_LIMITS เช่น "กินข้าว=30,ปวดหนัก=20,ปวดน้อย=6" / ปิดด้วย OVERDUE_ALERT=0
 OVERDUE_ALERT_ENABLED = os.environ.get("OVERDUE_ALERT", "1").strip() != "0"
 OVERDUE_CHECK_EVERY = 30          # เช็คทุกกี่วินาที
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+OVERDUE_REPEAT_MINUTES = _env_int("OVERDUE_REPEAT_MINUTES", 5)   # ยังไม่กลับ → เตือนซ้ำทุกกี่นาที
+OVERDUE_MAX_ALERTS = _env_int("OVERDUE_MAX_ALERTS", 0)           # เตือนสูงสุดกี่ครั้ง (0 = ไม่จำกัด เตือนจนกว่าจะกดกลับ)
 BREAK_LIMITS: dict[str, int] = {
     "กินข้าว": 30, "ทานข้าว": 30,
     "ปวดหนัก": 20, "ห้องน้ำใหญ่": 20,
@@ -875,23 +887,30 @@ class ActivityBot(discord.Client):
             NICK_SYNC_NOW.clear()
 
     async def _overdue_loop(self):
-        """⏰ ทุก 30 วิ: ใครพักเกินเวลาที่กำหนด แต่ยังไม่กดกลับ → แจ้งเตือนในห้อง (คนละ 1 ครั้งต่อการพัก)"""
+        """⏰ ทุก 30 วิ: ใครพักเกินเวลาที่กำหนด แต่ยังไม่กดกลับ → แจ้งเตือนในห้อง
+        เตือนซ้ำทุก 5 นาทีไปเรื่อยๆ จนกว่าจะกดกลับ (เตือนรอบใหม่ → ลบรอบก่อน ในห้องเหลืออันล่าสุดอันเดียว)"""
         await asyncio.sleep(30)                         # รอโหลดรายชื่อคนที่พักอยู่ก่อน
         while True:
             try:
-                now = get_thai_time()
-                for tid, info in list(OUT_INFO.items()):
-                    if info.get("alerted"):
-                        continue
-                    od = overdue_minutes(info, now)
-                    if od:
-                        info["alerted"] = True
-                        await self.send_overdue_alert(info, od[0], od[1])
+                await self.overdue_tick(get_thai_time())
             except Exception as e:
                 logger.warning(f"[OVERDUE] error: {e}")
             await asyncio.sleep(OVERDUE_CHECK_EVERY)
 
-    async def send_overdue_alert(self, info: dict, mins: int, limit: int) -> None:
+    async def overdue_tick(self, now: datetime) -> None:
+        for info in list(OUT_INFO.values()):
+            n = info.get("alerts", 0)
+            if OVERDUE_MAX_ALERTS > 0 and n >= OVERDUE_MAX_ALERTS:
+                continue                                # เตือนครบตามที่กำหนดแล้ว
+            last = info.get("last_alert")
+            if n and last and (now - last).total_seconds() < OVERDUE_REPEAT_MINUTES * 60:
+                continue                                # ยังไม่ถึงรอบเตือนซ้ำ
+            od = overdue_minutes(info, now)
+            if od:
+                info["alerts"], info["last_alert"] = n + 1, now
+                await self.send_overdue_alert(info, od[0], od[1], n + 1)
+
+    async def send_overdue_alert(self, info: dict, mins: int, limit: int, nth: int = 1) -> None:
         """รีพลายข้อความ "ไป..." ของคนนั้น + แท็กชื่อ (ไม่เจอข้อความ → ส่งในห้องที่เขาอยู่)"""
         name = info["name"]
         guild, member = await self.find_member(info.get("discord_id", ""))
@@ -911,8 +930,18 @@ class ActivityBot(discord.Client):
             logger.warning(f"[OVERDUE] {name} เกินเวลา แต่หาห้องที่จะแจ้งไม่เจอ")
             return
         activity = activity_label(info.get("activity", ""))
+        if OVERDUE_MAX_ALERTS > 0:
+            times = f" · เตือนครั้งที่ {nth}/{OVERDUE_MAX_ALERTS}" if OVERDUE_MAX_ALERTS > 1 else ""
+        else:
+            times = f" · เตือนครั้งที่ {nth}"
         text = (f"⏰ {member.mention} **{name}** {activity} เกินเวลาแล้ว\n"
-                f"> ออกไป {mins} นาที · กำหนด {limit} นาที")
+                f"> ออกไป {mins} นาที · กำหนด {limit} นาที{times}")
+        prev = self._overdue_msg.pop(member.id, None)
+        if prev is not None:
+            try:
+                await prev.delete()                                     # ลบเตือนรอบก่อน ไม่ให้รกห้อง
+            except Exception:
+                pass
         try:
             mentions = discord.AllowedMentions(users=[member], roles=False, everyone=False, replied_user=False)
             if ref is not None:
@@ -1561,8 +1590,11 @@ async def supabase_restore_open_breaks() -> None:
                 OUT_INFO[tid] = {
                     "name": r["staff_name"], "discord_id": EMPLOYEES.get(tid, {}).get("discord_id", ""),
                     "activity": activity, "start": start,
-                    # เกินเวลามานานแล้วตอนบอทปิดอยู่ → น่าจะเตือนไปแล้ว ไม่เตือนซ้ำ
-                    "alerted": limit is not None and over > 10,
+                    # เกินเวลามานานแล้วตอนบอทปิดอยู่ → น่าจะเตือนครบแล้ว ไม่เตือนซ้ำ
+                    # บอทรีสตาร์ทระหว่างพัก: เกินเวลาอยู่แล้ว → เตือนต่อทันที (นับครั้งต่อจากที่ควรเตือนไปแล้ว)
+                    "alerts": (1 + int(over // OVERDUE_REPEAT_MINUTES)) if (limit is not None and over > 0
+                                                                           and OVERDUE_REPEAT_MINUTES > 0) else 0,
+                    "last_alert": None,
                 }
         logger.info(f"[Supabase] Restored {restored} open break sessions → _currently_out")
         _out_restored = True
@@ -1816,7 +1848,8 @@ async def _handle_activity(emp: dict, parsed: dict) -> None:
         _currently_out[tid] = parsed.get("chat_id", "")
         OUT_INFO[tid] = {
             "name": emp["name"], "discord_id": emp["discord_id"], "activity": parsed["activity"],
-            "start": parse_telegram_timestamp(parsed.get("timestamp")) or get_thai_time(), "alerted": False,
+            "start": parse_telegram_timestamp(parsed.get("timestamp")) or get_thai_time(),
+            "alerts": 0, "last_alert": None,
         }
         # เปิด break session ใน Supabase ด้วยเวลาจาก Telegram
         await supabase_open_break(emp["name"], parsed["activity"], parsed.get("timestamp"))
