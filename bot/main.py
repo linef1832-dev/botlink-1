@@ -697,7 +697,8 @@ class ActivityBot(discord.Client):
         # member_id → ห้องทำงานล่าสุดที่อยู่ (ไม่นับห้องกินข้าว) — ไม่ถูกล้างรายชั่วโมง
         self._last_work_channel: dict[int, int] = {}
         # ── แจ้งเตือนพักเกินเวลา ── member_id → ข้อความแจ้งเตือนที่ส่งไป (ลบทิ้งตอนกดกลับ)
-        self._overdue_msg: dict[int, discord.Message] = {}
+        # member_id → ข้อความเตือนทั้งหมดของการพักครั้งนี้ (ค้างไว้ให้เห็นภาพรวม แล้วลบพร้อมชุดไป-กลับหลัง 2 ชม.)
+        self._overdue_msgs: dict[int, list] = {}
         # ── ชื่อเล่น ── member_id → อีโมจิพักที่ต้องแสดง (None = ไม่ได้พัก / กลับแล้ว)
         self._break_emoji: dict[int, str | None] = {}
         # เปลี่ยนชื่อไม่ได้ (role สูงกว่าบอท) → member_id: เวลาที่ลองล่าสุด
@@ -899,7 +900,7 @@ class ActivityBot(discord.Client):
 
     async def _overdue_loop(self):
         """⏰ ทุก 30 วิ: ใครพักเกินเวลาที่กำหนด แต่ยังไม่กดกลับ → แจ้งเตือนในห้อง
-        เตือนซ้ำทุก 5 นาทีไปเรื่อยๆ จนกว่าจะกดกลับ (เตือนรอบใหม่ → ลบรอบก่อน ในห้องเหลืออันล่าสุดอันเดียว)"""
+        เตือนซ้ำทุก 5 นาทีไปเรื่อยๆ จนกว่าจะกดกลับ (ข้อความเตือนค้างไว้ให้เห็นทุกอัน แล้วลบพร้อมชุดไป-กลับหลัง 2 ชม.)"""
         await asyncio.sleep(30)                         # รอโหลดรายชื่อคนที่พักอยู่ก่อน
         while True:
             try:
@@ -943,7 +944,7 @@ class ActivityBot(discord.Client):
 
     async def _post_break_alert(self, info: dict, template: str, log: str) -> None:
         """ส่งข้อความเตือน (รีพลายข้อความ "ไป..." ของคนนั้น ไม่เจอ → ส่งในห้องที่เขาอยู่) + แท็ก
-        แล้วลบข้อความเตือนอันก่อนของคนนี้ ในห้องจะเหลืออันล่าสุดอันเดียว"""
+        ข้อความเตือนทุกอันค้างไว้ให้เห็นภาพรวม แล้วลบพร้อมชุดไป-กลับหลัง 2 ชม."""
         name = info["name"]
         guild, member = await self.find_member(info.get("discord_id", ""))
         if member is None:
@@ -962,23 +963,26 @@ class ActivityBot(discord.Client):
             logger.warning(f"[OVERDUE] {name}: หาห้องที่จะแจ้งไม่เจอ")
             return
         text = template.replace("{mention}", member.mention)
-        prev = self._overdue_msg.pop(member.id, None)
-        if prev is not None:
-            try:
-                await prev.delete()                                     # ลบเตือนรอบก่อน ไม่ให้รกห้อง
-            except Exception:
-                pass
         try:
             mentions = discord.AllowedMentions(users=[member], roles=False, everyone=False, replied_user=False)
             if ref is not None:
                 msg = await ref.reply(text, allowed_mentions=mentions)
             else:
                 msg = await ch.send(text, allowed_mentions=mentions)
-            self._overdue_msg[member.id] = msg
+            self._overdue_msgs.setdefault(member.id, []).append(msg)     # เก็บไว้ทุกอัน ไม่ลบรอบก่อน
             self._sweep_channels[ch.id] = time_module.time()
             logger.info(f"{log} → แจ้งใน #{ch.name}")
         except Exception as e:
             logger.warning(f"[OVERDUE] ส่งแจ้งเตือน {name} ไม่สำเร็จ: {e}")
+
+    async def _expire_alerts(self, member_id: int) -> None:
+        """ตั้งเวลาลบข้อความเตือนของคนนี้ (เท่ากับเวลาลบชุดไป-กลับ) แล้วลืมไป"""
+        for msg in self._overdue_msgs.pop(member_id, []):
+            try:
+                if BREAK_MSG_DELETE_AFTER >= 0:
+                    await msg.delete(delay=BREAK_MSG_DELETE_AFTER)
+            except Exception:
+                pass
 
     async def send_prewarn(self, info: dict, used: int, limit: int) -> None:
         """⏳ เตือนล่วงหน้า 1 นาทีก่อนครบเวลา (ครั้งเดียวต่อการพัก) + แท็ก"""
@@ -990,13 +994,9 @@ class ActivityBot(discord.Client):
 
     async def finish_overdue(self, member, name: str, info: dict | None, timestamp: str | None,
                              reply_to=None, channel=None) -> None:
-        """กดกลับแล้ว: เอาแจ้งเตือน "เกินเวลา" ออก / ถ้ากลับช้า → รีพลายข้อความกลับที่นั่ง + แท็ก บอกว่าช้าไปกี่นาที"""
-        alert = self._overdue_msg.pop(member.id, None)
-        if alert is not None:
-            try:
-                await alert.delete()
-            except Exception:
-                pass
+        """กดกลับแล้ว: ข้อความเตือนทั้งหมดของรอบนี้ → ลบพร้อมชุดไป-กลับ (หลัง 2 ชม.)
+        ถ้ากลับช้า → รีพลายข้อความกลับที่นั่ง + แท็ก บอกว่าช้าไปกี่นาที"""
+        await self._expire_alerts(member.id)
         if not OVERDUE_ALERT_ENABLED or not info:
             return
         end = parse_telegram_timestamp(timestamp) or get_thai_time()
@@ -1004,8 +1004,10 @@ class ActivityBot(discord.Client):
         if not od:
             return
         used, limit, late = od
+        n_alerts = info.get("alerts", 0)
+        warned = f" · เตือนไป {n_alerts} ครั้ง" if n_alerts else ""
         text = (f"⏰ {member.mention} **{name}** {activity_label(info.get('activity', ''))} กลับช้าไป {late} นาที\n"
-                f"> ใช้ไป {used} นาที · กำหนด {limit} นาที")
+                f"> ใช้ไป {used} นาที · กำหนด {limit} นาที{warned}")
         mentions = discord.AllowedMentions(users=[member], roles=False, everyone=False, replied_user=False)
         try:
             if reply_to is not None:
@@ -1049,11 +1051,16 @@ class ActivityBot(discord.Client):
                                 self._sweep_channels[ch.id] = time_module.time()
                             continue
                         od = _OVERDUE_RE.match(m.content or "") if mine else None
-                        if od and _out_restored and od.group(1) not in _overdue_names():
-                            try:
-                                await m.delete()                    # แจ้งเตือนค้างของคนที่กลับแล้ว (เช่น บอทรีสตาร์ท)
-                            except Exception:
-                                pass
+                        if od:
+                            if not _out_restored or od.group(1) in _overdue_names():
+                                self._sweep_channels[ch.id] = time_module.time()   # ยังพักอยู่ → เก็บไว้
+                            elif (now - m.created_at).total_seconds() >= min_age:
+                                try:
+                                    await m.delete()                # กลับแล้ว + เกิน 2 ชม. → ลบ (ตามลบหลังรีสตาร์ท)
+                                except Exception:
+                                    pass
+                            else:
+                                self._sweep_channels[ch.id] = time_module.time()
                             continue
                         parsed = parse_break_message(m, me_id)
                         if parsed is None or parsed[1] != "กลับที่นั่งแล้ว":
@@ -1397,12 +1404,7 @@ class ActivityBot(discord.Client):
                                 except Exception as e:
                                     logger.warning(f"ลบข้อความแจ้งพักไม่สำเร็จ: {e}")
                 else:
-                    stale = self._overdue_msg.pop(member.id, None)     # กดไปรอบใหม่โดยไม่กดกลับ → เตือนของรอบก่อนไม่เกี่ยวแล้ว
-                    if stale is not None:
-                        try:
-                            await stale.delete()
-                        except Exception:
-                            pass
+                    await self._expire_alerts(member.id)       # กดไปรอบใหม่โดยไม่กดกลับ → เตือนรอบก่อนลบตามเวลาปกติ
                     sent_msg = await notify_vc.send(message)
                     self._last_notified_channel[member.id] = notify_vc.id
                     self._last_activity_message[member.id] = sent_msg
