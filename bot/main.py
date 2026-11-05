@@ -218,6 +218,58 @@ RETURN_KEYWORDS = ["กลับที่นั่ง", "กลับที่�
 TID_RE = re.compile(r"รหัสผู้ใช้[：:][^\d]*(\d+)")
 
 _currently_out: dict[str, str] = {}   # telegram_id → chat_id ของกลุ่มที่กดเช็คอินมา
+# telegram_id → {"name", "discord_id", "activity", "start": datetime ไทย, "alerted": bool}
+# ใช้แจ้งเตือนพักเกินเวลา (ข้อมูลชุดเดียวกับ _currently_out แต่มีเวลาเริ่มพักด้วย)
+OUT_INFO: dict[str, dict] = {}
+
+# ── ⏰ แจ้งเตือนพักเกินเวลา ── (เวลากำหนดเดียวกับหน้า "ติดตามการพัก" ในเว็บ K36)
+# ตั้งใหม่ได้ด้วย env BREAK_LIMITS เช่น "กินข้าว=30,ปวดหนัก=20,ปวดน้อย=6" / ปิดด้วย OVERDUE_ALERT=0
+OVERDUE_ALERT_ENABLED = os.environ.get("OVERDUE_ALERT", "1").strip() != "0"
+OVERDUE_CHECK_EVERY = 30          # เช็คทุกกี่วินาที
+BREAK_LIMITS: dict[str, int] = {
+    "กินข้าว": 30, "ทานข้าว": 30,
+    "ปวดหนัก": 20, "ห้องน้ำใหญ่": 20,
+    "ปวดน้อย": 6, "ห้องน้ำเล็ก": 6,
+}
+for _pair in os.environ.get("BREAK_LIMITS", "").split(","):
+    if "=" in _pair:
+        _k, _v = _pair.split("=", 1)
+        try:
+            BREAK_LIMITS[_k.strip()] = int(_v.strip())
+        except ValueError:
+            pass
+
+
+def break_limit_minutes(activity: str) -> int | None:
+    """เวลาพักสูงสุด (นาที) ของกิจกรรมนี้ — ไม่มีกำหนด คืน None (ไม่แจ้งเตือน)"""
+    for key, limit in BREAK_LIMITS.items():
+        if key in (activity or ""):
+            return limit
+    return None
+
+
+def _overdue_names() -> set[str]:
+    return {i["name"] for i in OUT_INFO.values()}
+
+
+def activity_label(activity: str) -> str:
+    """"🚽 ปวดหนัก" (break_reason จาก K36) → "ปวดหนัก" / "ปวดหนัก" → "ปวดหนัก" """
+    a = (activity or "พัก").strip()
+    head, _, rest = a.partition(" ")
+    return rest if rest and not any(c.isalnum() for c in head) else a
+
+
+def overdue_minutes(info: dict, end: datetime) -> tuple[int, int, int] | None:
+    """(ใช้ไปกี่นาที, กำหนดกี่นาที, เกินกี่นาที) — ยังไม่เกิน/ไม่มีกำหนด คืน None
+    นับเป็นวินาที: เกินไม่ถึงนาทีก็นับเป็น "เกิน 1 นาที" (นอกนั้นนับเต็มนาที)"""
+    limit = break_limit_minutes(info.get("activity", ""))
+    if limit is None or not info.get("start"):
+        return None
+    over_sec = (end - info["start"]).total_seconds() - limit * 60
+    if over_sec <= 0:
+        return None
+    late = max(1, int(over_sec // 60))
+    return limit + late, limit, late
 
 # อีโมจิที่ "บันทึกลง K36" (break_reason) — ต้องตรงกับ checkin-bot-render ห้ามเปลี่ยน
 BREAK_REASON_EMOJI = {
@@ -260,7 +312,8 @@ def is_destination(channel_id) -> bool:
 # NICK_STATUS=0 → ปิดอีโมจิพัก / WEB_NICK=0 → ปิดสีเว็บ
 NICK_STATUS_ENABLED = os.environ.get("NICK_STATUS", "1").strip() != "0"
 WEB_NICK_ENABLED = os.environ.get("WEB_NICK", "1").strip() != "0"
-WEB_NICK_SYNC_EVERY = 60          # อ่านตารางหน้าที่จาก K36 ใหม่ทุกกี่วินาที (แอดมินแก้หน้าที่ → ชื่อเปลี่ยนตามภายใน 1 นาที)
+WEB_NICK_SYNC_EVERY = 15          # อ่านตารางหน้าที่จาก K36 ใหม่ทุกกี่วินาที (query เล็กมาก ไม่กี่แถว)
+                                  # ถ้า Realtime ของตาราง settings เปิดอยู่ → เปลี่ยนแทบทันทีที่แอดมินกดบันทึก
 # ถูก set เมื่อข้อมูลพนักงานเปลี่ยน → รอบปรับชื่อทำงานทันที (ไม่ต้องรอครบ 1 นาที)
 NICK_SYNC_NOW = asyncio.Event()
 NICK_RETRY_AFTER = 300            # เปลี่ยนชื่อไม่ได้ → รอกี่วินาทีค่อยลองใหม่
@@ -570,6 +623,10 @@ _BREAK_MSG_RE = re.compile(
 )
 
 
+_OVERDUE_RE = re.compile(r"⏰ <@!?\d+> \*\*(.+?)\*\* .* เกินเวลาแล้ว")
+_LATE_RE = re.compile(r"⏰ <@!?\d+> \*\*(.+?)\*\* .* กลับช้าไป \d+ นาที")
+
+
 def parse_break_message(m, bot_user_id) -> tuple[str, str] | None:
     """ถ้าเป็นข้อความแจ้งพักของบอท คืน (ชื่อ, "กลับที่นั่งแล้ว" หรือ "ไป") ไม่ใช่คืน None
     ใช้ร่วมกันทั้งตัวเก็บกวาดอัตโนมัติ และคำสั่ง /clear_break_messages"""
@@ -616,6 +673,8 @@ class ActivityBot(discord.Client):
         self._return_channel: dict[int, int] = {}
         # member_id → ห้องทำงานล่าสุดที่อยู่ (ไม่นับห้องกินข้าว) — ไม่ถูกล้างรายชั่วโมง
         self._last_work_channel: dict[int, int] = {}
+        # ── แจ้งเตือนพักเกินเวลา ── member_id → ข้อความแจ้งเตือนที่ส่งไป (ลบทิ้งตอนกดกลับ)
+        self._overdue_msg: dict[int, discord.Message] = {}
         # ── ชื่อเล่น ── member_id → อีโมจิพักที่ต้องแสดง (None = ไม่ได้พัก / กลับแล้ว)
         self._break_emoji: dict[int, str | None] = {}
         # เปลี่ยนชื่อไม่ได้ (role สูงกว่าบอท) → member_id: เวลาที่ลองล่าสุด
@@ -663,6 +722,9 @@ class ActivityBot(discord.Client):
             logger.info(f"Snapshot: found {count} member(s) already in voice channels")
         self._ready_event.set()          # ⚠️ ต้องถึงบรรทัดนี้เสมอ — งาน Telegram/นับแชท รอสัญญาณนี้อยู่
         await self._sync_commands()
+        if OVERDUE_ALERT_ENABLED and not getattr(self, "_overdue_started", False):
+            self._overdue_started = True
+            spawn(self._overdue_loop())
         if (WEB_NICK_ENABLED or NICK_STATUS_ENABLED) and not getattr(self, "_nick_sync_started", False):
             self._nick_sync_started = True
             spawn(self._nick_sync_loop())
@@ -761,13 +823,15 @@ class ActivityBot(discord.Client):
         no_color: list[str] = []                        # คนที่อยู่ห้องเสียงแต่ไม่ได้สี + เหตุผล (ไว้ดูใน log)
         info_by_did = {e["discord_id"]: e for e in EMPLOYEES.values()}
         for g in self.guilds:
-            for m in g.members:
+            # คนที่อยู่ห้องเสียง (คนที่หัวหน้าเห็นอยู่) ทำก่อน แล้วค่อยคนที่ออฟไลน์
+            # (ไม่ต้องหน่วงเอง — discord.py รอตาม rate limit ของ Discord ให้อัตโนมัติ)
+            members = sorted(g.members, key=lambda mm: not (mm.voice and mm.voice.channel))
+            for m in members:
                 did = str(m.id)
                 if did not in NAME_BY_DISCORD:
                     continue                            # ไม่ใช่พนักงานในระบบ → ไม่แตะชื่อ
                 if await self.apply_nick(m):
                     changed += 1
-                    await asyncio.sleep(0.3)            # เว้นจังหวะ ไม่ยิง Discord รัวเกิน
                 if WEB_NICK_ENABLED and m.voice and m.voice.channel and not is_destination(m.voice.channel.id):
                     e = info_by_did.get(did, {})
                     if nickname.is_trainer_dept(e.get("department", "")):
@@ -790,7 +854,8 @@ class ActivityBot(discord.Client):
         return changed
 
     async def _nick_sync_loop(self):
-        """ทุก 5 นาที: อ่านตารางหน้าที่ใหม่ แล้วปรับชื่อทุกคน (ข้ามวัน/เปลี่ยนกะ/แอดมินแก้หน้าที่ → ชื่อเปลี่ยนตามเอง)"""
+        """ทุก 15 วิ (หรือทันทีที่มีสัญญาณ): อ่านตารางหน้าที่ใหม่ แล้วปรับชื่อทุกคน
+        (ข้ามวัน/เปลี่ยนกะ/แอดมินแก้หน้าที่ → ชื่อเปลี่ยนตามเอง)"""
         await asyncio.sleep(20)                         # รอโหลดพนักงาน + รายชื่อคนที่พักอยู่ก่อน
         NICK_SYNC_NOW.clear()                           # รอบแรกจะโหลดใหม่อยู่แล้ว
         while True:
@@ -804,9 +869,95 @@ class ActivityBot(discord.Client):
                 logger.warning(f"[NICK] sync error: {e}")
             try:
                 await asyncio.wait_for(NICK_SYNC_NOW.wait(), timeout=WEB_NICK_SYNC_EVERY)
+                await asyncio.sleep(1.5)                # แอดมินลากหลายคนติดกัน → รวบเป็นรอบเดียว
             except asyncio.TimeoutError:
                 pass
             NICK_SYNC_NOW.clear()
+
+    async def _overdue_loop(self):
+        """⏰ ทุก 30 วิ: ใครพักเกินเวลาที่กำหนด แต่ยังไม่กดกลับ → แจ้งเตือนในห้อง (คนละ 1 ครั้งต่อการพัก)"""
+        await asyncio.sleep(30)                         # รอโหลดรายชื่อคนที่พักอยู่ก่อน
+        while True:
+            try:
+                now = get_thai_time()
+                for tid, info in list(OUT_INFO.items()):
+                    if info.get("alerted"):
+                        continue
+                    od = overdue_minutes(info, now)
+                    if od:
+                        info["alerted"] = True
+                        await self.send_overdue_alert(info, od[0], od[1])
+            except Exception as e:
+                logger.warning(f"[OVERDUE] error: {e}")
+            await asyncio.sleep(OVERDUE_CHECK_EVERY)
+
+    async def send_overdue_alert(self, info: dict, mins: int, limit: int) -> None:
+        """รีพลายข้อความ "ไป..." ของคนนั้น + แท็กชื่อ (ไม่เจอข้อความ → ส่งในห้องที่เขาอยู่)"""
+        name = info["name"]
+        guild, member = await self.find_member(info.get("discord_id", ""))
+        if member is None:
+            logger.warning(f"[OVERDUE] {name} เกินเวลา แต่หาบัญชี Discord ไม่เจอ")
+            return
+        ref = self._last_activity_message.get(member.id)
+        if ref is None and guild is not None:
+            ref = await self._find_activity_msg_anywhere(guild, name)       # บอทรีสตาร์ท → หาจากประวัติห้อง
+        ch = ref.channel if ref is not None else None
+        if ch is None:
+            ch_id = self._last_notified_channel.get(member.id)
+            ch = await self.find_voice_channel_by_id(str(ch_id)) if ch_id else None
+        if ch is None and member.voice and member.voice.channel:
+            ch = member.voice.channel
+        if ch is None:
+            logger.warning(f"[OVERDUE] {name} เกินเวลา แต่หาห้องที่จะแจ้งไม่เจอ")
+            return
+        activity = activity_label(info.get("activity", ""))
+        text = (f"⏰ {member.mention} **{name}** {activity} เกินเวลาแล้ว\n"
+                f"> ออกไป {mins} นาที · กำหนด {limit} นาที")
+        try:
+            mentions = discord.AllowedMentions(users=[member], roles=False, everyone=False, replied_user=False)
+            if ref is not None:
+                msg = await ref.reply(text, allowed_mentions=mentions)
+            else:
+                msg = await ch.send(text, allowed_mentions=mentions)
+            self._overdue_msg[member.id] = msg
+            self._sweep_channels[ch.id] = time_module.time()
+            logger.info(f"[OVERDUE] {name} {activity} เกินเวลา ({mins}/{limit} นาที) → แจ้งใน #{ch.name}")
+        except Exception as e:
+            logger.warning(f"[OVERDUE] ส่งแจ้งเตือน {name} ไม่สำเร็จ: {e}")
+
+    async def finish_overdue(self, member, name: str, info: dict | None, timestamp: str | None,
+                             reply_to=None, channel=None) -> None:
+        """กดกลับแล้ว: เอาแจ้งเตือน "เกินเวลา" ออก / ถ้ากลับช้า → รีพลายข้อความกลับที่นั่ง + แท็ก บอกว่าช้าไปกี่นาที"""
+        alert = self._overdue_msg.pop(member.id, None)
+        if alert is not None:
+            try:
+                await alert.delete()
+            except Exception:
+                pass
+        if not OVERDUE_ALERT_ENABLED or not info:
+            return
+        end = parse_telegram_timestamp(timestamp) or get_thai_time()
+        od = overdue_minutes(info, end)
+        if not od:
+            return
+        used, limit, late = od
+        text = (f"⏰ {member.mention} **{name}** {activity_label(info.get('activity', ''))} กลับช้าไป {late} นาที\n"
+                f"> ใช้ไป {used} นาที · กำหนด {limit} นาที")
+        mentions = discord.AllowedMentions(users=[member], roles=False, everyone=False, replied_user=False)
+        try:
+            if reply_to is not None:
+                msg = await reply_to.reply(text, allowed_mentions=mentions)
+            elif channel is not None:
+                msg = await channel.send(text, allowed_mentions=mentions)
+            else:
+                logger.info(f"[OVERDUE] {name} กลับช้า {late} นาที แต่ไม่มีห้องให้แจ้ง")
+                return
+            self._sweep_channels[msg.channel.id] = time_module.time()
+            if BREAK_MSG_DELETE_AFTER >= 0:
+                await msg.delete(delay=BREAK_MSG_DELETE_AFTER)           # ลบพร้อมชุดไป-กลับ
+            logger.info(f"[OVERDUE] {name} กลับช้าไป {late} นาที ({used}/{limit})")
+        except Exception as e:
+            logger.warning(f"[OVERDUE] แจ้งกลับช้าของ {name} ไม่สำเร็จ: {e}")
 
     async def _sweep_once(self, full: bool) -> int:
         min_age = max(BREAK_MSG_DELETE_AFTER, 0) + 10
@@ -824,6 +975,23 @@ class ActivityBot(discord.Client):
                     continue
                 try:
                     async for m in ch.history(limit=self.SWEEP_HISTORY):
+                        mine = bool(me_id) and m.author.id == me_id
+                        if mine and _LATE_RE.match(m.content or ""):
+                            if (now - m.created_at).total_seconds() >= min_age:
+                                try:
+                                    await m.delete()                # แจ้ง "กลับช้า" ลบตามเวลาเดียวกับชุดไป-กลับ
+                                except Exception:
+                                    pass
+                            else:
+                                self._sweep_channels[ch.id] = time_module.time()
+                            continue
+                        od = _OVERDUE_RE.match(m.content or "") if mine else None
+                        if od and _out_restored and od.group(1) not in _overdue_names():
+                            try:
+                                await m.delete()                    # แจ้งเตือนค้างของคนที่กลับแล้ว (เช่น บอทรีสตาร์ท)
+                            except Exception:
+                                pass
+                            continue
                         parsed = parse_break_message(m, me_id)
                         if parsed is None or parsed[1] != "กลับที่นั่งแล้ว":
                             continue
@@ -1016,7 +1184,8 @@ class ActivityBot(discord.Client):
         return None
 
     async def send_notification(self, discord_user_id: str, name: str, activity: str,
-                                 is_return: bool, group_name: str, timestamp: str | None = None) -> tuple[bool, str | None]:
+                                 is_return: bool, group_name: str, timestamp: str | None = None,
+                                 break_info: dict | None = None) -> tuple[bool, str | None]:
         emoji = get_emoji(activity, is_return)
         action = f"**{name}** กลับที่นั่งแล้ว" if is_return else f"**{name}** ไป{activity}"
         # อ่านเวลาจากข้อความ Telegram เป็นเวลาไทย (ตัวเดียวกับที่เก็บลง DB)
@@ -1153,6 +1322,8 @@ class ActivityBot(discord.Client):
                         sent_msg = await notify_vc.send(message)
                     self._last_activity_message.pop(member.id, None)
                     self._last_notified_channel.pop(member.id, None)   # จับคู่ไป-กลับครบแล้ว
+                    # ⏰ เอาแจ้งเตือนเกินเวลาออก / กลับช้า → แจ้งว่าช้าไปกี่นาที + แท็ก
+                    await self.finish_overdue(member, name, break_info, timestamp, reply_to=sent_msg)
                     self._sweep_channels[notify_vc.id] = time_module.time()   # ให้ตัวเก็บกวาดตามดูห้องนี้
                     # 🧹 กลับที่นั่งแล้ว → ลบชุดข้อความ (แจ้งไป + แจ้งกลับ) ออกจากห้อง หลังหน่วงเวลาให้เห็นสักครู่
                     if BREAK_MSG_DELETE_AFTER >= 0:
@@ -1172,6 +1343,11 @@ class ActivityBot(discord.Client):
                 logger.error(f"Failed to send to voice channel #{notify_vc.name}: {e}")
         elif not is_return:
             logger.warning(f"No work channel found for {name} ({discord_user_id}) — notification skipped")
+        if is_return:
+            # แจ้งกลับที่นั่งไม่ได้ (ไม่อยู่ห้องเสียง) → ยังต้องเอาแจ้งเตือนเกินเวลาออก / แจ้งกลับช้าในห้องที่เคยแจ้ง
+            last = self._last_notified_channel.get(member.id)
+            await self.finish_overdue(member, name, break_info, timestamp,
+                                      channel=await self.find_voice_channel_by_id(str(last)) if last else None)
 
         return False, None
 
@@ -1360,7 +1536,7 @@ async def supabase_restore_open_breaks() -> None:
         break_date = get_break_date_from_time(now)
         prev_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
         res = await sb(lambda: supabase.from_(BREAK_TABLES[0])
-                       .select("staff_name")
+                       .select("staff_name, break_start, break_reason")
                        .in_("break_date", [break_date, prev_date])
                        .is_("break_end", "null")
                        .execute())
@@ -1374,6 +1550,20 @@ async def supabase_restore_open_breaks() -> None:
             if tid and tid not in _currently_out:
                 _currently_out[tid] = ""  # ไม่รู้ group_name เดิม
                 restored += 1
+            if tid and tid not in OUT_INFO:
+                try:
+                    start = datetime.fromisoformat(str(r.get("break_start"))).astimezone(TH_TZ)
+                except (TypeError, ValueError):
+                    start = now
+                activity = str(r.get("break_reason") or "")
+                limit = break_limit_minutes(activity)
+                over = (now - start).total_seconds() / 60 - (limit or 0)
+                OUT_INFO[tid] = {
+                    "name": r["staff_name"], "discord_id": EMPLOYEES.get(tid, {}).get("discord_id", ""),
+                    "activity": activity, "start": start,
+                    # เกินเวลามานานแล้วตอนบอทปิดอยู่ → น่าจะเตือนไปแล้ว ไม่เตือนซ้ำ
+                    "alerted": limit is not None and over > 10,
+                }
         logger.info(f"[Supabase] Restored {restored} open break sessions → _currently_out")
         _out_restored = True
     except Exception as e:
@@ -1458,7 +1648,15 @@ async def watch_realtime_forever() -> None:
                 callback=make_callback("[GROUPS] Realtime: ตรวจพบการเปลี่ยนแปลงใน telegram_groups → รีโหลดทันที",
                                        load_target_groups),
             ).subscribe()
-            logger.info("[REALTIME] กำลัง watch ตาราง users + telegram_groups...")
+            # ตารางหน้าที่ (settings key duty_roster_*) เปลี่ยน → ปรับสีชื่อทันที
+            # (ถ้าตาราง settings ไม่ได้เปิด Realtime ใน Supabase ก็ไม่เป็นไร — บอทเช็คเองทุก 15 วิอยู่แล้ว)
+            def on_settings_change(*args, **_kw):
+                if "duty_roster_" in str(args[:1]):
+                    loop.call_soon_threadsafe(NICK_SYNC_NOW.set)
+            await rt_client.channel("settings-changes").on_postgres_changes(
+                event="*", schema="public", table="settings", callback=on_settings_change,
+            ).subscribe()
+            logger.info("[REALTIME] กำลัง watch ตาราง users + telegram_groups + settings(ตารางหน้าที่)...")
             if not first:
                 await reload_all_data()          # ระหว่างหลุดอาจพลาด event ไป → โหลดใหม่ให้ทันข้อมูลล่าสุด
             first = False
@@ -1608,12 +1806,18 @@ async def _handle_activity(emp: dict, parsed: dict) -> None:
     tid = parsed["telegram_id"]
 
     # Track activity state
+    break_info = None
     if parsed["is_return"]:
         _currently_out.pop(tid, None)
+        break_info = OUT_INFO.pop(tid, None)
         # ปิด break session ใน Supabase ด้วยเวลาจาก Telegram
         await supabase_close_break(emp["name"], parsed.get("timestamp"))
     else:
         _currently_out[tid] = parsed.get("chat_id", "")
+        OUT_INFO[tid] = {
+            "name": emp["name"], "discord_id": emp["discord_id"], "activity": parsed["activity"],
+            "start": parse_telegram_timestamp(parsed.get("timestamp")) or get_thai_time(), "alerted": False,
+        }
         # เปิด break session ใน Supabase ด้วยเวลาจาก Telegram
         await supabase_open_break(emp["name"], parsed["activity"], parsed.get("timestamp"))
 
@@ -1625,6 +1829,7 @@ async def _handle_activity(emp: dict, parsed: dict) -> None:
         parsed["is_return"],
         parsed["group_name"],
         parsed.get("timestamp"),
+        break_info,
     )
     status = f"sent to #{channel}" if sent else "not sent (not in voice channel)"
     logger.info(f"{emp['name']} [{parsed['activity']}] → Discord {status}")
@@ -1637,8 +1842,10 @@ async def _handle_failed_return(tid: str, emp: dict, group_name: str) -> None:
     #       ถ้าบอทจำไม่ได้ แต่คนนั้นยังนั่งอยู่ห้องกินข้าว → ก็ต้องย้ายกลับด้วย
     await discord_bot.wait_until_ready_event()
     if tid in _currently_out or await discord_bot.is_in_destination(emp["discord_id"]):
-        await discord_bot.send_notification(emp["discord_id"], emp["name"], "กลับที่นั่ง", True, group_name)
         _currently_out.pop(tid, None)
+        info = OUT_INFO.pop(tid, None)
+        await discord_bot.send_notification(emp["discord_id"], emp["name"], "กลับที่นั่ง", True, group_name,
+                                            None, info)
     logger.info(f"[FAILED RETURN] {emp['name']} — closed break session (bot reset case)")
 
 
