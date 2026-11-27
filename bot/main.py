@@ -169,7 +169,10 @@ def parse_group_activities(raw) -> list[dict]:
             limit = int(a.get("limit") or 0)
         except (TypeError, ValueError):
             limit = 0
-        out.append({"name": name, "limit": max(0, limit)})
+        move = str(a.get("move_channel") or "").strip()
+        if not move.isdigit():
+            move = ""                                   # ต้องเป็น Discord channel ID (ตัวเลข) เท่านั้น
+        out.append({"name": name, "limit": max(0, limit), "move_channel": move})
     return out
 
 
@@ -211,7 +214,8 @@ async def load_target_groups() -> None:
 
         logger.info(f"[GROUPS] โหลดแล้ว {len(groups)} กลุ่ม (กะ {len(shifts)} กลุ่ม)")
         for cid, g in groups.items():
-            acts = ", ".join(f"{a['name']}={a['limit'] or '∞'}" for a in g["activities"]) or "(ยังไม่ตั้งกิจกรรม)"
+            acts = ", ".join(f"{a['name']}={a['limit'] or '∞'}{' →#' + a['move_channel'] if a['move_channel'] else ''}"
+                             for a in g["activities"]) or "(ยังไม่ตั้งกิจกรรม)"
             logger.info(f"[GROUPS]   chat_id={cid} · {g['name']} · {g['type']} · {acts}")
         if missing_id:
             logger.warning(f"[GROUPS] ข้าม {len(missing_id)} กลุ่ม เพราะยังไม่ได้ใส่ Chat ID: {missing_id}")
@@ -374,26 +378,25 @@ def all_break_emojis() -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# Activity → Discord voice channel auto-move
-# Map activity keyword → Discord voice channel ID (as string)
-# Leave empty string to disable auto-move for that activity
+# กิจกรรม → ย้ายไปห้องเสียง Discord อัตโนมัติ
+# ไม่ฝังในโค้ดแล้ว — ตั้ง "ห้องปลายทาง" (Discord channel ID) ต่อกิจกรรม ได้จากหน้าเว็บ K36 → ตั้งค่ากลุ่ม → แก้ไข
+# เว้นว่าง = กิจกรรมนั้นไม่ย้ายห้อง
 # ---------------------------------------------------------------------------
-ACTIVITY_MOVE_CHANNEL: dict[str, str] = {
-    "กินข้าว": "1451121950297686106",
-    "ทานข้าว": "1451121950297686106",
-    "ปวดหนัก": "",
-    "ปวดน้อย": "",
-}
+def destination_channel_ids() -> set[str]:
+    """ห้องปลายทางทั้งหมดที่ตั้งไว้ในเว็บ (ทุกกลุ่ม) — ไม่นับเป็นห้องทำงาน"""
+    return {a["move_channel"] for g in GROUPS_BY_CHAT.values()
+            for a in g.get("activities", []) if a.get("move_channel")}
 
-# ห้องที่ไม่นับเป็นห้องทำงาน (ห้องปลายทาง)
-DESTINATION_CHANNEL_IDS: set[str] = {
-    v for v in ACTIVITY_MOVE_CHANNEL.values() if v
-}
+
+def activity_move_channel(activity: str, chat_id: str = "") -> str:
+    """channel ID ที่ต้องย้ายไปเมื่อกดกิจกรรมนี้ (ตามที่ตั้งในกลุ่มที่กดมา) — ไม่ตั้ง → "" """
+    a = find_group_activity(chat_id, activity)
+    return (a.get("move_channel") or "") if a else ""
 
 
 def is_destination(channel_id) -> bool:
     """ห้องปลายทาง (ห้องกินข้าว) — ไม่นับเป็นห้องทำงาน"""
-    return str(channel_id) in DESTINATION_CHANNEL_IDS
+    return str(channel_id) in destination_channel_ids()
 
 
 # ── 🏷️ ชื่อเล่นพนักงาน = [อีโมจิพัก][สีเว็บวันนี้][ชื่อเดิม] ── เช่น "🚽🟣👑 LAYLA" (รายละเอียดใน nick.py)
@@ -406,11 +409,7 @@ WEB_NICK_SYNC_EVERY = 15          # อ่านตารางหน้าท�
 # ถูก set เมื่อข้อมูลพนักงานเปลี่ยน → รอบปรับชื่อทำงานทันที (ไม่ต้องรอครบ 1 นาที)
 NICK_SYNC_NOW = asyncio.Event()
 NICK_RETRY_AFTER = 300            # เปลี่ยนชื่อไม่ได้ → รอกี่วินาทีค่อยลองใหม่
-# กิจกรรมที่ "มีห้องให้ย้ายไป" (เช่น กินข้าว) ไม่ต้องใส่อีโมจิพักหน้าชื่อ — เห็นจากห้องได้เลย
-
-
-def activity_moves_room(activity: str) -> bool:
-    return any(k in (activity or "") and v for k, v in ACTIVITY_MOVE_CHANNEL.items())
+# อีโมจิหน้าชื่อใส่ทุกกิจกรรม (รวมกิจกรรมที่ย้ายห้อง เช่น กินข้าว) ตามอีโมจิที่ตั้งในเว็บ
 
 WEB_EMOJI: dict[str, str] = nickname.web_emoji_map([])   # ชื่อเว็บ(ตัวเล็ก) → สี
 # discord_id → [เว็บงานหลัก, (เว็บงานรอง — OD)] ([] = ไม่มีสี: ไม่ได้จัดหน้าที่ / ไม่มีชื่อ / ผู้สอน)
@@ -872,12 +871,6 @@ class ActivityBot(discord.Client):
         else:
             out_ids = {EMPLOYEES[t]["discord_id"] for t in _currently_out if t in EMPLOYEES}
             brk = brk_cur if did in out_ids else ""     # บอทรีสตาร์ทระหว่างพัก → คงอีโมจิเดิมจนกว่าจะกดกลับ
-        if brk:
-            # กิจกรรมที่กำลังพักอยู่มีห้องให้ย้าย (กินข้าว) → ไม่ต้องใส่อีโมจิหน้าชื่อ
-            for t, info in OUT_INFO.items():
-                if info.get("discord_id") == did and activity_moves_room(info.get("activity", "")):
-                    brk = ""
-                    break
 
         if not web and not brk and (not base or base in (member.global_name, member.name)):
             return None                                 # ไม่มีอะไรต้องเติม และชื่อเท่าชื่อบัญชี → ไม่ต้องตั้งชื่อเล่น
@@ -1269,11 +1262,8 @@ class ActivityBot(discord.Client):
             logger.error(f"Failed to find channel by ID {channel_id}: {e}")
         return None
 
-    def get_move_channel_id(self, activity: str) -> str:
-        for keyword, channel_name in ACTIVITY_MOVE_CHANNEL.items():
-            if keyword in activity:
-                return channel_name
-        return ""
+    def get_move_channel_id(self, activity: str, chat_id: str = "") -> str:
+        return activity_move_channel(activity, chat_id)
 
     def channel_time_this_hour(self, member_id: int) -> dict[int, float]:
         """{channel_id: วินาที} ที่อยู่ในแต่ละห้องชั่วโมงนี้ = เวลาที่สะสมไว้ + session ที่กำลังอยู่ตอนนี้ (ไม่นับห้องปลายทาง)"""
@@ -1348,10 +1338,9 @@ class ActivityBot(discord.Client):
             logger.warning(f"No member found for {name} ({discord_user_id})")
             return False, None
 
-        # 🏷️ อีโมจิหน้าชื่อ: ไป → ใส่ / กลับ → คืนชื่อเดิม (พังก็ไม่กระทบการแจ้ง/ย้ายห้อง)
-        #    กินข้าว → ไม่ใส่ (และล้างอีโมจิเก่าถ้ามีค้าง) เพราะถูกย้ายไปห้องกินข้าวอยู่แล้ว
+        # 🏷️ อีโมจิหน้าชื่อ: ไป → ใส่ (ทุกกิจกรรม รวมกินข้าว) / กลับ → คืนชื่อเดิม (พังก็ไม่กระทบการแจ้ง/ย้ายห้อง)
         try:
-            nick_emoji = None if (is_return or activity_moves_room(activity) or not NICK_STATUS_ENABLED) else emoji
+            nick_emoji = None if (is_return or not NICK_STATUS_ENABLED) else emoji
             await self.set_break_nick(member, nick_emoji)
         except Exception as e:
             logger.warning(f"[NICK] {name}: {e}")
@@ -1420,7 +1409,7 @@ class ActivityBot(discord.Client):
             notify_vc = last_vc or fallback_vc or move_target or current_ch
 
         else:
-            target_channel_id = self.get_move_channel_id(activity)
+            target_channel_id = self.get_move_channel_id(activity, chat_id)
 
             if target_channel_id:
                 # กินข้าว / ทานข้าว → แจ้งในห้องทำงาน แล้วย้ายไป Dining
