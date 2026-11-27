@@ -1,6 +1,7 @@
 import asyncio
 import re
 import os
+import json
 import sys
 import logging
 import time as time_module
@@ -147,6 +148,30 @@ def norm_chat_id(value) -> str:
     return s
 
 
+def parse_group_activities(raw) -> list[dict]:
+    """telegram_groups.activities (ตั้งจากหน้าเว็บ K36) → [{"name": str, "limit": int(นาที, 0 = ไม่จำกัด)}]"""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = None
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for a in raw:
+        if not isinstance(a, dict):
+            continue
+        name = str(a.get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            limit = int(a.get("limit") or 0)
+        except (TypeError, ValueError):
+            limit = 0
+        out.append({"name": name, "limit": max(0, limit)})
+    return out
+
+
 async def load_target_groups() -> None:
     """โหลดกลุ่ม Telegram จาก Supabase ตาราง telegram_groups"""
     global GROUPS_BY_CHAT, SHIFT_CHAT_IDS
@@ -154,7 +179,7 @@ async def load_target_groups() -> None:
         return
     try:
         res = await sb(lambda: supabase.from_("telegram_groups")
-                       .select("group_name, group_type, chat_id")
+                       .select("group_name, group_type, chat_id, activities")
                        .eq("active", True)
                        .execute())
 
@@ -171,6 +196,7 @@ async def load_target_groups() -> None:
             groups[cid] = {
                 "name": r.get("group_name") or "",
                 "type": r.get("group_type") or "checkin",
+                "activities": parse_group_activities(r.get("activities")),
             }
             if groups[cid]["type"] == "shift":
                 shifts.add(cid)
@@ -184,7 +210,8 @@ async def load_target_groups() -> None:
 
         logger.info(f"[GROUPS] โหลดแล้ว {len(groups)} กลุ่ม (กะ {len(shifts)} กลุ่ม)")
         for cid, g in groups.items():
-            logger.info(f"[GROUPS]   chat_id={cid} · {g['name']} · {g['type']}")
+            acts = ", ".join(f"{a['name']}={a['limit'] or '∞'}" for a in g["activities"]) or "(ยังไม่ตั้งกิจกรรม)"
+            logger.info(f"[GROUPS]   chat_id={cid} · {g['name']} · {g['type']} · {acts}")
         if missing_id:
             logger.warning(f"[GROUPS] ข้าม {len(missing_id)} กลุ่ม เพราะยังไม่ได้ใส่ Chat ID: {missing_id}")
         if not groups:
@@ -223,8 +250,8 @@ _currently_out: dict[str, str] = {}   # telegram_id → chat_id ของกล�
 # ใช้แจ้งเตือนพักเกินเวลา (ข้อมูลชุดเดียวกับ _currently_out แต่มีเวลาเริ่มพักด้วย)
 OUT_INFO: dict[str, dict] = {}
 
-# ── ⏰ แจ้งเตือนพักเกินเวลา ── (เวลากำหนดเดียวกับหน้า "ติดตามการพัก" ในเว็บ K36)
-# ตั้งใหม่ได้ด้วย env BREAK_LIMITS เช่น "กินข้าว=30,ปวดหนัก=20,ปวดน้อย=6" / ปิดด้วย OVERDUE_ALERT=0
+# ── ⏰ แจ้งเตือนพักเกินเวลา ── เวลาจำกัดของแต่ละกิจกรรมตั้งจากหน้าเว็บ K36 → ตั้งค่ากลุ่ม → แก้ไข
+# (ไม่มีตัวเลขฝังในโค้ดอีกแล้ว — กิจกรรมที่ไม่ได้ตั้งในกลุ่ม = ไม่เตือน) / ปิดทั้งหมดด้วย OVERDUE_ALERT=0
 OVERDUE_ALERT_ENABLED = os.environ.get("OVERDUE_ALERT", "1").strip() != "0"
 OVERDUE_CHECK_EVERY = 5           # เช็คทุกกี่วินาที (ดูแค่รายชื่อคนที่พักอยู่ในหน่วยความจำ ไม่หนัก)
 
@@ -239,31 +266,30 @@ def _env_int(name: str, default: int) -> int:
 OVERDUE_REPEAT_MINUTES = _env_int("OVERDUE_REPEAT_MINUTES", 5)   # ยังไม่กลับ → เตือนซ้ำทุกกี่นาที
 OVERDUE_MAX_ALERTS = _env_int("OVERDUE_MAX_ALERTS", 0)           # เตือนสูงสุดกี่ครั้ง (0 = ไม่จำกัด เตือนจนกว่าจะกดกลับ)
 OVERDUE_PREWARN_MINUTES = _env_int("OVERDUE_PREWARN_MINUTES", 1)  # เตือนล่วงหน้าก่อนครบเวลากี่นาที (0 = ไม่เตือนล่วงหน้า)
-BREAK_LIMITS: dict[str, int] = {
-    "กินข้าว": 30, "ทานข้าว": 30,
-    "ปวดหนัก": 20, "ห้องน้ำใหญ่": 20,
-    "ปวดน้อย": 6, "ห้องน้ำเล็ก": 6,
-}
-for _pair in os.environ.get("BREAK_LIMITS", "").split(","):
-    if "=" in _pair:
-        _k, _v = _pair.split("=", 1)
-        try:
-            BREAK_LIMITS[_k.strip()] = int(_v.strip())
-        except ValueError:
-            pass
+def group_activity_limit(chat_id, activity: str) -> int | None:
+    """เวลาพักสูงสุด (นาที) — อ่านจาก "ตั้งค่ากลุ่ม" ในหน้าเว็บ K36 (telegram_groups.activities)
 
-
-def break_limit_minutes(activity: str) -> int | None:
-    """เวลาพักสูงสุด (นาที) ของกิจกรรมนี้ — ไม่มีกำหนด คืน None (ไม่แจ้งเตือน)"""
-    for key, limit in BREAK_LIMITS.items():
-        if key in (activity or ""):
-            return limit
+    เทียบชื่อกิจกรรมที่แกะจาก Telegram กับชื่อที่ตั้งไว้ในกลุ่มที่กดมา (ตาม chat_id)
+    ไม่รู้กลุ่ม (เช่น โหลดคืนหลังรีสตาร์ท) → ไล่หาในทุกกลุ่มเช็คอิน
+    ไม่เจอชื่อ / ตั้ง 0 → คืน None = ไม่แจ้งเตือน"""
+    act = (activity or "").strip().lower()
+    if not act:
+        return None
+    cid = norm_chat_id(chat_id)
+    if cid in GROUPS_BY_CHAT:
+        groups = [GROUPS_BY_CHAT[cid]]
+    else:
+        groups = [g for g in GROUPS_BY_CHAT.values() if g.get("type") == "checkin"]
+    for g in groups:
+        for a in g.get("activities", []):
+            if a["name"].lower() in act:
+                return a["limit"] or None
     return None
 
 
 def info_limit(info: dict) -> int | None:
-    """เวลาจำกัด (นาที) ของการพักครั้งนี้: ใช้ตัวเลขจากข้อความ Telegram ก่อน ไม่มีค่อยใช้ค่าในโค้ด"""
-    return info.get("limit") or break_limit_minutes(info.get("activity", ""))
+    """เวลาจำกัด (นาที) ของการพักครั้งนี้ ตามที่ตั้งไว้ในหน้าเว็บ K36"""
+    return group_activity_limit(info.get("chat_id", ""), info.get("activity", ""))
 
 
 def _overdue_names() -> set[str]:
@@ -289,13 +315,8 @@ def overdue_minutes(info: dict, end: datetime) -> tuple[int, int, int] | None:
     late = max(1, int(over_sec // 60))
     return limit + late, limit, late
 
-# อีโมจิที่ "บันทึกลง K36" (break_reason) — ต้องตรงกับ checkin-bot-render ห้ามเปลี่ยน
-BREAK_REASON_EMOJI = {
-    "กินข้าว": "🍚", "ทานข้าว": "🍚",
-    "ปวดหนัก": "🚽", "ห้องน้ำใหญ่": "🚽",
-    "ปวดน้อย": "🚾", "ห้องน้ำเล็ก": "🚾",
-}
 # อีโมจิที่ "แสดงใน Discord" (ข้อความแจ้งพัก + หน้าชื่อ) — เปลี่ยนได้อิสระ
+# (break_reason ที่บันทึกลง K36 ไม่ใส่อีโมจิแล้ว — เก็บชื่อกิจกรรมตามที่กดใน Telegram ตรงๆ)
 ACTIVITY_EMOJI = {
     "กินข้าว": "🍚", "ทานข้าว": "🍚",
     "ปวดหนัก": "🚽", "ห้องน้ำใหญ่": "🚽",
@@ -338,7 +359,7 @@ NICK_RETRY_AFTER = 300            # เปลี่ยนชื่อไม่�
 # กิจกรรมที่ไม่ต้องใส่อีโมจิพัก — กินข้าวถูกย้ายไปห้องกินข้าวอยู่แล้ว เห็นจากห้องได้เลย
 NICK_SKIP_EMOJIS = {"🍚"}
 # อีโมจิพักทั้งหมดที่บอทอาจใส่ (รวมรุ่นเก่า เช่น 🚾 / 🍚 ไว้ด้วย เพื่อให้ยังลบออกจากชื่อที่ค้างอยู่ได้)
-BREAK_NICK_EMOJIS = set(ACTIVITY_EMOJI.values()) | set(BREAK_REASON_EMOJI.values()) | {"🚶"}
+BREAK_NICK_EMOJIS = set(ACTIVITY_EMOJI.values()) | {"🍚", "🚽", "🚾", "🚶"}
 
 WEB_EMOJI: dict[str, str] = nickname.web_emoji_map([])   # ชื่อเว็บ(ตัวเล็ก) → สี
 # discord_id → [เว็บงานหลัก, (เว็บงานรอง — OD)] ([] = ไม่มีสี: ไม่ได้จัดหน้าที่ / ไม่มีชื่อ / ผู้สอน)
@@ -406,11 +427,9 @@ def get_emoji(activity: str, is_return: bool) -> str:
 
 
 def get_break_reason(activity: str) -> str:
-    """แปลงชื่อกิจกรรมเป็น break_reason ที่ตรงกับ checkin-bot-render"""
-    for key, emoji in BREAK_REASON_EMOJI.items():
-        if key in activity:
-            return f"{emoji} {key}"
-    return f"☕ {activity}"
+    """break_reason ที่บันทึกลง K36 = ชื่อกิจกรรมตามที่กดใน Telegram (ไม่ใส่อีโมจิ)
+    หน้าเว็บจะเอาชื่อนี้ไปเทียบกับ "ตั้งค่ากลุ่ม" เพื่อดูเวลาจำกัด"""
+    return (activity or "พัก").strip()
 
 
 # โซนเวลา
@@ -514,7 +533,7 @@ def _close_break_ids(table: str, ids: list, now: datetime) -> None:
         .execute()
 
 
-def _open_break_in(table: str, staff_name: str, reason: str, now: datetime) -> None:
+def _open_break_in(table: str, staff_name: str, reason: str, now: datetime, chat_id: str = "") -> None:
     break_date = get_break_date_from_time(now)
 
     # ถ้ายังมี record ที่ยังไม่ปิดอยู่ → ปิดก่อนแล้วเปิดใหม่ (กรณีบอท Telegram รีเซทข้ามตี 1)
@@ -523,12 +542,15 @@ def _open_break_in(table: str, staff_name: str, reason: str, now: datetime) -> N
         _close_break_ids(table, ids, now)
         logger.info(f"[{table}] {staff_name} มี record ค้าง {len(ids)} รายการ → ปิดแล้วเปิดใหม่")
 
-    supabase.from_(table).insert({
+    row = {
         "staff_name": staff_name,
         "break_start": now.isoformat(),
         "break_date": break_date,
         "break_reason": reason,
-    }).execute()
+    }
+    if table == BREAK_TABLES[0] and chat_id:
+        row["chat_id"] = chat_id            # กลุ่มที่กดมา → K36 ใช้แยกเวลาจำกัดต่อกลุ่ม (เฉพาะ break_logs)
+    supabase.from_(table).insert(row).execute()
     logger.info(f"[{table}] {staff_name} เริ่มพัก ({reason}) break_date={break_date} เวลา={now.strftime('%H:%M:%S')}")
 
 
@@ -541,15 +563,17 @@ def _close_break_in(table: str, staff_name: str, now: datetime) -> None:
     logger.info(f"[{table}] {staff_name} กลับแล้ว ปิด {len(ids)} record เวลา={now.strftime('%H:%M:%S')}")
 
 
-async def supabase_open_break(staff_name: str, activity: str, timestamp_str: str | None = None) -> None:
+async def supabase_open_break(staff_name: str, activity: str, timestamp_str: str | None = None,
+                              chat_id: str = "") -> None:
     """บันทึกเริ่มพักลงทุกตารางใน BREAK_TABLES (ตารางหนึ่งพัง อีกตารางยังบันทึกได้)"""
     if not supabase:
         return
     now = parse_telegram_timestamp(timestamp_str) or get_thai_time()
     reason = get_break_reason(activity)
+    cid = norm_chat_id(chat_id)
     for table in BREAK_TABLES:
         try:
-            await sb(lambda t=table: _open_break_in(t, staff_name, reason, now))
+            await sb(lambda t=table: _open_break_in(t, staff_name, reason, now, cid))
         except Exception as e:
             logger.error(f"[{table}] supabase_open_break error: {e}")
 
@@ -1605,11 +1629,17 @@ async def supabase_restore_open_breaks() -> None:
         now = get_thai_time()
         break_date = get_break_date_from_time(now)
         prev_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-        res = await sb(lambda: supabase.from_(BREAK_TABLES[0])
-                       .select("staff_name, break_start, break_reason")
-                       .in_("break_date", [break_date, prev_date])
-                       .is_("break_end", "null")
-                       .execute())
+        def _q(cols: str):
+            return supabase.from_(BREAK_TABLES[0]) \
+                .select(cols) \
+                .in_("break_date", [break_date, prev_date]) \
+                .is_("break_end", "null") \
+                .execute()
+        try:
+            res = await sb(lambda: _q("staff_name, break_start, break_reason, chat_id"))
+        except Exception:
+            # คอลัมน์ chat_id ยังไม่ได้เพิ่มในฐานข้อมูล → โหลดแบบไม่มี chat_id (หาเวลาจำกัดจากทุกกลุ่มแทน)
+            res = await sb(lambda: _q("staff_name, break_start, break_reason"))
         if not res.data:
             logger.info("[Supabase] ไม่มี open break sessions ค้างอยู่")
             _out_restored = True
@@ -1617,8 +1647,9 @@ async def supabase_restore_open_breaks() -> None:
         restored = 0
         for r in res.data:
             tid = TID_BY_NAME.get(r["staff_name"])
+            chat_id = str(r.get("chat_id") or "")
             if tid and tid not in _currently_out:
-                _currently_out[tid] = ""  # ไม่รู้ group_name เดิม
+                _currently_out[tid] = chat_id
                 restored += 1
             if tid and tid not in OUT_INFO:
                 try:
@@ -1626,11 +1657,11 @@ async def supabase_restore_open_breaks() -> None:
                 except (TypeError, ValueError):
                     start = now
                 activity = str(r.get("break_reason") or "")
-                limit = break_limit_minutes(activity)
+                limit = group_activity_limit(chat_id, activity)
                 over = (now - start).total_seconds() / 60 - (limit or 0)
                 OUT_INFO[tid] = {
                     "name": r["staff_name"], "discord_id": EMPLOYEES.get(tid, {}).get("discord_id", ""),
-                    "activity": activity, "start": start,
+                    "activity": activity, "start": start, "chat_id": chat_id,
                     # เกินเวลามานานแล้วตอนบอทปิดอยู่ → น่าจะเตือนครบแล้ว ไม่เตือนซ้ำ
                     # บอทรีสตาร์ทระหว่างพัก: เกินเวลาอยู่แล้ว → เตือนต่อทันที (นับครั้งต่อจากที่ควรเตือนไปแล้ว)
                     "alerts": (1 + int(over // OVERDUE_REPEAT_MINUTES)) if (limit is not None and over > 0
@@ -1899,10 +1930,11 @@ async def _handle_activity(emp: dict, parsed: dict) -> None:
             "name": emp["name"], "discord_id": emp["discord_id"], "activity": parsed["activity"],
             "start": parse_telegram_timestamp(parsed.get("timestamp")) or get_thai_time(),
             "alerts": 0, "last_alert": None, "prewarned": False,
-            "limit": parsed.get("limit"),           # เวลาจำกัดจากข้อความ Telegram (ไม่มี → ใช้ค่าในโค้ด)
+            "chat_id": parsed.get("chat_id", ""),   # กลุ่มที่กดมา → ใช้หาเวลาจำกัดจาก "ตั้งค่ากลุ่ม" ใน K36
         }
         # เปิด break session ใน Supabase ด้วยเวลาจาก Telegram
-        await supabase_open_break(emp["name"], parsed["activity"], parsed.get("timestamp"))
+        await supabase_open_break(emp["name"], parsed["activity"], parsed.get("timestamp"),
+                                  parsed.get("chat_id", ""))
 
     await discord_bot.wait_until_ready_event()
     sent, channel = await discord_bot.send_notification(
@@ -1937,7 +1969,7 @@ async def telegram_prewarn(tid: str, text: str = "") -> None:
         m = re.search(r"เวลาจำกัดสำหรับ\s*([^\s.]+)", text)
         info = OUT_INFO[tid] = {
             "name": emp["name"], "discord_id": emp["discord_id"], "activity": m.group(1) if m else "พัก",
-            "start": None, "alerts": 0, "last_alert": None, "prewarned": False, "limit": None,
+            "start": None, "alerts": 0, "last_alert": None, "prewarned": False, "chat_id": "",
         }
     if info.get("prewarned") or info.get("alerts", 0):
         return                                          # ตัวนับเวลาของบอทเตือนไปก่อนแล้ว
