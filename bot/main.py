@@ -333,13 +333,45 @@ def overdue_minutes(info: dict, end: datetime) -> tuple[int, int, int] | None:
     late = max(1, int(over_sec // 60))
     return limit + late, limit, late
 
-# อีโมจิที่ "แสดงใน Discord" (ข้อความแจ้งพัก + หน้าชื่อ) — เปลี่ยนได้อิสระ
-# (break_reason ที่บันทึกลง K36 ไม่ใส่อีโมจิแล้ว — เก็บชื่อกิจกรรมตามที่กดใน Telegram ตรงๆ)
-ACTIVITY_EMOJI = {
-    "กินข้าว": "🍚", "ทานข้าว": "🍚",
-    "ปวดหนัก": "🚽", "ห้องน้ำใหญ่": "🚽",
-    "ปวดน้อย": "🚬", "ห้องน้ำเล็ก": "🚬",
-}
+# อีโมจิของกิจกรรม (ข้อความแจ้งพักใน Discord + หน้าชื่อเล่น) — ไม่ฝังในโค้ดแล้ว
+# ใช้อีโมจิที่พิมพ์นำหน้าชื่อกิจกรรมใน "ตั้งค่ากลุ่ม" ของหน้าเว็บ K36 (เช่น "🚽 ปวดหนัก") → ดู activity_emoji()
+BREAK_EMOJI_FALLBACK = "🚶"            # กิจกรรมที่ไม่ได้ตั้ง / ตั้งแล้วแต่ไม่ได้ใส่อีโมจิ
+LEGACY_BREAK_EMOJIS = {"🍚", "🚽", "🚾", "🚬", "🚶"}   # อีโมจิรุ่นเก่า — ให้ยังล้างออกจากชื่อเล่นที่ค้างอยู่ได้
+
+
+def leading_emoji(text: str) -> str:
+    """อีโมจินำหน้าชื่อ: "🚽 ปวดหนัก" → "🚽" · "ปวดหนัก" → "" (รองรับอีโมจิหลายตัว/แบบมี variation selector)"""
+    out = []
+    for c in str(text or "").lstrip():
+        cat = unicodedata.category(c)
+        if c in ("\ufe0e", "\ufe0f", "\u200d"):           # variation selector / ZWJ เป็นส่วนหนึ่งของอีโมจิ
+            out.append(c)
+            continue
+        if cat[0] in "LNM" or c.isspace():
+            break
+        if cat[0] in ("S", "C") or cat in ("Po", "Pd"):   # สัญลักษณ์/อีโมจิ + ตัวเชื่อม (ZWJ, VS16)
+            out.append(c)
+        else:
+            break
+    return "".join(out).strip()
+
+
+def activity_emoji(activity: str, chat_id: str = "") -> str:
+    """อีโมจิของกิจกรรมตามที่ตั้งในเว็บ (กลุ่มที่กดมาก่อน) — ไม่มี → 🚶"""
+    a = find_group_activity(chat_id, activity)
+    return (leading_emoji(a["name"]) if a else "") or BREAK_EMOJI_FALLBACK
+
+
+def all_break_emojis() -> set[str]:
+    """อีโมจิพักทั้งหมดที่บอทอาจเคยใส่หน้าชื่อ (ที่ตั้งในเว็บทุกกลุ่ม + รุ่นเก่า) — ใช้ตอนแกะ/ล้างชื่อเล่น"""
+    out = set(LEGACY_BREAK_EMOJIS)
+    for g in GROUPS_BY_CHAT.values():
+        for a in g.get("activities", []):
+            e = leading_emoji(a["name"])
+            if e:
+                out.add(e)
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Activity → Discord voice channel auto-move
@@ -374,10 +406,11 @@ WEB_NICK_SYNC_EVERY = 15          # อ่านตารางหน้าท�
 # ถูก set เมื่อข้อมูลพนักงานเปลี่ยน → รอบปรับชื่อทำงานทันที (ไม่ต้องรอครบ 1 นาที)
 NICK_SYNC_NOW = asyncio.Event()
 NICK_RETRY_AFTER = 300            # เปลี่ยนชื่อไม่ได้ → รอกี่วินาทีค่อยลองใหม่
-# กิจกรรมที่ไม่ต้องใส่อีโมจิพัก — กินข้าวถูกย้ายไปห้องกินข้าวอยู่แล้ว เห็นจากห้องได้เลย
-NICK_SKIP_EMOJIS = {"🍚"}
-# อีโมจิพักทั้งหมดที่บอทอาจใส่ (รวมรุ่นเก่า เช่น 🚾 / 🍚 ไว้ด้วย เพื่อให้ยังลบออกจากชื่อที่ค้างอยู่ได้)
-BREAK_NICK_EMOJIS = set(ACTIVITY_EMOJI.values()) | {"🍚", "🚽", "🚾", "🚶"}
+# กิจกรรมที่ "มีห้องให้ย้ายไป" (เช่น กินข้าว) ไม่ต้องใส่อีโมจิพักหน้าชื่อ — เห็นจากห้องได้เลย
+
+
+def activity_moves_room(activity: str) -> bool:
+    return any(k in (activity or "") and v for k, v in ACTIVITY_MOVE_CHANNEL.items())
 
 WEB_EMOJI: dict[str, str] = nickname.web_emoji_map([])   # ชื่อเว็บ(ตัวเล็ก) → สี
 # discord_id → [เว็บงานหลัก, (เว็บงานรอง — OD)] ([] = ไม่มีสี: ไม่ได้จัดหน้าที่ / ไม่มีชื่อ / ผู้สอน)
@@ -435,13 +468,10 @@ def web_prefix_for(teams: list[str]) -> str:
     return "".join(out)
 
 
-def get_emoji(activity: str, is_return: bool) -> str:
+def get_emoji(activity: str, is_return: bool, chat_id: str = "") -> str:
     if is_return:
         return "✅"
-    for key, emoji in ACTIVITY_EMOJI.items():
-        if key in activity:
-            return emoji
-    return "🚶"
+    return activity_emoji(activity, chat_id)
 
 
 def get_break_reason(activity: str) -> str:
@@ -826,7 +856,7 @@ class ActivityBot(discord.Client):
         """ชื่อเล่นที่ควรเป็นตอนนี้ (None = ไม่ตั้งชื่อเล่น ใช้ชื่อบัญชี)"""
         did = str(member.id)
         web_cur, base, brk_cur = nickname.parse_nick(member.nick, nickname.all_web_emojis(WEB_EMOJI),
-                                                     BREAK_NICK_EMOJIS)
+                                                     all_break_emojis())
         base_text = base or member.global_name or member.name
 
         web = web_cur                                   # ไม่รู้ตารางวันนี้ → คงสีเดิม
@@ -842,8 +872,12 @@ class ActivityBot(discord.Client):
         else:
             out_ids = {EMPLOYEES[t]["discord_id"] for t in _currently_out if t in EMPLOYEES}
             brk = brk_cur if did in out_ids else ""     # บอทรีสตาร์ทระหว่างพัก → คงอีโมจิเดิมจนกว่าจะกดกลับ
-        if brk in NICK_SKIP_EMOJIS:
-            brk = ""
+        if brk:
+            # กิจกรรมที่กำลังพักอยู่มีห้องให้ย้าย (กินข้าว) → ไม่ต้องใส่อีโมจิหน้าชื่อ
+            for t, info in OUT_INFO.items():
+                if info.get("discord_id") == did and activity_moves_room(info.get("activity", "")):
+                    brk = ""
+                    break
 
         if not web and not brk and (not base or base in (member.global_name, member.name)):
             return None                                 # ไม่มีอะไรต้องเติม และชื่อเท่าชื่อบัญชี → ไม่ต้องตั้งชื่อเล่น
@@ -1296,8 +1330,8 @@ class ActivityBot(discord.Client):
 
     async def send_notification(self, discord_user_id: str, name: str, activity: str,
                                  is_return: bool, group_name: str, timestamp: str | None = None,
-                                 break_info: dict | None = None) -> tuple[bool, str | None]:
-        emoji = get_emoji(activity, is_return)
+                                 break_info: dict | None = None, chat_id: str = "") -> tuple[bool, str | None]:
+        emoji = get_emoji(activity, is_return, chat_id)
         action = f"**{name}** กลับที่นั่งแล้ว" if is_return else f"**{name}** ไป{activity}"
         # อ่านเวลาจากข้อความ Telegram เป็นเวลาไทย (ตัวเดียวกับที่เก็บลง DB)
         th_dt = parse_telegram_timestamp(timestamp) if timestamp else None
@@ -1317,7 +1351,7 @@ class ActivityBot(discord.Client):
         # 🏷️ อีโมจิหน้าชื่อ: ไป → ใส่ / กลับ → คืนชื่อเดิม (พังก็ไม่กระทบการแจ้ง/ย้ายห้อง)
         #    กินข้าว → ไม่ใส่ (และล้างอีโมจิเก่าถ้ามีค้าง) เพราะถูกย้ายไปห้องกินข้าวอยู่แล้ว
         try:
-            nick_emoji = None if (is_return or emoji in NICK_SKIP_EMOJIS or not NICK_STATUS_ENABLED) else emoji
+            nick_emoji = None if (is_return or activity_moves_room(activity) or not NICK_STATUS_ENABLED) else emoji
             await self.set_break_nick(member, nick_emoji)
         except Exception as e:
             logger.warning(f"[NICK] {name}: {e}")
@@ -1963,6 +1997,7 @@ async def _handle_activity(emp: dict, parsed: dict) -> None:
         parsed["group_name"],
         parsed.get("timestamp"),
         break_info,
+        parsed.get("chat_id", ""),
     )
     status = f"sent to #{channel}" if sent else "not sent (not in voice channel)"
     logger.info(f"{emp['name']} [{parsed['activity']}] → Discord {status}")
