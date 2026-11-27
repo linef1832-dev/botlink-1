@@ -2,6 +2,7 @@ import asyncio
 import re
 import os
 import json
+import unicodedata
 import sys
 import logging
 import time as time_module
@@ -266,13 +267,20 @@ def _env_int(name: str, default: int) -> int:
 OVERDUE_REPEAT_MINUTES = _env_int("OVERDUE_REPEAT_MINUTES", 5)   # ยังไม่กลับ → เตือนซ้ำทุกกี่นาที
 OVERDUE_MAX_ALERTS = _env_int("OVERDUE_MAX_ALERTS", 0)           # เตือนสูงสุดกี่ครั้ง (0 = ไม่จำกัด เตือนจนกว่าจะกดกลับ)
 OVERDUE_PREWARN_MINUTES = _env_int("OVERDUE_PREWARN_MINUTES", 1)  # เตือนล่วงหน้าก่อนครบเวลากี่นาที (0 = ไม่เตือนล่วงหน้า)
-def group_activity_limit(chat_id, activity: str) -> int | None:
-    """เวลาพักสูงสุด (นาที) — อ่านจาก "ตั้งค่ากลุ่ม" ในหน้าเว็บ K36 (telegram_groups.activities)
+def activity_core(text: str) -> str:
+    """แก่นของชื่อกิจกรรม = เหลือแค่ตัวอักษร/ตัวเลข ตัดอีโมจิ ช่องว่าง จุด ฯลฯ ทิ้ง แล้วทำตัวเล็ก
+    "🚽 ปวดหนัก" → "ปวดหนัก" · "ปวดน้อย.สูบบุหรี่" → "ปวดน้อยสูบบุหรี่" · "🚬 ปวดน้อย" → "ปวดน้อย"
+    ใช้เทียบชื่อที่ตั้งในเว็บ K36 กับชื่อที่แกะจาก Telegram โดยไม่สนว่าใส่อีโมจิหรือไม่"""
+    # เก็บเฉพาะตัวอักษร (L) ตัวเลข (N) และสระ/วรรณยุกต์ (M — จำเป็นสำหรับภาษาไทย)
+    return "".join(c for c in str(text or "") if unicodedata.category(c)[0] in "LNM").lower()
 
-    เทียบชื่อกิจกรรมที่แกะจาก Telegram กับชื่อที่ตั้งไว้ในกลุ่มที่กดมา (ตาม chat_id)
-    ไม่รู้กลุ่ม (เช่น โหลดคืนหลังรีสตาร์ท) → ไล่หาในทุกกลุ่มเช็คอิน
-    ไม่เจอชื่อ / ตั้ง 0 → คืน None = ไม่แจ้งเตือน"""
-    act = (activity or "").strip().lower()
+
+def find_group_activity(chat_id, activity: str) -> dict | None:
+    """หากิจกรรมที่ตั้งไว้ใน "ตั้งค่ากลุ่ม" (K36) ที่ตรงกับชื่อที่กดใน Telegram
+
+    เทียบด้วยแก่นของคำ: ชื่อในเว็บ (ตัดอีโมจิแล้ว) ต้องอยู่ในชื่อจาก Telegram (ตัดอีโมจิ/จุดแล้ว)
+    ดูกลุ่มที่กดมาก่อน (ตาม chat_id) ไม่รู้กลุ่ม → ไล่หาในทุกกลุ่มเช็คอิน · ชื่อยาวกว่าชนะ (เจาะจงกว่า)"""
+    act = activity_core(activity)
     if not act:
         return None
     cid = norm_chat_id(chat_id)
@@ -280,11 +288,21 @@ def group_activity_limit(chat_id, activity: str) -> int | None:
         groups = [GROUPS_BY_CHAT[cid]]
     else:
         groups = [g for g in GROUPS_BY_CHAT.values() if g.get("type") == "checkin"]
+    best: dict | None = None
     for g in groups:
         for a in g.get("activities", []):
-            if a["name"].lower() in act:
-                return a["limit"] or None
-    return None
+            core = activity_core(a["name"])
+            if core and core in act and (best is None or len(core) > len(activity_core(best["name"]))):
+                best = a
+        if best:
+            break
+    return best
+
+
+def group_activity_limit(chat_id, activity: str) -> int | None:
+    """เวลาพักสูงสุด (นาที) ตามที่ตั้งในเว็บ — ไม่เจอชื่อ / ตั้ง 0 → None = ไม่แจ้งเตือน"""
+    a = find_group_activity(chat_id, activity)
+    return (a["limit"] or None) if a else None
 
 
 def info_limit(info: dict) -> int | None:
